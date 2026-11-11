@@ -5,8 +5,10 @@ metadata:
       deprecated: false
   description: "This step will execute backend integration tests via the Jacoco Maven-plugin."
   longDescription: |
-    If the project contains a Maven module named "integration-tests", this step will execute
+    If the project contains a Maven module for integration tests, this step will execute
     the integration tests via the Jacoco Maven-plugin.
+    By default the module is expected at `integration-tests/pom.xml`. Use the `pomPath`
+    parameter to point to a different location.
 spec:
   inputs:
     params:
@@ -32,17 +34,56 @@ spec:
           - STEPS
           - STAGES
         default: "1C"
+      - name: goal
+        type: string
+        description:
+          "The name of the Maven goal to execute."
+        scope:
+          - STEPS
+          - STAGES
+          - PARAMETERS
+        default: "test"
       - name: installArtifacts
         type: bool
         description:
-          "If enabled, it will install all artifacts to the local maven repository to make them available before running the tests.
-          This is required if the integration test module has dependencies to other modules in the repository and they were not installed before."
+          "If enabled, it will install all artifacts from all modules to the local maven repository.
+          This is required if the `integration-tests` module has dependencies on other modules in the same repository
+          which have not yet been installed.
+          Artifacts are installed using the `install:install-file` goal which expects the artifacts
+          to be already available.
+          If you'd like to build the artifacts on the spot, you might want to use `installWithReactor instead.
+          Mutually exclusive with `installWithReactor`."
         scope:
           - GENERAL
           - STEPS
           - STAGES
           - PARAMETERS
         default: true
+      - name: installWithReactor
+        type: bool
+        description:
+          "If enabled, it will use the Maven reactor to build and install the `integration-tests` module and all
+          of its dependencies.
+          Artifacts are installed using the `install` goal which builds the artifacts on the spot if required.
+          If you already have the artifacts available, you might want to use `installArtifacts` instead.
+          Mutually exclusive with `installArtifacts`."
+        scope:
+          - GENERAL
+          - STEPS
+          - STAGES
+          - PARAMETERS
+        default: false
+      - name: pomPath
+        type: string
+        description: >
+          Path to the pom.xml of the integration-test Maven module.
+          If not set, defaults to `integration-tests/pom.xml`.
+          Override this if your integration-test module lives under a different directory or file name.
+        scope:
+          - PARAMETERS
+          - STEPS
+          - STAGES
+        default: "integration-tests/pom.xml"
       # Global maven settings, should be added to all maven steps
       - name: projectSettingsFile
         type: string
@@ -86,10 +127,22 @@ spec:
         default: false
         aliases:
           - name: maven/logSuccessfulMavenTransfers
-
+  outputs:
+    resources:
+      - name: reports
+        type: reports
+        params:
+          - filePattern: "**/requirement.mapping"
+            type: requirement-mapping
+          - filePattern: "**/TEST-*.xml"
+            type: junit
+          - filePattern: "**/integration-test/*.xml"
+            type: integration-test
+          - filePattern: "**/jacoco.xml"
+            type: jacoco-coverage
   containers:
     - name: mvn
-      image: maven:3.6-jdk-8
+      image: docker.io/maven:3.6-jdk-8
 
   # This declaration is necessary in order to return any sidecar configuration in the context config.
   sidecars:

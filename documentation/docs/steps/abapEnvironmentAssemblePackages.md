@@ -2,6 +2,11 @@
 
 ## ${docGenDescription}
 
+### Artifacts
+
+- package logs ({packagename}.zip)
+    This archive contains all relevant transport logs per assembled package which might be needed for detailed analysis in case of support requests or for audit purpose. For productive builds it might be advisable to store this file as well as the overall pipeline run logs in a revision proof manner. For every assembled package an respective zip archive with its related logs are created and archived as artifact.
+
 ## Prerequisites
 
 * A SAP BTP, ABAP environment system is available.
@@ -25,6 +30,7 @@
 * The Software Components for which packages are to be assembled need to be present in the system.
   * This can be done manually through the respective applications on the SAP BTP, ABAP environment system.
   * In a pipeline, you can do this, for example, with the step [abapEnvironmentPullGitRepo](https://sap.github.io/jenkins-library/steps/abapEnvironmentPullGitRepo/).
+  * In case multiple software component are used, any dependencies between the components need to be defined in [Software Component Relations](https://help.sap.com/docs/abap-cloud/abap-development-tools-user-guide/software-component-relations).
 * The packages to be assembled need to be reserved in AAKaaS and the corresponding information needs to be present in CommonPipelineEnvironment. To do so run step [abapAddonAssemblyKitReserveNextPackages](https://sap.github.io/jenkins-library/steps/abapAddonAssemblyKitReserveNextPackages/) prior this step.
 
 ## ${docGenParameters}

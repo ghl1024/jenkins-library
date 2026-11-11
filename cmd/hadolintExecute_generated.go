@@ -8,18 +8,24 @@ import (
 	"time"
 
 	"github.com/SAP/jenkins-library/pkg/config"
+	"github.com/SAP/jenkins-library/pkg/eventing"
 	"github.com/SAP/jenkins-library/pkg/log"
+	"github.com/SAP/jenkins-library/pkg/splunk"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
+	"github.com/SAP/jenkins-library/pkg/validation"
+
 	"github.com/spf13/cobra"
 )
 
 type hadolintExecuteOptions struct {
-	ConfigurationURL      string `json:"configurationUrl,omitempty"`
-	ConfigurationUsername string `json:"configurationUsername,omitempty"`
-	ConfigurationPassword string `json:"configurationPassword,omitempty"`
-	DockerFile            string `json:"dockerFile,omitempty"`
-	ConfigurationFile     string `json:"configurationFile,omitempty"`
-	ReportFile            string `json:"reportFile,omitempty"`
+	ConfigurationURL          string   `json:"configurationUrl,omitempty"`
+	ConfigurationUsername     string   `json:"configurationUsername,omitempty"`
+	ConfigurationPassword     string   `json:"configurationPassword,omitempty"`
+	DockerFile                string   `json:"dockerFile,omitempty"`
+	DockerFileExclude         []string `json:"dockerFileExclude,omitempty"`
+	ConfigurationFile         string   `json:"configurationFile,omitempty"`
+	ReportFile                string   `json:"reportFile,omitempty"`
+	CustomTLSCertificateLinks []string `json:"customTlsCertificateLinks,omitempty"`
 }
 
 // HadolintExecuteCommand Executes the Haskell Dockerfile Linter which is a smarter Dockerfile linter that helps you build [best practice](https://docs.docker.com/develop/develop-images/dockerfile_best-practices/) Docker images.
@@ -29,6 +35,9 @@ func HadolintExecuteCommand() *cobra.Command {
 	metadata := hadolintExecuteMetadata()
 	var stepConfig hadolintExecuteOptions
 	var startTime time.Time
+	var logCollector *log.CollectorHook
+	var splunkClient *splunk.Splunk
+	telemetryClient := &telemetry.Telemetry{}
 
 	var createHadolintExecuteCmd = &cobra.Command{
 		Use:   STEP_NAME,
@@ -40,15 +49,31 @@ The linter is parsing the Dockerfile into an abstract syntax tree (AST) and perf
 			log.SetStepName(STEP_NAME)
 			log.SetVerbose(GeneralConfig.Verbose)
 
-			path, _ := os.Getwd()
+			GeneralConfig.GitHubAccessTokens = ResolveAccessTokens(GeneralConfig.GitHubTokens)
+
+			path, err := os.Getwd()
+			if err != nil {
+				return err
+			}
 			fatalHook := &log.FatalHook{CorrelationID: GeneralConfig.CorrelationID, Path: path}
 			log.RegisterHook(fatalHook)
 
-			err := PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
+			err = PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
 			if err != nil {
 				log.SetErrorCategory(log.ErrorConfiguration)
 				return err
 			}
+
+			// Set step error patterns for improved error detection
+			stepErrors := make([]log.StepError, len(metadata.Metadata.Errors))
+			for i, err := range metadata.Metadata.Errors {
+				stepErrors[i] = log.StepError{
+					Pattern:  err.Pattern,
+					Message:  err.Message,
+					Category: err.Category,
+				}
+			}
+			log.SetStepErrors(stepErrors)
 			log.RegisterSecret(stepConfig.ConfigurationUsername)
 			log.RegisterSecret(stepConfig.ConfigurationPassword)
 
@@ -57,22 +82,81 @@ The linter is parsing the Dockerfile into an abstract syntax tree (AST) and perf
 				log.RegisterHook(&sentryHook)
 			}
 
+			if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 || len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+				splunkClient = &splunk.Splunk{}
+				logCollector = &log.CollectorHook{CorrelationID: GeneralConfig.CorrelationID}
+				log.RegisterHook(logCollector)
+			}
+
+			if err = log.RegisterANSHookIfConfigured(GeneralConfig.CorrelationID); err != nil {
+				log.Entry().WithError(err).Warn("failed to set up SAP Alert Notification Service log hook")
+			}
+
+			validation, err := validation.New(validation.WithJSONNamesForStructFields(), validation.WithPredefinedErrorMessages())
+			if err != nil {
+				return err
+			}
+			if err = validation.ValidateStruct(stepConfig); err != nil {
+				log.SetErrorCategory(log.ErrorConfiguration)
+				return err
+			}
+
 			return nil
 		},
 		Run: func(_ *cobra.Command, _ []string) {
-			telemetryData := telemetry.CustomData{}
-			telemetryData.ErrorCode = "1"
+			vaultClient := config.GlobalVaultClient()
+			var oidcTokenProvider func(string) (string, error)
+			if vaultClient != nil {
+				defer vaultClient.MustRevokeToken()
+				oidcTokenProvider = vaultClient.GetOIDCTokenByValidation
+			}
+
+			stepTelemetryData := telemetry.CustomData{
+				ErrorCode: "1",
+			}
 			handler := func() {
 				config.RemoveVaultSecretFiles()
-				telemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
-				telemetryData.ErrorCategory = log.GetErrorCategory().String()
-				telemetry.Send(&telemetryData)
+				stepTelemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
+				stepTelemetryData.ErrorCategory = log.GetErrorCategory().String()
+				stepTelemetryData.PiperCommitHash = GitCommit
+				telemetryClient.SetData(&stepTelemetryData)
+				telemetryClient.LogStepTelemetryData()
+				if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.Dsn,
+						GeneralConfig.HookConfig.SplunkConfig.Token,
+						GeneralConfig.HookConfig.SplunkConfig.Index,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblToken,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblIndex,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.GCPPubSubConfig.ProjectNumber) > 0 {
+					if err := eventing.PublishTaskRunFinishedEvent(
+						oidcTokenProvider,
+						&GeneralConfig,
+						eventing.EventContext{
+							StepName:   STEP_NAME,
+							StageName:  telemetryClient.GetData().StageName,
+							ErrorCode:  stepTelemetryData.ErrorCode,
+							PipelineID: telemetryClient.GetBuildURL(),
+						},
+					); err != nil {
+						log.Entry().WithError(err).Warn("failed to publish GCP Pub/Sub event")
+					}
+				}
 			}
 			log.DeferExitHandler(handler)
 			defer handler()
-			telemetry.Initialize(GeneralConfig.NoTelemetry, STEP_NAME)
-			hadolintExecute(stepConfig, &telemetryData)
-			telemetryData.ErrorCode = "0"
+			telemetryClient.Initialize(STEP_NAME)
+			hadolintExecute(stepConfig, &stepTelemetryData)
+			stepTelemetryData.ErrorCode = "0"
 			log.Entry().Info("SUCCESS")
 		},
 	}
@@ -85,9 +169,11 @@ func addHadolintExecuteFlags(cmd *cobra.Command, stepConfig *hadolintExecuteOpti
 	cmd.Flags().StringVar(&stepConfig.ConfigurationURL, "configurationUrl", os.Getenv("PIPER_configurationUrl"), "URL pointing to the .hadolint.yaml exclude configuration to be used for linting. Also have a look at `configurationFile` which could avoid central configuration download in case the file is part of your repository.")
 	cmd.Flags().StringVar(&stepConfig.ConfigurationUsername, "configurationUsername", os.Getenv("PIPER_configurationUsername"), "The username to authenticate")
 	cmd.Flags().StringVar(&stepConfig.ConfigurationPassword, "configurationPassword", os.Getenv("PIPER_configurationPassword"), "The password to authenticate")
-	cmd.Flags().StringVar(&stepConfig.DockerFile, "dockerFile", `./Dockerfile`, "Dockerfile to be used for the assessment.")
+	cmd.Flags().StringVar(&stepConfig.DockerFile, "dockerFile", `**/Dockerfile`, "Path or glob pattern of Dockerfile(s) to be used for the assessment. Supports double-star glob patterns (e.g. `**/Dockerfile`, `images/**/Dockerfile`). When a pattern is provided, all matching files are linted in a single hadolint invocation.")
+	cmd.Flags().StringSliceVar(&stepConfig.DockerFileExclude, "dockerFileExclude", []string{}, "List of files, directories, or GLOB patterns to exclude from the Dockerfiles selected by dockerFile. Directory exclusions apply recursively.")
 	cmd.Flags().StringVar(&stepConfig.ConfigurationFile, "configurationFile", `.hadolint.yaml`, "Name of the configuration file used locally within the step. If a file with this name is detected as part of your repo downloading the central configuration via `configurationUrl` will be skipped. If you change the file's name make sure your stashing configuration also reflects this.")
 	cmd.Flags().StringVar(&stepConfig.ReportFile, "reportFile", `hadolint.xml`, "Name of the result file used locally within the step.")
+	cmd.Flags().StringSliceVar(&stepConfig.CustomTLSCertificateLinks, "customTlsCertificateLinks", []string{}, "List of download links to custom TLS certificates. This is required to ensure trusted connections between Piper and the system where the configuration file is to be downloaded from.")
 
 }
 
@@ -101,6 +187,9 @@ func hadolintExecuteMetadata() config.StepData {
 		},
 		Spec: config.StepSpec{
 			Inputs: config.StepInputs{
+				Secrets: []config.StepSecrets{
+					{Name: "configurationCredentialsId", Description: "Jenkins 'Username with password' credentials ID containing username/password for access to your remote configuration file.", Type: "jenkins"},
+				},
 				Parameters: []config.StepParameters{
 					{
 						Name:        "configurationUrl",
@@ -109,6 +198,7 @@ func hadolintExecuteMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_configurationUrl"),
 					},
 					{
 						Name: "configurationUsername",
@@ -118,11 +208,18 @@ func hadolintExecuteMetadata() config.StepData {
 								Param: "username",
 								Type:  "secret",
 							},
+
+							{
+								Name:    "hadolintConfigSecretName",
+								Type:    "vaultSecret",
+								Default: "hadolintConfig",
+							},
 						},
 						Scope:     []string{"PARAMETERS", "STAGES", "STEPS"},
 						Type:      "string",
 						Mandatory: false,
-						Aliases:   []config.Alias{},
+						Aliases:   []config.Alias{{Name: "username"}},
+						Default:   os.Getenv("PIPER_configurationUsername"),
 					},
 					{
 						Name: "configurationPassword",
@@ -132,11 +229,18 @@ func hadolintExecuteMetadata() config.StepData {
 								Param: "password",
 								Type:  "secret",
 							},
+
+							{
+								Name:    "hadolintConfigSecretName",
+								Type:    "vaultSecret",
+								Default: "hadolintConfig",
+							},
 						},
 						Scope:     []string{"PARAMETERS", "STAGES", "STEPS"},
 						Type:      "string",
 						Mandatory: false,
-						Aliases:   []config.Alias{},
+						Aliases:   []config.Alias{{Name: "password"}},
+						Default:   os.Getenv("PIPER_configurationPassword"),
 					},
 					{
 						Name:        "dockerFile",
@@ -145,6 +249,16 @@ func hadolintExecuteMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "dockerfile"}},
+						Default:     `**/Dockerfile`,
+					},
+					{
+						Name:        "dockerFileExclude",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"GENERAL", "PARAMETERS", "STAGES", "STEPS"},
+						Type:        "[]string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     []string{},
 					},
 					{
 						Name:        "configurationFile",
@@ -153,6 +267,7 @@ func hadolintExecuteMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `.hadolint.yaml`,
 					},
 					{
 						Name:        "reportFile",
@@ -161,11 +276,21 @@ func hadolintExecuteMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `hadolint.xml`,
+					},
+					{
+						Name:        "customTlsCertificateLinks",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:        "[]string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     []string{},
 					},
 				},
 			},
 			Containers: []config.Container{
-				{Name: "hadolint", Image: "hadolint/hadolint:latest-debian"},
+				{Name: "hadolint", Image: "docker.io/hadolint/hadolint:v2.15.1-alpine"},
 			},
 		},
 	}

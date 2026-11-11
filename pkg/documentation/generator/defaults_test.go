@@ -1,9 +1,13 @@
+//go:build unit
+// +build unit
+
 package generator
 
 import (
 	"testing"
 
 	"github.com/SAP/jenkins-library/pkg/config"
+
 	"github.com/stretchr/testify/assert"
 )
 

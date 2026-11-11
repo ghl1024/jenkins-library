@@ -1,15 +1,18 @@
+//go:build unit
+// +build unit
+
 package config
 
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"go.yaml.in/yaml/v3"
 )
 
 func TestReadPipelineStepData(t *testing.T) {
@@ -17,7 +20,7 @@ func TestReadPipelineStepData(t *testing.T) {
 
 	t.Run("Success case", func(t *testing.T) {
 		myMeta := strings.NewReader("metadata:\n  name: testIt\nspec:\n  inputs:\n    params:\n      - name: testParamName\n    secrets:\n      - name: testSecret")
-		err := s.ReadPipelineStepData(ioutil.NopCloser(myMeta)) // NopCloser "no-ops" the closing interface since strings do not need to be closed
+		err := s.ReadPipelineStepData(io.NopCloser(myMeta)) // NopCloser "no-ops" the closing interface since strings do not need to be closed
 
 		if err != nil {
 			t.Errorf("Got error although no error expected: %v", err)
@@ -52,7 +55,7 @@ func TestReadPipelineStepData(t *testing.T) {
 
 	t.Run("Unmarshalling failure", func(t *testing.T) {
 		myMeta := strings.NewReader("metadata:\n\tname: testIt")
-		err := s.ReadPipelineStepData(ioutil.NopCloser(myMeta))
+		err := s.ReadPipelineStepData(io.NopCloser(myMeta))
 		if err == nil {
 			t.Errorf("Got no error although error expected.")
 		}
@@ -291,7 +294,7 @@ func TestGetContextParameterFilters(t *testing.T) {
 
 	t.Run("Containers", func(t *testing.T) {
 		filters := metadata2.GetContextParameterFilters()
-		params := defaultParams("containerCommand", "containerShell", "dockerEnvVars", "dockerImage", "dockerName", "dockerOptions", "dockerPullImage", "dockerVolumeBind", "dockerWorkspace", "pip", "scanType")
+		params := defaultParams("containerCommand", "containerShell", "dockerEnvVars", "dockerImage", "dockerName", "dockerOptions", "dockerPullImage", "dockerVolumeBind", "dockerWorkspace", "dockerRegistryUrl", "dockerRegistryCredentialsId", "pip", "scanType")
 
 		assert.Equal(t, params, filters.All, "incorrect filter All")
 		assert.Equal(t, params, filters.General, "incorrect filter General")
@@ -395,10 +398,10 @@ func TestGetContextDefaults(t *testing.T) {
 							{Name: "opt1", Value: "optValue1"},
 							{Name: "opt2", Value: "optValue2"},
 						},
-						//VolumeMounts: []VolumeMount{
-						//	{MountPath: "mp1", Name: "mn1"},
-						//	{MountPath: "mp2", Name: "mn2"},
-						//},
+						VolumeMounts: []VolumeMount{
+							{MountPath: "mp1", Name: "volume"},
+							{MountPath: "mp2", Name: "mn2"},
+						},
 					},
 				},
 				Sidecars: []Container{
@@ -417,10 +420,10 @@ func TestGetContextDefaults(t *testing.T) {
 							{Name: "opt3", Value: "optValue3"},
 							{Name: "opt4", Value: "optValue4"},
 						},
-						//VolumeMounts: []VolumeMount{
-						//	{MountPath: "mp3", Name: "mn3"},
-						//	{MountPath: "mp4", Name: "mn4"},
-						//},
+						VolumeMounts: []VolumeMount{
+							{MountPath: "mp3", Name: "mn3"},
+							{MountPath: "mp4", Name: "volume"},
+						},
 					},
 				},
 			},
@@ -449,7 +452,7 @@ func TestGetContextDefaults(t *testing.T) {
 		assert.Equal(t, true, d.Defaults[0].Steps["testStep"]["dockerPullImage"], "dockerPullImage default not available")
 		assert.Equal(t, "/test/dir", d.Defaults[0].Steps["testStep"]["dockerWorkspace"], "dockerWorkspace default not available")
 		assert.Equal(t, []interface{}{"opt1 optValue1", "opt2 optValue2"}, d.Defaults[0].Steps["testStep"]["dockerOptions"], "dockerOptions default not available")
-		//assert.Equal(t, []interface{}{"mn1:mp1", "mn2:mp2"}, d.Defaults[0].Steps["testStep"]["dockerVolumeBind"], "dockerVolumeBind default not available")
+		assert.Equal(t, []interface{}{"volume:mp1"}, d.Defaults[0].Steps["testStep"]["dockerVolumeBind"], "dockerVolumeBind default not available")
 
 		assert.Equal(t, "/sidecar/command", d.Defaults[0].Steps["testStep"]["sidecarCommand"], "sidecarCommand default not available")
 		assert.Equal(t, map[string]interface{}{"env3": "val3", "env4": "val4"}, d.Defaults[0].Steps["testStep"]["sidecarEnvVars"], "sidecarEnvVars default not available")
@@ -459,7 +462,7 @@ func TestGetContextDefaults(t *testing.T) {
 		assert.Equal(t, "/sidecar/command", d.Defaults[0].Steps["testStep"]["sidecarReadyCommand"], "sidecarReadyCommand default not available")
 		assert.Equal(t, "/sidecar/dir", d.Defaults[0].Steps["testStep"]["sidecarWorkspace"], "sidecarWorkspace default not available")
 		assert.Equal(t, []interface{}{"opt3 optValue3", "opt4 optValue4"}, d.Defaults[0].Steps["testStep"]["sidecarOptions"], "sidecarOptions default not available")
-		//assert.Equal(t, []interface{}{"mn3:mp3", "mn4:mp4"}, d.Defaults[0].Steps["testStep"]["sidecarVolumeBind"], "sidecarVolumeBind default not available")
+		assert.Equal(t, []interface{}{"volume:mp4"}, d.Defaults[0].Steps["testStep"]["sidecarVolumeBind"], "sidecarVolumeBind default not available")
 	})
 
 	t.Run("Container conditions", func(t *testing.T) {
@@ -536,6 +539,28 @@ func TestGetContextDefaults(t *testing.T) {
 
 		assert.Equal(t, nil, d.Defaults[0].Steps["testStep"]["dockerPullImage"], "dockerPullImage default not available")
 		assert.Equal(t, nil, d.Defaults[0].Steps["testStep"]["sidecarPullImage"], "sidecarPullImage default not available")
+	})
+
+	t.Run("Empty docker parameter values", func(t *testing.T) {
+		metadata := StepData{
+			Spec: StepSpec{
+				Containers: []Container{
+					{
+						Image:   "testImage1:tag",
+						Options: []Option{{Name: "entrypoint", Value: ""}},
+					},
+				},
+			},
+		}
+
+		cd, err := metadata.GetContextDefaults("testStep")
+
+		assert.NoError(t, err)
+
+		var d PipelineDefaults
+		d.ReadPipelineDefaults([]io.ReadCloser{cd})
+
+		assert.Equal(t, []interface{}{"entrypoint="}, d.Defaults[0].Steps["testStep"]["dockerOptions"])
 	})
 
 	t.Run("Negative case", func(t *testing.T) {
@@ -628,26 +653,35 @@ func TestGetResourceParameters(t *testing.T) {
 				}}}},
 			expected: map[string]interface{}{"param4": "{\"key\":\"valueString\"}"},
 		},
+		{
+			in: StepData{
+				Spec: StepSpec{Inputs: StepInputs{Parameters: []StepParameters{
+					{Name: "param1", ResourceRef: []ResourceReference{{Name: "commonPipelineEnvironment", Param: "envparam1"}, {Name: "commonPipelineEnvironment", Param: "envparam2"}}, Type: "string"},
+				}}}},
+			expected: map[string]interface{}{"param1": "val1"},
+		},
+		{
+			in: StepData{
+				Spec: StepSpec{Inputs: StepInputs{Parameters: []StepParameters{
+					{Name: "param1", ResourceRef: []ResourceReference{{Name: "commonPipelineEnvironment", Param: "sthwhichclearlydoesntexist"}, {Name: "commonPipelineEnvironment", Param: "envparam2"}}, Type: "string"},
+				}}}},
+			expected: map[string]interface{}{"param1": "val2"},
+		},
 	}
 
-	dir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal("Failed to create temporary directory")
-	}
-	// clean up tmp dir
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	cpeDir := filepath.Join(dir, "commonPipelineEnvironment")
-	err = os.MkdirAll(cpeDir, 0700)
+	err := os.MkdirAll(cpeDir, 0700)
 	if err != nil {
 		t.Fatal("Failed to create sub directory")
 	}
 
-	ioutil.WriteFile(filepath.Join(cpeDir, "envparam1"), []byte("val1"), 0700)
-	ioutil.WriteFile(filepath.Join(cpeDir, "envparam2"), []byte("val2"), 0700)
-	ioutil.WriteFile(filepath.Join(cpeDir, "jsonList.json"), []byte("[\"value1\",\"value2\"]"), 0700)
-	ioutil.WriteFile(filepath.Join(cpeDir, "jsonKeyValue.json"), []byte("{\"key\":\"value\"}"), 0700)
-	ioutil.WriteFile(filepath.Join(cpeDir, "jsonKeyValueString"), []byte("{\"key\":\"valueString\"}"), 0700)
+	os.WriteFile(filepath.Join(cpeDir, "envparam1"), []byte("val1"), 0700)
+	os.WriteFile(filepath.Join(cpeDir, "envparam2"), []byte("val2"), 0700)
+	os.WriteFile(filepath.Join(cpeDir, "jsonList.json"), []byte("[\"value1\",\"value2\"]"), 0700)
+	os.WriteFile(filepath.Join(cpeDir, "jsonKeyValue.json"), []byte("{\"key\":\"value\"}"), 0700)
+	os.WriteFile(filepath.Join(cpeDir, "jsonKeyValueString"), []byte("{\"key\":\"valueString\"}"), 0700)
 
 	for run, test := range tt {
 		t.Run(fmt.Sprintf("Run %v", run), func(t *testing.T) {
@@ -700,6 +734,22 @@ func TestAvoidEmptyFields(t *testing.T) {
 	})
 }
 
+func TestOptionsAsStringSlice(t *testing.T) {
+	tt := []struct {
+		options  []Option
+		expected []string
+	}{
+		{options: []Option{}, expected: []string{}},
+		{options: []Option{{Name: "name1", Value: "value1"}}, expected: []string{"name1 value1"}},
+		{options: []Option{{Name: "name1", Value: "value1"}, {Name: "name2", Value: "value2"}}, expected: []string{"name1 value1", "name2 value2"}},
+		{options: []Option{{Name: "empty", Value: ""}}, expected: []string{"empty="}},
+	}
+
+	for _, test := range tt {
+		assert.Equal(t, test.expected, OptionsAsStringSlice(test.options))
+	}
+}
+
 func defaultParams(params ...string) []string {
 	vaultParams := []string{
 		"vaultAppRoleTokenCredentialsId",
@@ -712,4 +762,71 @@ func defaultParams(params ...string) []string {
 	stepParams = append(stepParams, vaultParams...)
 
 	return stepParams
+}
+
+func testMetadataResolver() map[string]StepData {
+	return map[string]StepData{
+		"githubCreateIssue": {
+			Metadata: StepMetadata{
+				Name: "githubCreateIssue",
+			},
+		},
+	}
+}
+
+func TestResolveMetadata(t *testing.T) {
+
+	t.Run("Succes - stepName", func(t *testing.T) {
+		stepName := "githubCreateIssue"
+		stepData, err := ResolveMetadata(map[string]string{}, testMetadataResolver, "", stepName)
+		assert.NoError(t, err)
+		assert.Equal(t, "githubCreateIssue", stepData.Metadata.Name)
+	})
+
+	t.Run("Error - wrong stepName", func(t *testing.T) {
+		stepName := "notExisting"
+		_, err := ResolveMetadata(map[string]string{}, testMetadataResolver, "", stepName)
+		assert.EqualError(t, err, "could not retrieve by stepName notExisting")
+	})
+
+	t.Run("Error - missing input", func(t *testing.T) {
+		stepName := ""
+		_, err := ResolveMetadata(map[string]string{}, testMetadataResolver, "", stepName)
+		assert.EqualError(t, err, "either one of stepMetadata or stepName parameter has to be passed")
+	})
+}
+
+func TestStepMetadataCLIAliases(t *testing.T) {
+	t.Run("cliAliases parsed from YAML", func(t *testing.T) {
+		yamlContent := `
+metadata:
+  name: myStep
+  cliAliases:
+    - myOldStep
+    - myLegacyStep
+  description: some step
+spec:
+  inputs:
+    params: []
+`
+		var stepData StepData
+		err := yaml.Unmarshal([]byte(yamlContent), &stepData)
+		assert.NoError(t, err)
+		assert.Equal(t, []string{"myOldStep", "myLegacyStep"}, stepData.Metadata.CLIAliases)
+	})
+
+	t.Run("cliAliases absent when not set", func(t *testing.T) {
+		yamlContent := `
+metadata:
+  name: myStep
+  description: some step
+spec:
+  inputs:
+    params: []
+`
+		var stepData StepData
+		err := yaml.Unmarshal([]byte(yamlContent), &stepData)
+		assert.NoError(t, err)
+		assert.Empty(t, stepData.Metadata.CLIAliases)
+	})
 }

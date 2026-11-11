@@ -3,14 +3,17 @@ package command
 import (
 	"os/exec"
 	"sync"
+
+	"github.com/SAP/jenkins-library/pkg/log"
 )
 
-//errCopyStdout and errCopyStderr are filled after the command execution after Wait() terminates
+// errCopyStdout and errCopyStderr are filled after the command execution after Wait() terminates
 type execution struct {
 	cmd           *exec.Cmd
 	wg            sync.WaitGroup
 	errCopyStdout error
 	errCopyStderr error
+	ul            *log.URLLogger
 }
 
 func (execution *execution) Kill() error {
@@ -19,6 +22,7 @@ func (execution *execution) Kill() error {
 
 func (execution *execution) Wait() error {
 	execution.wg.Wait()
+	execution.ul.WriteURLsLogToJSON()
 	return execution.cmd.Wait()
 }
 

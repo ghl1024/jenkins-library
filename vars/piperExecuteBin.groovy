@@ -9,6 +9,7 @@ import com.sap.piper.analytics.InfluxData
 import groovy.transform.Field
 
 import static com.sap.piper.Prerequisites.checkScript
+import static com.sap.piper.BashUtils.quoteAndEscape as q
 
 @Field String STEP_NAME = getClass().getName()
 
@@ -34,6 +35,13 @@ void call(Map parameters = [:], String stepName, String metadataFile, List crede
         withEnv([
             "PIPER_parametersJSON=${groovy.json.JsonOutput.toJson(stepParameters)}",
             "PIPER_correlationID=${env.BUILD_URL}",
+            /*
+            Additional logic "?: ''" is necessary to ensure the environment
+            variable is set to an empty string if the value is null
+            Without this, the environment variable would be set to the string "null",
+            causing checks for an empty token in the Go application to fail.
+            */
+            "PIPER_systemTrustToken=${env.PIPER_systemTrustToken ?: ''}",
             //ToDo: check if parameters make it into docker image on JaaS
         ]) {
             String defaultConfigArgs = getCustomDefaultConfigsArg()
@@ -48,8 +56,13 @@ void call(Map parameters = [:], String stepName, String metadataFile, List crede
                 echo "Context Config: ${config}"
             }
 
+            //Add ANS credential information to the config
+            ansHookServiceKeyCredentialsId =
+                DefaultValueCache.getInstance().getDefaultValues().hooks?.ans?.serviceKeyCredentialsId
+            config += ["ansHookServiceKeyCredentialsId": ansHookServiceKeyCredentialsId]
+
             // prepare stashes
-            // first eliminate empty stashes
+            // first eliminate non existing stashes
             config.stashContent = utils.unstashAll(config.stashContent)
             // then make sure that commonPipelineEnvironment, config, ... is also available when step stashing is active
             if (config.stashContent?.size() > 0) {
@@ -66,23 +79,28 @@ void call(Map parameters = [:], String stepName, String metadataFile, List crede
 
             dockerWrapper(script, stepName, config) {
                 handleErrorDetails(stepName) {
-                    script.commonPipelineEnvironment.writeToDisk(script)
+                    writePipelineEnv(script: script, piperGoPath: piperGoPath)
                     utils.unstash('pipelineStepReports')
                     try {
                         try {
                             try {
                                 credentialWrapper(config, credentialInfo) {
+                                    if (config.verbose) {  // need to be set on step config
+                                        echo "[DEBUG] Current environment limits:"
+                                        sh "ulimit -a"
+                                    }
+
                                     sh "${piperGoPath} ${stepName}${defaultConfigArgs}${customConfigArg}"
                                 }
                             } finally {
                                 jenkinsUtils.handleStepResults(stepName, failOnMissingReports, failOnMissingLinks)
                             }
                         } finally {
-                            script.commonPipelineEnvironment.readFromDisk(script)
+                           readPipelineEnv(script: script, piperGoPath: piperGoPath)
                         }
                     } finally {
                         InfluxData.readFromDisk(script)
-                        stash name: 'pipelineStepReports', includes: '.pipeline/stepReports/**', allowEmpty: true
+                        utils.stash name: 'pipelineStepReports', includes: '.pipeline/stepReports/**', allowEmpty: true
                     }
                 }
             }
@@ -127,7 +145,7 @@ static String getCustomDefaultConfigs() {
     // resources by setupCommonPipelineEnvironment.groovy into .pipeline/.
     List customDefaults = DefaultValueCache.getInstance().getCustomDefaults()
     for (int i = 0; i < customDefaults.size(); i++) {
-        customDefaults[i] = BashUtils.quoteAndEscape(".pipeline/${customDefaults[i]}")
+        customDefaults[i] = q(".pipeline/${customDefaults[i]}")
     }
     return customDefaults.join(',')
 }
@@ -146,7 +164,7 @@ static String getCustomConfigArg(def script) {
     if (script?.commonPipelineEnvironment?.configurationFile
         && script.commonPipelineEnvironment.configurationFile != '.pipeline/config.yml'
         && script.commonPipelineEnvironment.configurationFile != '.pipeline/config.yaml') {
-        return " --customConfig ${BashUtils.quoteAndEscape(script.commonPipelineEnvironment.configurationFile)}"
+        return " --customConfig ${q(script.commonPipelineEnvironment.configurationFile)}"
     }
     return ''
 }
@@ -168,7 +186,7 @@ void dockerWrapper(script, stepName, config, body) {
 // reused in sonarExecuteScan
 void credentialWrapper(config, List credentialInfo, body) {
     credentialInfo = handleVaultCredentials(config, credentialInfo)
-
+    credentialInfo = handleANSCredentials(config, credentialInfo)
     if (credentialInfo.size() > 0) {
         def creds = []
         def sshCreds = []
@@ -256,6 +274,14 @@ List handleVaultCredentials(config, List credentialInfo) {
     return credentialInfo
 }
 
+List handleANSCredentials(config, List credentialInfo){
+    if (config.containsKey('ansHookServiceKeyCredentialsId')) {
+        credentialInfo += [[type: 'token', id: 'ansHookServiceKeyCredentialsId', env: ['PIPER_ansHookServiceKey']]]
+    }
+
+    return credentialInfo
+}
+
 // reused in sonarExecuteScan
 void handleErrorDetails(String stepName, Closure body) {
     try {
@@ -273,4 +299,29 @@ void handleErrorDetails(String stepName, Closure body) {
         }
         error "[${stepName}] Step execution failed. Error: ${ex}, please see log file for more details."
     }
+}
+// it can be used in 2 ways:
+// 1. use stage, step arguments and leave stepOutputFile "" and stageOutputFile "" empty to check if this step is active in this stage (true means step is active, false - not active or something went wrong)
+// 2. use stageOutputFile and/or stepOutputFile and leave step "" and stage "" to write the whole map of steps in all stages into a file[s] (true means no errors, false - something went wrong)
+// if both presented - priority is option 2
+static boolean checkIfStepActive(Map parameters = [:], Script script, String piperGoPath, String stageConfig = "", String stepOutputFile = "", String stageOutputFile = "", String stage = "", String step = "") {
+    def utils = parameters.juStabUtils ?: new Utils()
+    def piperGoUtils = parameters.piperGoUtils ?: new PiperGoUtils(script, utils)
+    def flags = "--stageConfig ${stageConfig} --useV1"
+    if (stageOutputFile) {
+        flags += " --stageOutputFile ${stageOutputFile}"
+    }
+    if (stepOutputFile) {
+        flags += " --stepOutputFile ${stepOutputFile}"
+    }
+    if (!stage || !step) {
+        stage = "_"
+        step = "_"
+    }
+    flags += " --stage ${stage} --step ${step}"
+    flags += getCustomDefaultConfigsArg()
+    flags += getCustomConfigArg(script)
+    piperGoUtils.unstashPiperBin()
+    def returnCode = script.sh(returnStatus: true, script: "${piperGoPath} checkIfStepActive ${flags}")
+    return (returnCode == 0)
 }

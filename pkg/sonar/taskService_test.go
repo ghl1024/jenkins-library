@@ -1,3 +1,6 @@
+//go:build unit
+// +build unit
+
 package sonar
 
 import (
@@ -6,12 +9,11 @@ import (
 	"testing"
 	"time"
 
+	piperhttp "github.com/SAP/jenkins-library/pkg/http"
+
 	"github.com/jarcoal/httpmock"
-	sonargo "github.com/magicsong/sonargo/sonar"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
-
-	piperhttp "github.com/SAP/jenkins-library/pkg/http"
 )
 
 func TestGetTask(t *testing.T) {
@@ -21,13 +23,13 @@ func TestGetTask(t *testing.T) {
 		defer httpmock.DeactivateAndReset()
 
 		sender := &piperhttp.Client{}
-		sender.SetOptions(piperhttp.ClientOptions{UseDefaultTransport: true})
+		sender.SetOptions(piperhttp.ClientOptions{MaxRetries: -1, UseDefaultTransport: true})
 		// add response handler
 		httpmock.RegisterResponder(http.MethodGet, testURL+"/api/"+EndpointCeTask+"", httpmock.NewStringResponder(http.StatusOK, responseCeTaskSuccess))
 		// create service instance
 		serviceUnderTest := NewTaskService(testURL, mock.Anything, mock.Anything, sender)
 		// test
-		result, response, err := serviceUnderTest.GetTask(&sonargo.CeTaskOption{Id: mock.Anything})
+		result, response, err := serviceUnderTest.GetTask(&CeTaskOption{Id: mock.Anything})
 		// assert
 		assert.NoError(t, err)
 		assert.NotEmpty(t, result)
@@ -39,13 +41,13 @@ func TestGetTask(t *testing.T) {
 		defer httpmock.DeactivateAndReset()
 
 		sender := &piperhttp.Client{}
-		sender.SetOptions(piperhttp.ClientOptions{UseDefaultTransport: true})
+		sender.SetOptions(piperhttp.ClientOptions{MaxRetries: -1, UseDefaultTransport: true})
 		// add response handler
 		httpmock.RegisterResponder(http.MethodGet, testURL+"/api/"+EndpointCeTask+"", httpmock.NewErrorResponder(errors.New("internal server error")))
 		// create service instance
 		serviceUnderTest := NewTaskService(testURL, mock.Anything, mock.Anything, sender)
 		// test
-		result, response, err := serviceUnderTest.GetTask(&sonargo.CeTaskOption{Id: mock.Anything})
+		result, response, err := serviceUnderTest.GetTask(&CeTaskOption{Id: mock.Anything})
 		// assert
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "internal server error")
@@ -58,13 +60,13 @@ func TestGetTask(t *testing.T) {
 		defer httpmock.DeactivateAndReset()
 
 		sender := &piperhttp.Client{}
-		sender.SetOptions(piperhttp.ClientOptions{UseDefaultTransport: true})
+		sender.SetOptions(piperhttp.ClientOptions{MaxRetries: -1, UseDefaultTransport: true})
 		// add response handler
 		httpmock.RegisterResponder(http.MethodGet, testURL+"/api/"+EndpointCeTask+"", httpmock.NewStringResponder(http.StatusNotFound, responseCeTaskError))
 		// create service instance
 		serviceUnderTest := NewTaskService(testURL, mock.Anything, mock.Anything, sender)
 		// test
-		result, response, err := serviceUnderTest.GetTask(&sonargo.CeTaskOption{Id: mock.Anything})
+		result, response, err := serviceUnderTest.GetTask(&CeTaskOption{Id: mock.Anything})
 		// assert
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "No activity found for task ")
@@ -81,7 +83,7 @@ func TestWaitForTask(t *testing.T) {
 		defer httpmock.DeactivateAndReset()
 
 		sender := &piperhttp.Client{}
-		sender.SetOptions(piperhttp.ClientOptions{UseDefaultTransport: true})
+		sender.SetOptions(piperhttp.ClientOptions{MaxRetries: -1, UseDefaultTransport: true})
 		// add response handler
 
 		httpmock.RegisterResponder(http.MethodGet, testURL+"/api/"+EndpointCeTask+"", httpmock.ResponderFromMultipleResponses(
@@ -105,7 +107,7 @@ func TestWaitForTask(t *testing.T) {
 		defer httpmock.DeactivateAndReset()
 
 		sender := &piperhttp.Client{}
-		sender.SetOptions(piperhttp.ClientOptions{UseDefaultTransport: true})
+		sender.SetOptions(piperhttp.ClientOptions{MaxRetries: -1, UseDefaultTransport: true})
 		// add response handler
 
 		httpmock.RegisterResponder(http.MethodGet, testURL+"/api/"+EndpointCeTask+"", httpmock.ResponderFromMultipleResponses(

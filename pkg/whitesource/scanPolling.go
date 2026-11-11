@@ -2,8 +2,9 @@ package whitesource
 
 import (
 	"fmt"
-	"github.com/SAP/jenkins-library/pkg/log"
 	"time"
+
+	"github.com/SAP/jenkins-library/pkg/log"
 )
 
 type whitesourcePoller interface {
@@ -34,7 +35,7 @@ func pollProjectStatus(projectToken string, scanTime time.Time, sys whitesourceP
 		scanTime:         scanTime,
 		maxAge:           20 * time.Second,
 		timeBetweenPolls: 20 * time.Second,
-		maxWaitTime:      15 * time.Minute,
+		maxWaitTime:      30 * time.Minute,
 	}
 	return blockUntilProjectIsUpdated(projectToken, sys, options)
 }

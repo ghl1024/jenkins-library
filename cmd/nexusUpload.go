@@ -1,25 +1,25 @@
 package cmd
 
 import (
+	b64 "encoding/base64"
+	"errors"
 	"fmt"
-	piperhttp "github.com/SAP/jenkins-library/pkg/http"
-	"github.com/pkg/errors"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
-	b64 "encoding/base64"
-
 	"github.com/SAP/jenkins-library/pkg/command"
+	piperhttp "github.com/SAP/jenkins-library/pkg/http"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/maven"
 	"github.com/SAP/jenkins-library/pkg/nexus"
 	"github.com/SAP/jenkins-library/pkg/piperenv"
 	"github.com/SAP/jenkins-library/pkg/piperutils"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/ghodss/yaml"
+
+	"go.yaml.in/yaml/v3"
 )
 
 // nexusUploadUtils defines an interface for utility functionality used from external packages,
@@ -194,8 +194,8 @@ func uploadMTA(utils nexusUploadUtils, uploader nexus.Uploader, options *nexusUp
 }
 
 type mtaYaml struct {
-	ID      string `json:"ID"`
-	Version string `json:"version"`
+	ID      string `json:"ID" yaml:"ID"`
+	Version string `json:"version" yaml:"version"`
 }
 
 func getInfoFromMtaFile(utils nexusUploadUtils, filePath string) (*mtaYaml, error) {

@@ -2,13 +2,13 @@ package cmd
 
 import (
 	"context"
-
-	"github.com/SAP/jenkins-library/pkg/log"
-	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/google/go-github/v32/github"
-	"github.com/pkg/errors"
+	"fmt"
 
 	piperGithub "github.com/SAP/jenkins-library/pkg/github"
+	"github.com/SAP/jenkins-library/pkg/log"
+	"github.com/SAP/jenkins-library/pkg/telemetry"
+
+	"github.com/google/go-github/v68/github"
 )
 
 type githubPRService interface {
@@ -20,7 +20,8 @@ type githubIssueService interface {
 }
 
 func githubCreatePullRequest(config githubCreatePullRequestOptions, telemetryData *telemetry.CustomData) {
-	ctx, client, err := piperGithub.NewClient(config.Token, config.APIURL, "")
+	// TODO provide parameter for trusted certs
+	ctx, client, err := piperGithub.NewClientBuilder(config.Token, config.APIURL).Build()
 	if err != nil {
 		log.Entry().WithError(err).Fatal("Failed to get GitHub client")
 	}
@@ -32,7 +33,6 @@ func githubCreatePullRequest(config githubCreatePullRequestOptions, telemetryDat
 }
 
 func runGithubCreatePullRequest(ctx context.Context, config *githubCreatePullRequestOptions, ghPRService githubPRService, ghIssueService githubIssueService) error {
-
 	prRequest := github.NewPullRequest{
 		Title: &config.Title,
 		Head:  &config.Head,
@@ -43,7 +43,7 @@ func runGithubCreatePullRequest(ctx context.Context, config *githubCreatePullReq
 	newPR, resp, err := ghPRService.Create(ctx, config.Owner, config.Repository, &prRequest)
 	if err != nil {
 		log.Entry().Errorf("GitHub response code %v", resp.Status)
-		return errors.Wrap(err, "Error occurred when creating pull request")
+		return fmt.Errorf("Error occurred when creating pull request: %w", err)
 	}
 	log.Entry().Debugf("New pull request created: %v", newPR)
 
@@ -55,7 +55,7 @@ func runGithubCreatePullRequest(ctx context.Context, config *githubCreatePullReq
 	updatedPr, resp, err := ghIssueService.Edit(ctx, config.Owner, config.Repository, newPR.GetNumber(), &issueRequest)
 	if err != nil {
 		log.Entry().Errorf("GitHub response code %v", resp.Status)
-		return errors.Wrap(err, "Error occurred when editing pull request")
+		return fmt.Errorf("Error occurred when editing pull request: %w", err)
 	}
 	log.Entry().Debugf("Updated pull request: %v", updatedPr)
 

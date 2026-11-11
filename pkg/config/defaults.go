@@ -3,15 +3,13 @@ package config
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 
-	"github.com/ghodss/yaml"
-	"github.com/pkg/errors"
+	"go.yaml.in/yaml/v3"
 )
 
 // PipelineDefaults defines the structure of the pipeline defaults
 type PipelineDefaults struct {
-	Defaults []Config `json:"defaults"`
+	Defaults []Config `json:"defaults" yaml:"defaults"`
 }
 
 // ReadPipelineDefaults loads defaults and returns its content
@@ -27,9 +25,9 @@ func (d *PipelineDefaults) ReadPipelineDefaults(defaultSources []io.ReadCloser) 
 		var c Config
 		var err error
 
-		content, err := ioutil.ReadAll(def)
+		content, err := io.ReadAll(def)
 		if err != nil {
-			return errors.Wrapf(err, "error reading %v", def)
+			return fmt.Errorf("error reading %v: %w", def, err)
 		}
 
 		err = yaml.Unmarshal(content, &c)

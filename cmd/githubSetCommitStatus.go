@@ -2,14 +2,14 @@ package cmd
 
 import (
 	"context"
-
-	"github.com/SAP/jenkins-library/pkg/log"
-	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/google/go-github/v32/github"
-
-	"github.com/pkg/errors"
+	"fmt"
+	"strings"
 
 	piperGithub "github.com/SAP/jenkins-library/pkg/github"
+	"github.com/SAP/jenkins-library/pkg/log"
+	"github.com/SAP/jenkins-library/pkg/telemetry"
+
+	"github.com/google/go-github/v68/github"
 )
 
 type gitHubCommitStatusRepositoriesService interface {
@@ -17,7 +17,8 @@ type gitHubCommitStatusRepositoriesService interface {
 }
 
 func githubSetCommitStatus(config githubSetCommitStatusOptions, telemetryData *telemetry.CustomData) {
-	ctx, client, err := piperGithub.NewClient(config.Token, config.APIURL, "")
+	// TODO provide parameter for trusted certs
+	ctx, client, err := piperGithub.NewClientBuilder(config.Token, config.APIURL).Build()
 	if err != nil {
 		log.Entry().WithError(err).Fatal("Failed to get GitHub client")
 	}
@@ -32,7 +33,10 @@ func runGithubSetCommitStatus(ctx context.Context, config *githubSetCommitStatus
 	status := github.RepoStatus{Context: &config.Context, Description: &config.Description, State: &config.Status, TargetURL: &config.TargetURL}
 	_, _, err := ghRepositoriesService.CreateStatus(ctx, config.Owner, config.Repository, config.CommitID, &status)
 	if err != nil {
-		return errors.Wrapf(err, "failed to set status '%v' on commitId '%v'", config.Status, config.CommitID)
+		if strings.Contains(fmt.Sprint(err), "No commit found for SHA") {
+			log.SetErrorCategory(log.ErrorCustom)
+		}
+		return fmt.Errorf("failed to set status '%v' on commitId '%v': %w", config.Status, config.CommitID, err)
 	}
 	return nil
 }

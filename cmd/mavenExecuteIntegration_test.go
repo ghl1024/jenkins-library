@@ -1,12 +1,17 @@
+//go:build unit
+// +build unit
+
 package cmd
 
 import (
 	"errors"
-	"github.com/SAP/jenkins-library/pkg/mock"
-	"github.com/stretchr/testify/assert"
 	"net/http"
 	"path/filepath"
 	"testing"
+
+	"github.com/SAP/jenkins-library/pkg/mock"
+
+	"github.com/stretchr/testify/assert"
 )
 
 type mavenExecuteIntegrationTestUtilsBundle struct {
@@ -21,7 +26,9 @@ func (m mavenExecuteIntegrationTestUtilsBundle) DownloadFile(url, filename strin
 func TestIntegrationTestModuleDoesNotExist(t *testing.T) {
 	t.Parallel()
 	utils := newMavenIntegrationTestsUtilsBundle()
-	config := mavenExecuteIntegrationOptions{}
+	config := mavenExecuteIntegrationOptions{
+		PomPath: "integration-tests/pom.xml",
+	}
 
 	err := runMavenExecuteIntegration(&config, utils)
 
@@ -34,8 +41,10 @@ func TestHappyPathIntegrationTests(t *testing.T) {
 	utils.FilesMock.AddFile("integration-tests/pom.xml", []byte(`<project> </project>`))
 
 	config := mavenExecuteIntegrationOptions{
+		PomPath:   "integration-tests/pom.xml",
 		Retry:     2,
 		ForkCount: "1C",
+		Goal:      "post-integration-test",
 	}
 
 	err := runMavenExecuteIntegration(&config, utils)
@@ -43,7 +52,7 @@ func TestHappyPathIntegrationTests(t *testing.T) {
 		t.Fatalf("Error %s", err)
 	}
 
-	expectedParameters1 := []string{
+	expectedTestExecutionParameters := []string{
 		"--file",
 		filepath.Join(".", "integration-tests", "pom.xml"),
 		"-Dsurefire.rerunFailingTestsCount=2",
@@ -51,10 +60,71 @@ func TestHappyPathIntegrationTests(t *testing.T) {
 		"-Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn",
 		"--batch-mode",
 		"org.jacoco:jacoco-maven-plugin:prepare-agent",
-		"test",
+		"post-integration-test",
 	}
 
-	assert.Equal(t, mock.ExecCall{Exec: "mvn", Params: expectedParameters1}, utils.ExecMockRunner.Calls[0])
+	assert.Equal(t, mock.ExecCall{Exec: "mvn", Params: expectedTestExecutionParameters}, utils.ExecMockRunner.Calls[0])
+}
+
+func TestHappyPathIntegrationTestsWithReactorInstall(t *testing.T) {
+	t.Parallel()
+	utils := newMavenIntegrationTestsUtilsBundle()
+	utils.FilesMock.AddFile("integration-tests/pom.xml", []byte(`<project> </project>`))
+
+	config := mavenExecuteIntegrationOptions{
+		PomPath:            "integration-tests/pom.xml",
+		Retry:              2,
+		ForkCount:          "1C",
+		Goal:               "post-integration-test",
+		InstallWithReactor: true,
+	}
+
+	err := runMavenExecuteIntegration(&config, utils)
+	if err != nil {
+		t.Fatalf("Error %s", err)
+	}
+
+	expectedInstallParameters := []string{
+		"-pl",
+		"integration-tests",
+		"-am",
+		"-DskipTests",
+		"-Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn",
+		"--batch-mode",
+		"install",
+	}
+
+	expectedTestExecutionParameters := []string{
+		"--file",
+		filepath.Join(".", "integration-tests", "pom.xml"),
+		"-Dsurefire.rerunFailingTestsCount=2",
+		"-Dsurefire.forkCount=1C",
+		"-Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn",
+		"--batch-mode",
+		"org.jacoco:jacoco-maven-plugin:prepare-agent",
+		"post-integration-test",
+	}
+
+	assert.Equal(t, mock.ExecCall{Exec: "mvn", Params: expectedInstallParameters}, utils.ExecMockRunner.Calls[0])
+	assert.Equal(t, mock.ExecCall{Exec: "mvn", Params: expectedTestExecutionParameters}, utils.ExecMockRunner.Calls[1])
+}
+
+func TestMutualExclusivityOfInstallFlags(t *testing.T) {
+	t.Parallel()
+	utils := newMavenIntegrationTestsUtilsBundle()
+	utils.FilesMock.AddFile("integration-tests/pom.xml", []byte(`<project> </project>`))
+
+	config := mavenExecuteIntegrationOptions{
+		PomPath:            "integration-tests/pom.xml",
+		InstallArtifacts:   true,
+		InstallWithReactor: true,
+	}
+
+	err := runMavenExecuteIntegration(&config, utils)
+
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), "parameters 'installArtifacts' and 'installWithReactor' are mutually exclusive")
+	}
 }
 
 func TestInvalidForkCountParam(t *testing.T) {
@@ -64,7 +134,7 @@ func TestInvalidForkCountParam(t *testing.T) {
 	utils.FilesMock.AddFile("integration-tests/pom.xml", []byte(`<project> </project>`))
 
 	// test
-	err := runMavenExecuteIntegration(&mavenExecuteIntegrationOptions{ForkCount: "4.2"}, utils)
+	err := runMavenExecuteIntegration(&mavenExecuteIntegrationOptions{PomPath: "integration-tests/pom.xml", ForkCount: "4.2"}, utils)
 
 	// assert
 	if assert.Error(t, err) {
@@ -134,6 +204,93 @@ func TestValidateForkCount(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCustomPomPathDoesNotExist(t *testing.T) {
+	t.Parallel()
+	utils := newMavenIntegrationTestsUtilsBundle()
+
+	config := mavenExecuteIntegrationOptions{
+		PomPath: "my-it-module/pom.xml",
+	}
+
+	err := runMavenExecuteIntegration(&config, utils)
+
+	assert.EqualError(t, err, "maven module 'my-it-module' does not exist in project structure")
+}
+
+func TestCustomPomPath(t *testing.T) {
+	t.Parallel()
+	utils := newMavenIntegrationTestsUtilsBundle()
+	utils.FilesMock.AddFile("my-it-module/pom.xml", []byte(`<project> </project>`))
+
+	config := mavenExecuteIntegrationOptions{
+		PomPath:   "my-it-module/pom.xml",
+		Retry:     1,
+		ForkCount: "1C",
+		Goal:      "test",
+	}
+
+	err := runMavenExecuteIntegration(&config, utils)
+	if err != nil {
+		t.Fatalf("Error %s", err)
+	}
+
+	expectedTestExecutionParameters := []string{
+		"--file",
+		filepath.Join(".", "my-it-module", "pom.xml"),
+		"-Dsurefire.rerunFailingTestsCount=1",
+		"-Dsurefire.forkCount=1C",
+		"-Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn",
+		"--batch-mode",
+		"org.jacoco:jacoco-maven-plugin:prepare-agent",
+		"test",
+	}
+
+	assert.Equal(t, mock.ExecCall{Exec: "mvn", Params: expectedTestExecutionParameters}, utils.ExecMockRunner.Calls[0])
+}
+
+func TestCustomPomPathWithReactorInstall(t *testing.T) {
+	t.Parallel()
+	utils := newMavenIntegrationTestsUtilsBundle()
+	utils.FilesMock.AddFile("my-it-module/pom.xml", []byte(`<project> </project>`))
+
+	config := mavenExecuteIntegrationOptions{
+		PomPath:            "my-it-module/pom.xml",
+		Retry:              1,
+		ForkCount:          "1C",
+		Goal:               "test",
+		InstallWithReactor: true,
+	}
+
+	err := runMavenExecuteIntegration(&config, utils)
+	if err != nil {
+		t.Fatalf("Error %s", err)
+	}
+
+	expectedInstallParameters := []string{
+		"-pl",
+		"my-it-module",
+		"-am",
+		"-DskipTests",
+		"-Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn",
+		"--batch-mode",
+		"install",
+	}
+
+	expectedTestExecutionParameters := []string{
+		"--file",
+		filepath.Join(".", "my-it-module", "pom.xml"),
+		"-Dsurefire.rerunFailingTestsCount=1",
+		"-Dsurefire.forkCount=1C",
+		"-Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn",
+		"--batch-mode",
+		"org.jacoco:jacoco-maven-plugin:prepare-agent",
+		"test",
+	}
+
+	assert.Equal(t, mock.ExecCall{Exec: "mvn", Params: expectedInstallParameters}, utils.ExecMockRunner.Calls[0])
+	assert.Equal(t, mock.ExecCall{Exec: "mvn", Params: expectedTestExecutionParameters}, utils.ExecMockRunner.Calls[1])
 }
 
 func newMavenIntegrationTestsUtilsBundle() *mavenExecuteIntegrationTestUtilsBundle {

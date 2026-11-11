@@ -1,11 +1,16 @@
+//go:build unit
+// +build unit
+
 package solman
 
 import (
 	"bytes"
 	"fmt"
-	"github.com/SAP/jenkins-library/pkg/mock"
-	"github.com/stretchr/testify/assert"
 	"testing"
+
+	"github.com/SAP/jenkins-library/pkg/mock"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestSolmanCreateTransportRequest(t *testing.T) {
@@ -36,7 +41,6 @@ func TestSolmanCreateTransportRequest(t *testing.T) {
 					"--endpoint", "https://example.org/solman",
 					"--user", "me",
 					"--password", "******",
-					"--backend-type", "SOLMAN",
 					"create-transport",
 					"-cID", "123",
 					"-dID", "XXX~EXT_SRV",

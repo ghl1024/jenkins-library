@@ -5,73 +5,261 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/SAP/jenkins-library/pkg/config"
+	"github.com/SAP/jenkins-library/pkg/eventing"
+	"github.com/SAP/jenkins-library/pkg/gcs"
 	"github.com/SAP/jenkins-library/pkg/log"
+	"github.com/SAP/jenkins-library/pkg/piperenv"
+	"github.com/SAP/jenkins-library/pkg/piperutils"
+	"github.com/SAP/jenkins-library/pkg/splunk"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
+	"github.com/SAP/jenkins-library/pkg/validation"
+
 	"github.com/spf13/cobra"
 )
 
 type npmExecuteScriptsOptions struct {
-	Install                    bool     `json:"install,omitempty"`
-	RunScripts                 []string `json:"runScripts,omitempty"`
-	DefaultNpmRegistry         string   `json:"defaultNpmRegistry,omitempty"`
-	VirtualFrameBuffer         bool     `json:"virtualFrameBuffer,omitempty"`
-	ScriptOptions              []string `json:"scriptOptions,omitempty"`
-	BuildDescriptorExcludeList []string `json:"buildDescriptorExcludeList,omitempty"`
-	BuildDescriptorList        []string `json:"buildDescriptorList,omitempty"`
-	CreateBOM                  bool     `json:"createBOM,omitempty"`
+	Install                      bool     `json:"install,omitempty"`
+	RunScripts                   []string `json:"runScripts,omitempty"`
+	DefaultNpmRegistry           string   `json:"defaultNpmRegistry,omitempty"`
+	VirtualFrameBuffer           bool     `json:"virtualFrameBuffer,omitempty"`
+	ScriptOptions                []string `json:"scriptOptions,omitempty"`
+	BuildDescriptorExcludeList   []string `json:"buildDescriptorExcludeList,omitempty"`
+	BuildDescriptorList          []string `json:"buildDescriptorList,omitempty"`
+	CreateBOM                    bool     `json:"createBOM,omitempty"`
+	Publish                      bool     `json:"publish,omitempty"`
+	PublishTag                   string   `json:"publishTag,omitempty"`
+	RepositoryURL                string   `json:"repositoryUrl,omitempty"`
+	RepositoryPassword           string   `json:"repositoryPassword,omitempty"`
+	RepositoryUsername           string   `json:"repositoryUsername,omitempty"`
+	BuildSettingsInfo            string   `json:"buildSettingsInfo,omitempty"`
+	PackBeforePublish            bool     `json:"packBeforePublish,omitempty"`
+	Production                   bool     `json:"production,omitempty"`
+	CreateBuildArtifactsMetadata bool     `json:"createBuildArtifactsMetadata,omitempty"`
+	PnpmVersion                  string   `json:"pnpmVersion,omitempty"`
 }
 
-// NpmExecuteScriptsCommand Execute npm run scripts on all npm packages in a project
+type npmExecuteScriptsCommonPipelineEnvironment struct {
+	custom struct {
+		buildSettingsInfo string
+		npmBuildArtifacts string
+	}
+}
+
+func (p *npmExecuteScriptsCommonPipelineEnvironment) persist(path, resourceName string) {
+	content := []struct {
+		category string
+		name     string
+		value    any
+	}{
+		{category: "custom", name: "buildSettingsInfo", value: p.custom.buildSettingsInfo},
+		{category: "custom", name: "npmBuildArtifacts", value: p.custom.npmBuildArtifacts},
+	}
+
+	errCount := 0
+	for _, param := range content {
+		err := piperenv.SetResourceParameter(path, resourceName, filepath.Join(param.category, param.name), param.value)
+		if err != nil {
+			log.Entry().WithError(err).Error("Error persisting piper environment.")
+			errCount++
+		}
+	}
+	if errCount > 0 {
+		log.Entry().Error("failed to persist Piper environment")
+	}
+}
+
+type npmExecuteScriptsReports struct {
+}
+
+func (p *npmExecuteScriptsReports) persist(stepConfig npmExecuteScriptsOptions, gcpJsonKeyFilePath string, gcsBucketId string, gcsFolderPath string, gcsSubFolder string) {
+	if gcsBucketId == "" {
+		log.Entry().Info("persisting reports to GCS is disabled, because gcsBucketId is empty")
+		return
+	}
+	log.Entry().Info("Uploading reports to Google Cloud Storage...")
+	content := []gcs.ReportOutputParam{
+		{FilePattern: "**/bom-npm.xml", ParamRef: "", StepResultType: "sbom"},
+		{FilePattern: "**/TEST-*.xml", ParamRef: "", StepResultType: "junit"},
+		{FilePattern: "**/cobertura-coverage.xml", ParamRef: "", StepResultType: "cobertura-coverage"},
+		{FilePattern: "**/e2e/*.json", ParamRef: "", StepResultType: "cucumber"},
+	}
+
+	gcsClient, err := gcs.NewClient(gcpJsonKeyFilePath, "")
+	if err != nil {
+		log.Entry().Errorf("creation of GCS client failed: %v", err)
+		return
+	}
+	defer gcsClient.Close()
+	structVal := reflect.ValueOf(&stepConfig).Elem()
+	inputParameters := map[string]string{}
+	for i := 0; i < structVal.NumField(); i++ {
+		field := structVal.Type().Field(i)
+		if field.Type.String() == "string" {
+			paramName := strings.Split(field.Tag.Get("json"), ",")
+			paramValue, _ := structVal.Field(i).Interface().(string)
+			inputParameters[paramName[0]] = paramValue
+		}
+	}
+	if err := gcs.PersistReportsToGCS(gcsClient, content, inputParameters, gcsFolderPath, gcsBucketId, gcsSubFolder, piperutils.Glob, os.Stat); err != nil {
+		log.Entry().Errorf("failed to persist reports: %v", err)
+	}
+}
+
+// NpmExecuteScriptsCommand Handles JavaScript dependency installation via npm, yarn or pnpm and basic npm commands.
 func NpmExecuteScriptsCommand() *cobra.Command {
 	const STEP_NAME = "npmExecuteScripts"
 
 	metadata := npmExecuteScriptsMetadata()
 	var stepConfig npmExecuteScriptsOptions
 	var startTime time.Time
+	var commonPipelineEnvironment npmExecuteScriptsCommonPipelineEnvironment
+	var reports npmExecuteScriptsReports
+	var logCollector *log.CollectorHook
+	var splunkClient *splunk.Splunk
+	telemetryClient := &telemetry.Telemetry{}
 
 	var createNpmExecuteScriptsCmd = &cobra.Command{
 		Use:   STEP_NAME,
-		Short: "Execute npm run scripts on all npm packages in a project",
-		Long:  `Execute npm run scripts in all package json files, if they implement the scripts.`,
+		Short: "Handles JavaScript dependency installation via npm, yarn or pnpm and basic npm commands.",
+		Long: `### Lock file detection:
+
+  - If ` + "`" + `package-lock.json` + "`" + ` is found → runs ` + "`" + `npm ci` + "`" + `
+  - If ` + "`" + `yarn.lock.json` + "`" + ` is found → runs ` + "`" + `yarn install --frozen-lockfile` + "`" + `
+  - If ` + "`" + `pnpm-lock.yaml` + "`" + ` is found → runs ` + "`" + `pnpm install --frozen-lockfile` + "`" + `
+  - If no lock file is found → defaults to ` + "`" + `npm install` + "`" + ` and continues execution
+
+Only the install command uses the detected package manager (npm, yarn, or pnpm). All other commands (e.g., ` + "`" + `run` + "`" + `, ` + "`" + `pack` + "`" + `, ` + "`" + `publish` + "`" + `) are executed via the ` + "`" + `npm` + "`" + ` CLI, regardless of which lock file is detected.<br/>
+Rationale: In the Piper environment, using the npm CLI for non-install commands provides sufficient functionality without requiring additional CLI dependencies. Supporting yarn or pnpm for these commands was deemed unnecessary due to lack of added benefit.<br/>
+If your project contains multiple package.json files (i.e., multi module projects), install command will be run in every directory where the package.json file is found. One can use ` + "`" + `buildDescriptorList` + "`" + ` or ` + "`" + `buildDescriptorExcludeList` + "`" + ` (more details below) to override the default behaviour.<br/>
+### pnpm multi-module support:
+pnpm multi-module projects are supported when each package has its own ` + "`" + `pnpm-lock.yaml` + "`" + ` file. Workspace-based pnpm projects are not yet supported.
+### pnpm and running tests.
+When pnpm is installed, it is placed in ` + "`" + `./tmp/node_modules/.bin/pnpm` + "`" + `, and some dependency files under ` + "`" + `./tmp/` + "`" + ` may include test files. If your test runner uses a broad glob pattern (such as ` + "`" + `**/*.test.js` + "`" + `), it might unintentionally pick up test files from ` + "`" + `./tmp/**` + "`" + `. To avoid this, exclude ` + "`" + `./tmp/**` + "`" + ` from your test execution patterns. For best results, use more specific glob patterns for running tests, such as ` + "`" + `src/**/*.test.js` + "`" + `, to ensure only your intended test files are executed.
+### Build with private dependencies from a repository
+If your build has scoped/unscoped dependencies from a private repository you can include a ` + "`" + `.npmrc` + "`" + ` into the source code repository as below (replace the ` + "`" + `@privateScope:registry` + "`" + ` value(s) with a valid private repo url) :<br/>
+` + "`" + `` + "`" + `` + "`" + ` @privateScope:registry=https://private.repository.com/ //private.repository.com/:username=${PIPER_VAULTCREDENTIAL_USER} //private.repository.com/:_password=${PIPER_VAULTCREDENTIAL_PASSWORD_BASE64} //private.repository.com/:always-auth=true registry=https://registry.npmjs.org ` + "`" + `` + "`" + `` + "`" + `
+` + "`" + `PIPER_VAULTCREDENTIAL_USER` + "`" + ` and ` + "`" + `PIPER_VAULTCREDENTIAL_PASSWORD_BASE64` + "`" + ` (Base64 encoded password) are the username and password for the private repository and are exposed are environment variables that must be present in the environment where the Piper step runs or alternatively can be created using : [vault general purpose credentials](../infrastructure/vault.md#using-vault-for-general-purpose-and-test-credentials)`,
 		PreRunE: func(cmd *cobra.Command, _ []string) error {
 			startTime = time.Now()
 			log.SetStepName(STEP_NAME)
 			log.SetVerbose(GeneralConfig.Verbose)
 
-			path, _ := os.Getwd()
+			GeneralConfig.GitHubAccessTokens = ResolveAccessTokens(GeneralConfig.GitHubTokens)
+
+			path, err := os.Getwd()
+			if err != nil {
+				return err
+			}
 			fatalHook := &log.FatalHook{CorrelationID: GeneralConfig.CorrelationID, Path: path}
 			log.RegisterHook(fatalHook)
 
-			err := PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
+			err = PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
 			if err != nil {
 				log.SetErrorCategory(log.ErrorConfiguration)
 				return err
 			}
+
+			// Set step error patterns for improved error detection
+			stepErrors := make([]log.StepError, len(metadata.Metadata.Errors))
+			for i, err := range metadata.Metadata.Errors {
+				stepErrors[i] = log.StepError{
+					Pattern:  err.Pattern,
+					Message:  err.Message,
+					Category: err.Category,
+				}
+			}
+			log.SetStepErrors(stepErrors)
+			log.RegisterSecret(stepConfig.RepositoryPassword)
+			log.RegisterSecret(stepConfig.RepositoryUsername)
 
 			if len(GeneralConfig.HookConfig.SentryConfig.Dsn) > 0 {
 				sentryHook := log.NewSentryHook(GeneralConfig.HookConfig.SentryConfig.Dsn, GeneralConfig.CorrelationID)
 				log.RegisterHook(&sentryHook)
 			}
 
+			if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 || len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+				splunkClient = &splunk.Splunk{}
+				logCollector = &log.CollectorHook{CorrelationID: GeneralConfig.CorrelationID}
+				log.RegisterHook(logCollector)
+			}
+
+			if err = log.RegisterANSHookIfConfigured(GeneralConfig.CorrelationID); err != nil {
+				log.Entry().WithError(err).Warn("failed to set up SAP Alert Notification Service log hook")
+			}
+
+			validation, err := validation.New(validation.WithJSONNamesForStructFields(), validation.WithPredefinedErrorMessages())
+			if err != nil {
+				return err
+			}
+			if err = validation.ValidateStruct(stepConfig); err != nil {
+				log.SetErrorCategory(log.ErrorConfiguration)
+				return err
+			}
+
 			return nil
 		},
 		Run: func(_ *cobra.Command, _ []string) {
-			telemetryData := telemetry.CustomData{}
-			telemetryData.ErrorCode = "1"
+			vaultClient := config.GlobalVaultClient()
+			var oidcTokenProvider func(string) (string, error)
+			if vaultClient != nil {
+				defer vaultClient.MustRevokeToken()
+				oidcTokenProvider = vaultClient.GetOIDCTokenByValidation
+			}
+
+			stepTelemetryData := telemetry.CustomData{
+				ErrorCode: "1",
+			}
 			handler := func() {
+				commonPipelineEnvironment.persist(GeneralConfig.EnvRootPath, "commonPipelineEnvironment")
+				reports.persist(stepConfig, GeneralConfig.GCPJsonKeyFilePath, GeneralConfig.GCSBucketId, GeneralConfig.GCSFolderPath, GeneralConfig.GCSSubFolder)
 				config.RemoveVaultSecretFiles()
-				telemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
-				telemetryData.ErrorCategory = log.GetErrorCategory().String()
-				telemetry.Send(&telemetryData)
+				stepTelemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
+				stepTelemetryData.ErrorCategory = log.GetErrorCategory().String()
+				stepTelemetryData.PiperCommitHash = GitCommit
+				telemetryClient.SetData(&stepTelemetryData)
+				telemetryClient.LogStepTelemetryData()
+				if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.Dsn,
+						GeneralConfig.HookConfig.SplunkConfig.Token,
+						GeneralConfig.HookConfig.SplunkConfig.Index,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblToken,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblIndex,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.GCPPubSubConfig.ProjectNumber) > 0 {
+					if err := eventing.PublishTaskRunFinishedEvent(
+						oidcTokenProvider,
+						&GeneralConfig,
+						eventing.EventContext{
+							StepName:   STEP_NAME,
+							StageName:  telemetryClient.GetData().StageName,
+							ErrorCode:  stepTelemetryData.ErrorCode,
+							PipelineID: telemetryClient.GetBuildURL(),
+						},
+					); err != nil {
+						log.Entry().WithError(err).Warn("failed to publish GCP Pub/Sub event")
+					}
+				}
 			}
 			log.DeferExitHandler(handler)
 			defer handler()
-			telemetry.Initialize(GeneralConfig.NoTelemetry, STEP_NAME)
-			npmExecuteScripts(stepConfig, &telemetryData)
-			telemetryData.ErrorCode = "0"
+			telemetryClient.Initialize(STEP_NAME)
+			npmExecuteScripts(stepConfig, &stepTelemetryData, &commonPipelineEnvironment)
+			stepTelemetryData.ErrorCode = "0"
 			log.Entry().Info("SUCCESS")
 		},
 	}
@@ -89,6 +277,16 @@ func addNpmExecuteScriptsFlags(cmd *cobra.Command, stepConfig *npmExecuteScripts
 	cmd.Flags().StringSliceVar(&stepConfig.BuildDescriptorExcludeList, "buildDescriptorExcludeList", []string{`deployment/**`}, "List of build descriptors and therefore modules to exclude from execution of the npm scripts. The elements can either be a path to the build descriptor or a pattern.")
 	cmd.Flags().StringSliceVar(&stepConfig.BuildDescriptorList, "buildDescriptorList", []string{}, "List of build descriptors and therefore modules for execution of the npm scripts. The elements have to be paths to the build descriptors. **If set, buildDescriptorExcludeList will be ignored.**")
 	cmd.Flags().BoolVar(&stepConfig.CreateBOM, "createBOM", false, "Create a BOM xml using CycloneDX.")
+	cmd.Flags().BoolVar(&stepConfig.Publish, "publish", false, "Configures npm to publish the artifact to a repository.")
+	cmd.Flags().StringVar(&stepConfig.PublishTag, "publishTag", os.Getenv("PIPER_publishTag"), "Value of --tag flag that is passed to `npm publish` command. If not specified, it will be determined automatically depending on semver2 version (e.g., 1.0.0-202601012233 will be 'prerelease', 1.0.0 will be 'latest').")
+	cmd.Flags().StringVar(&stepConfig.RepositoryURL, "repositoryUrl", os.Getenv("PIPER_repositoryUrl"), "Url to the repository to which the project artifacts should be published.")
+	cmd.Flags().StringVar(&stepConfig.RepositoryPassword, "repositoryPassword", os.Getenv("PIPER_repositoryPassword"), "Password for the repository to which the project artifacts should be published.")
+	cmd.Flags().StringVar(&stepConfig.RepositoryUsername, "repositoryUsername", os.Getenv("PIPER_repositoryUsername"), "Username for the repository to which the project artifacts should be published.")
+	cmd.Flags().StringVar(&stepConfig.BuildSettingsInfo, "buildSettingsInfo", os.Getenv("PIPER_buildSettingsInfo"), "build settings info is typically filled by the step automatically to create information about the build settings that were used during the npm build . This information is typically used for compliance related processes.")
+	cmd.Flags().BoolVar(&stepConfig.PackBeforePublish, "packBeforePublish", false, "used for executing npm pack first, followed by npm publish. This two step maybe required in two cases. case 1) When building multiple npm packages (multiple package.json) please keep this parameter true and also see `buildDescriptorList` or  `buildDescriptorExcludeList` to choose which package(s) to publish. case 2)when you are building a single npm (single `package.json` in your repo) / multiple npm (multiple package.json) scoped package(s) and have npm dependencies from the same scope.")
+	cmd.Flags().BoolVar(&stepConfig.Production, "production", false, "used for omitting installation of dev. dependencies if true")
+	cmd.Flags().BoolVar(&stepConfig.CreateBuildArtifactsMetadata, "createBuildArtifactsMetadata", false, "metadata about the artifacts that are build and published , this metadata is generally used by steps downstream in the pipeline")
+	cmd.Flags().StringVar(&stepConfig.PnpmVersion, "pnpmVersion", os.Getenv("PIPER_pnpmVersion"), "Version of pnpm to use for installation. If not specified, will use globally installed pnpm or install latest locally. Only used when pnpm-lock.yaml is detected.")
 
 }
 
@@ -98,7 +296,54 @@ func npmExecuteScriptsMetadata() config.StepData {
 		Metadata: config.StepMetadata{
 			Name:        "npmExecuteScripts",
 			Aliases:     []config.Alias{{Name: "executeNpm", Deprecated: false}},
-			Description: "Execute npm run scripts on all npm packages in a project",
+			Description: "Handles JavaScript dependency installation via npm, yarn or pnpm and basic npm commands.",
+			Errors: []config.StepError{
+				{
+					Pattern:  "npm error code E401",
+					Message:  "",
+					Category: "authentication",
+				},
+				{
+					Pattern:  "npm error Incorrect or missing password",
+					Message:  "NPM authentication failed. Your password or token is incorrect.",
+					Category: "authentication",
+				},
+				{
+					Pattern:  "npm error 404.*Not Found",
+					Message:  "NPM package not found. Check package name and registry.",
+					Category: "dependency",
+				},
+				{
+					Pattern:  "npm error ENOTFOUND",
+					Message:  "NPM registry not reachable. Check network connection and registry URL.",
+					Category: "network",
+				},
+				{
+					Pattern:  "npm error EACCES",
+					Message:  "NPM permission denied. Check file permissions or registry access rights.",
+					Category: "permission",
+				},
+				{
+					Pattern:  "ERR_PNPM_FETCH_401",
+					Message:  "PNPM authentication failed. Check your credentials or token.",
+					Category: "authentication",
+				},
+				{
+					Pattern:  "npm error ERESOLVE",
+					Message:  "NPM dependency resolution failed. Review peer dependency conflicts.",
+					Category: "dependency",
+				},
+				{
+					Pattern:  "npm error EINTEGRITY",
+					Message:  "Package integrity check failed. Clear npm cache and retry installation.",
+					Category: "dependency",
+				},
+				{
+					Pattern:  "npm error code ENOENT.*package.json",
+					Message:  "Package.json file not found. Ensure package.json exists in the correct directory. For multi-module projects, check if buildDescriptorList and buildDescriptorExcludeList are correct.",
+					Category: "configuration",
+				},
+			},
 		},
 		Spec: config.StepSpec{
 			Inputs: config.StepInputs{
@@ -113,6 +358,7 @@ func npmExecuteScriptsMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     true,
 					},
 					{
 						Name:        "runScripts",
@@ -121,6 +367,7 @@ func npmExecuteScriptsMetadata() config.StepData {
 						Type:        "[]string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     []string{},
 					},
 					{
 						Name:        "defaultNpmRegistry",
@@ -129,6 +376,7 @@ func npmExecuteScriptsMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "npm/defaultNpmRegistry"}},
+						Default:     os.Getenv("PIPER_defaultNpmRegistry"),
 					},
 					{
 						Name:        "virtualFrameBuffer",
@@ -137,6 +385,7 @@ func npmExecuteScriptsMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     false,
 					},
 					{
 						Name:        "scriptOptions",
@@ -145,6 +394,7 @@ func npmExecuteScriptsMetadata() config.StepData {
 						Type:        "[]string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     []string{},
 					},
 					{
 						Name:        "buildDescriptorExcludeList",
@@ -153,6 +403,7 @@ func npmExecuteScriptsMetadata() config.StepData {
 						Type:        "[]string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     []string{`deployment/**`},
 					},
 					{
 						Name:        "buildDescriptorList",
@@ -161,6 +412,7 @@ func npmExecuteScriptsMetadata() config.StepData {
 						Type:        "[]string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     []string{},
 					},
 					{
 						Name:        "createBOM",
@@ -169,11 +421,159 @@ func npmExecuteScriptsMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     false,
+					},
+					{
+						Name:        "publish",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"STEPS", "STAGES", "PARAMETERS"},
+						Type:        "bool",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     false,
+					},
+					{
+						Name:        "publishTag",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"STEPS", "STAGES", "PARAMETERS"},
+						Type:        "string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_publishTag"),
+					},
+					{
+						Name: "repositoryUrl",
+						ResourceRef: []config.ResourceReference{
+							{
+								Name:  "commonPipelineEnvironment",
+								Param: "custom/npmRepositoryURL",
+							},
+
+							{
+								Name:  "commonPipelineEnvironment",
+								Param: "custom/repositoryUrl",
+							},
+						},
+						Scope:     []string{"GENERAL", "PARAMETERS", "STAGES", "STEPS"},
+						Type:      "string",
+						Mandatory: false,
+						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_repositoryUrl"),
+					},
+					{
+						Name: "repositoryPassword",
+						ResourceRef: []config.ResourceReference{
+							{
+								Name:  "commonPipelineEnvironment",
+								Param: "custom/npmRepositoryPassword",
+							},
+
+							{
+								Name:  "commonPipelineEnvironment",
+								Param: "custom/repositoryPassword",
+							},
+						},
+						Scope:     []string{"GENERAL", "PARAMETERS", "STAGES", "STEPS"},
+						Type:      "string",
+						Mandatory: false,
+						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_repositoryPassword"),
+					},
+					{
+						Name: "repositoryUsername",
+						ResourceRef: []config.ResourceReference{
+							{
+								Name:  "commonPipelineEnvironment",
+								Param: "custom/npmRepositoryUsername",
+							},
+
+							{
+								Name:  "commonPipelineEnvironment",
+								Param: "custom/repositoryUsername",
+							},
+						},
+						Scope:     []string{"GENERAL", "PARAMETERS", "STAGES", "STEPS"},
+						Type:      "string",
+						Mandatory: false,
+						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_repositoryUsername"),
+					},
+					{
+						Name: "buildSettingsInfo",
+						ResourceRef: []config.ResourceReference{
+							{
+								Name:  "commonPipelineEnvironment",
+								Param: "custom/buildSettingsInfo",
+							},
+						},
+						Scope:     []string{"STEPS", "STAGES", "PARAMETERS"},
+						Type:      "string",
+						Mandatory: false,
+						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_buildSettingsInfo"),
+					},
+					{
+						Name:        "packBeforePublish",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"STEPS", "STAGES", "PARAMETERS"},
+						Type:        "bool",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     false,
+					},
+					{
+						Name:        "production",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"STEPS", "STAGES", "PARAMETERS"},
+						Type:        "bool",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     false,
+					},
+					{
+						Name:        "createBuildArtifactsMetadata",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"STEPS", "STAGES", "PARAMETERS"},
+						Type:        "bool",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     false,
+					},
+					{
+						Name:        "pnpmVersion",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:        "string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_pnpmVersion"),
 					},
 				},
 			},
 			Containers: []config.Container{
-				{Name: "node", Image: "node:12-buster-slim"},
+				{Name: "node", Image: "docker.io/node:24-bookworm"},
+			},
+			Outputs: config.StepOutputs{
+				Resources: []config.StepResources{
+					{
+						Name: "commonPipelineEnvironment",
+						Type: "piperEnvironment",
+						Parameters: []map[string]any{
+							{"name": "custom/buildSettingsInfo"},
+							{"name": "custom/npmBuildArtifacts"},
+						},
+					},
+					{
+						Name: "reports",
+						Type: "reports",
+						Parameters: []map[string]any{
+							{"filePattern": "**/bom-npm.xml", "type": "sbom"},
+							{"filePattern": "**/TEST-*.xml", "type": "junit"},
+							{"filePattern": "**/cobertura-coverage.xml", "type": "cobertura-coverage"},
+							{"filePattern": "**/e2e/*.json", "type": "cucumber"},
+						},
+					},
+				},
 			},
 		},
 	}

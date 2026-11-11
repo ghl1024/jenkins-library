@@ -2,13 +2,13 @@ package cmd
 
 import (
 	"context"
-
-	"github.com/SAP/jenkins-library/pkg/log"
-	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/google/go-github/v32/github"
-	"github.com/pkg/errors"
+	"fmt"
 
 	piperGithub "github.com/SAP/jenkins-library/pkg/github"
+	"github.com/SAP/jenkins-library/pkg/log"
+	"github.com/SAP/jenkins-library/pkg/telemetry"
+
+	"github.com/google/go-github/v68/github"
 )
 
 type githubIssueCommentService interface {
@@ -16,7 +16,8 @@ type githubIssueCommentService interface {
 }
 
 func githubCommentIssue(config githubCommentIssueOptions, telemetryData *telemetry.CustomData) {
-	ctx, client, err := piperGithub.NewClient(config.Token, config.APIURL, "")
+	// TODO provide parameter for trusted certs
+	ctx, client, err := piperGithub.NewClientBuilder(config.Token, config.APIURL).Build()
 	if err != nil {
 		log.Entry().WithError(err).Fatal("Failed to get GitHub client")
 	}
@@ -34,7 +35,7 @@ func runGithubCommentIssue(ctx context.Context, config *githubCommentIssueOption
 	newcomment, resp, err := ghIssueCommentService.CreateComment(ctx, config.Owner, config.Repository, config.Number, &issueComment)
 	if err != nil {
 		log.Entry().Errorf("GitHub response code %v", resp.Status)
-		return errors.Wrapf(err, "Error occurred when creating comment on issue %v", config.Number)
+		return fmt.Errorf("Error occurred when creating comment on issue %v: %w", config.Number, err)
 	}
 	log.Entry().Debugf("New issue comment created for issue %v: %v", config.Number, newcomment)
 

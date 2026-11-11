@@ -1,8 +1,12 @@
+//go:build unit
+// +build unit
+
 package validation
 
 import (
-	"github.com/stretchr/testify/assert"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 type Connection struct {

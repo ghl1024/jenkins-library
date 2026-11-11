@@ -2,20 +2,19 @@ package piperenv
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/SAP/jenkins-library/pkg/log"
-	"github.com/pkg/errors"
 )
 
 // This file contains functions used to read/write pipeline environment data from/to disk.
 // The content of a written file is the value. For the custom parameters this could for example also be a JSON representation of a more complex value.
 
 // SetResourceParameter sets a resource parameter in the environment stored in the file system
-func SetResourceParameter(path, resourceName, paramName string, value interface{}) error {
+func SetResourceParameter(path, resourceName, paramName string, value any) error {
 	var content []byte
 	paramPath := filepath.Join(path, resourceName, paramName)
 	switch typedValue := value.(type) {
@@ -26,7 +25,7 @@ func SetResourceParameter(path, resourceName, paramName string, value interface{
 		paramPath += ".json"
 		content, err = json.Marshal(typedValue)
 		if err != nil {
-			return errors.Wrapf(err, "failed to marshal resource parameter value %v", typedValue)
+			return fmt.Errorf("failed to marshal resource parameter value %v: %w", typedValue, err)
 		}
 	}
 	return writeToDisk(paramPath, content)
@@ -34,7 +33,8 @@ func SetResourceParameter(path, resourceName, paramName string, value interface{
 
 // GetResourceParameter reads a resource parameter from the environment stored in the file system
 func GetResourceParameter(path, resourceName, paramName string) string {
-	//TODO: align JSON un/marshalling, currently done in pkg/congif/stepmeta.go#getParameterValue
+	//TODO: align JSON un/marshalling, currently done in pkg/config/stepmeta.go#getParameterValue
+
 	paramPath := filepath.Join(path, resourceName, paramName)
 	return readFromDisk(paramPath)
 }
@@ -55,13 +55,16 @@ func writeToDisk(filename string, data []byte) error {
 
 	if _, err := os.Stat(filepath.Dir(filename)); os.IsNotExist(err) {
 		log.Entry().Debugf("Creating directory: %v", filepath.Dir(filename))
-		os.MkdirAll(filepath.Dir(filename), 0777)
+		cErr := os.MkdirAll(filepath.Dir(filename), 0777)
+		if cErr != nil {
+			return fmt.Errorf("failed to create directory %v, %w", filepath.Dir(filename), cErr)
+		}
 	}
 
 	//ToDo: make sure to not overwrite file but rather add another file? Create error if already existing?
 	if len(data) > 0 {
 		log.Entry().Debugf("Writing file to disk: %v", filename)
-		return ioutil.WriteFile(filename, data, 0766)
+		return os.WriteFile(filename, data, 0766)
 	}
 	return nil
 }
@@ -69,7 +72,7 @@ func writeToDisk(filename string, data []byte) error {
 func readFromDisk(filename string) string {
 	//ToDo: if multiple files exist, read from latest file
 	log.Entry().Debugf("Reading file from disk: %v", filename)
-	v, err := ioutil.ReadFile(filename)
+	v, err := os.ReadFile(filename)
 	val := string(v)
 	if err != nil {
 		val = ""

@@ -9,10 +9,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/SAP/jenkins-library/pkg/log"
-	"github.com/pkg/errors"
 )
 
 const jvmTarGz = "jvm.tar.gz"
@@ -21,27 +22,51 @@ const projectRegEx = `Project name: ([^,]*), URL: (.*)`
 
 // ExecuteUAScan executes a scan with the Whitesource Unified Agent.
 func (s *Scan) ExecuteUAScan(config *ScanOptions, utils Utils) error {
-	if config.BuildTool != "mta" {
-		return s.ExecuteUAScanInPath(config, utils, ".")
+	s.AgentName = "WhiteSource Unified Agent"
+
+	switch config.BuildTool {
+	case "mta":
+		return s.ExecuteUAScanForMTA(config, utils)
+	case "npm":
+		if config.DisableNpmSubmodulesAggregation {
+			return s.ExecuteUAScanForMultiModuleNPM(config, utils)
+		} else {
+			return s.ExecuteUAScanInPath(config, utils, config.ScanPath)
+		}
+	default:
+		return s.ExecuteUAScanInPath(config, utils, config.ScanPath)
 	}
 
+}
+
+func (s *Scan) ExecuteUAScanForMTA(config *ScanOptions, utils Utils) error {
 	log.Entry().Infof("Executing WhiteSource UA scan for MTA project")
+
+	log.Entry().Infof("Executing WhiteSource UA scan for Maven part")
 	pomExists, _ := utils.FileExists("pom.xml")
 	if pomExists {
 		mavenConfig := *config
 		mavenConfig.BuildTool = "maven"
-		if err := s.ExecuteUAScanInPath(&mavenConfig, utils, "."); err != nil {
-			return errors.Wrap(err, "failed to run scan for maven modules of mta")
+		if err := s.ExecuteUAScanInPath(&mavenConfig, utils, config.ScanPath); err != nil {
+			return fmt.Errorf("failed to run scan for maven modules of mta: %w", err)
 		}
 	} else {
 		if pomFiles, _ := utils.Glob("**/pom.xml"); len(pomFiles) > 0 {
+			log.SetErrorCategory(log.ErrorCustom)
 			return fmt.Errorf("mta project with java modules does not contain an aggregator pom.xml in the root - this is mandatory")
 		}
 	}
 
+	log.Entry().Infof("Executing WhiteSource UA scan for NPM part")
+	return s.ExecuteUAScanForMultiModuleNPM(config, utils)
+}
+
+func (s *Scan) ExecuteUAScanForMultiModuleNPM(config *ScanOptions, utils Utils) error {
+	log.Entry().Infof("Executing WhiteSource UA scan for multi-module NPM projects")
+
 	packageJSONFiles, err := utils.FindPackageJSONFiles(config)
 	if err != nil {
-		return errors.Wrap(err, "failed to find package.json files")
+		return fmt.Errorf("failed to find package.json files: %w", err)
 	}
 	if len(packageJSONFiles) > 0 {
 		npmConfig := *config
@@ -51,13 +76,13 @@ func (s *Scan) ExecuteUAScan(config *ScanOptions, utils Utils) error {
 			modulePath, _ := filepath.Split(packageJSONFile)
 			projectName, err := getProjectNameFromPackageJSON(packageJSONFile, utils)
 			if err != nil {
-				return errors.Wrapf(err, "failed retrieve project name")
+				return fmt.Errorf("failed retrieve project name: %w", err)
 			}
 			npmConfig.ProjectName = projectName
 			// ToDo: likely needs to be refactored, AggregateProjectName should only be available if we want to force aggregation?
 			s.AggregateProjectName = projectName
 			if err := s.ExecuteUAScanInPath(&npmConfig, utils, modulePath); err != nil {
-				return errors.Wrapf(err, "failed to run scan for npm module %v", modulePath)
+				return fmt.Errorf("failed to run scan for npm module %v: %w", modulePath, err)
 			}
 		}
 	}
@@ -81,14 +106,34 @@ func (s *Scan) ExecuteUAScanInPath(config *ScanOptions, utils Utils, scanPath st
 		return err
 	}
 
+	// Fetch version of UA
+	versionBuffer := bytes.Buffer{}
+	utils.Stdout(&versionBuffer)
+	err = utils.RunExecutable(javaPath, "-jar", config.AgentFileName, "-v")
+	if err != nil {
+		return fmt.Errorf("Failed to determine UA version: %w", err)
+	}
+	s.AgentVersion = strings.TrimSpace(versionBuffer.String())
+	log.Entry().Debugf("Read UA version %v from Stdout", s.AgentVersion)
+	utils.Stdout(log.Writer())
+
 	// ToDo: Check if Download of Docker/container image should be done here instead of in cmd/whitesourceExecuteScan.go
 
 	// ToDo: check if this is required
-	if err := s.AppendScannedProject(s.AggregateProjectName); err != nil {
-		return err
+	if !config.SkipParentProjectResolution {
+		if err := s.AppendScannedProject(s.AggregateProjectName); err != nil {
+			return err
+		}
 	}
 
-	configPath, err := config.RewriteUAConfigurationFile(utils, s.AggregateProjectName)
+	if config.UseGlobalConfiguration {
+		config.ConfigFilePath, err = filepath.Abs(config.ConfigFilePath)
+		if err != nil {
+			return err
+		}
+	}
+
+	configPath, err := config.RewriteUAConfigurationFile(utils, s.AggregateProjectName, config.Verbose)
 	if err != nil {
 		return err
 	}
@@ -121,7 +166,6 @@ func (s *Scan) ExecuteUAScanInPath(config *ScanOptions, utils Utils, scanPath st
 		defer wg.Done()
 		scanLog(trErr, s)
 	}()
-
 	err = utils.RunExecutable(javaPath, "-jar", config.AgentFileName, "-d", scanPath, "-c", configPath, "-wss.url", config.AgentURL)
 
 	if err := removeJre(javaPath, utils); err != nil {
@@ -135,7 +179,7 @@ func (s *Scan) ExecuteUAScanInPath(config *ScanOptions, utils Utils, scanPath st
 		exitCode := utils.GetExitCode()
 		log.Entry().Infof("WhiteSource scan failed with exit code %v", exitCode)
 		evaluateExitCode(exitCode)
-		return errors.Wrapf(err, "failed to execute WhiteSource scan with exit code %v", exitCode)
+		return fmt.Errorf("failed to execute WhiteSource scan with exit code %v: %w", exitCode, err)
 	}
 	return nil
 }
@@ -171,12 +215,22 @@ func downloadAgent(config *ScanOptions, utils Utils) error {
 	agentFile := config.AgentFileName
 	exists, err := utils.FileExists(agentFile)
 	if err != nil {
-		return errors.Wrapf(err, "failed to check if file '%s' exists", agentFile)
+		return fmt.Errorf("failed to check if file '%s' exists: %w", agentFile, err)
 	}
 	if !exists {
 		err := utils.DownloadFile(config.AgentDownloadURL, agentFile, nil, nil)
 		if err != nil {
-			return errors.Wrapf(err, "failed to download unified agent from URL '%s' to file '%s'", config.AgentDownloadURL, agentFile)
+			// we check if the copy and the unauthorized error occurs and retry the download
+			// if the copy error did not happen, we rerun the whole download mechanism once
+			if strings.Contains(err.Error(), "unable to copy content from url to file") || strings.Contains(err.Error(), "returned with response 404 Not Found") || strings.Contains(err.Error(), "returned with response 403 Forbidden") {
+				// retry the download once again
+				log.Entry().Warnf("[Retry] Previous download failed due to %v", err)
+				err = utils.DownloadFile(config.AgentDownloadURL, agentFile, nil, nil)
+			}
+		}
+
+		if err != nil {
+			return fmt.Errorf("failed to download unified agent from URL '%s' to file '%s': %w", config.AgentDownloadURL, agentFile, err)
 		}
 	}
 	return nil
@@ -192,9 +246,24 @@ func downloadJre(config *ScanOptions, utils Utils) (string, error) {
 	javaPath := "java"
 	if err != nil {
 		log.Entry().Infof("No Java installation found, downloading JVM from %v", config.JreDownloadURL)
-		err := utils.DownloadFile(config.JreDownloadURL, jvmTarGz, nil, nil)
+		const maxRetries = 3
+		retries := 0
+		for retries < maxRetries {
+			err = utils.DownloadFile(config.JreDownloadURL, jvmTarGz, nil, nil)
+			if err == nil {
+				break
+			}
+			log.Entry().Warnf("Attempt %d: Download failed due to %v", retries+1, err)
+			retries++
+			if retries >= maxRetries {
+				log.Entry().Errorf("Download failed after %d attempts", retries)
+				return "", fmt.Errorf("failed to download jre from URL '%s': %w", config.JreDownloadURL, err)
+			}
+			time.Sleep(1 * time.Second)
+		}
+
 		if err != nil {
-			return "", errors.Wrapf(err, "failed to download jre from URL '%s'", config.JreDownloadURL)
+			return "", fmt.Errorf("Even after retry failed to download jre from URL '%s': %w", config.JreDownloadURL, err)
 		}
 
 		// ToDo: replace tar call with go library call
@@ -202,7 +271,7 @@ func downloadJre(config *ScanOptions, utils Utils) (string, error) {
 
 		err = utils.RunExecutable("tar", fmt.Sprintf("--directory=%v", jvmDir), "--strip-components=1", "-xzf", jvmTarGz)
 		if err != nil {
-			return "", errors.Wrapf(err, "failed to extract %v", jvmTarGz)
+			return "", fmt.Errorf("failed to extract %v: %w", jvmTarGz, err)
 		}
 		log.Entry().Info("Java successfully installed")
 		javaPath = filepath.Join(jvmDir, "bin", "java")
@@ -228,11 +297,11 @@ func removeJre(javaPath string, utils Utils) error {
 func getProjectNameFromPackageJSON(packageJSONPath string, utils Utils) (string, error) {
 	fileContents, err := utils.FileRead(packageJSONPath)
 	if err != nil {
-		return "", errors.Wrapf(err, "failed to read file %v", packageJSONPath)
+		return "", fmt.Errorf("failed to read file %v: %w", packageJSONPath, err)
 	}
-	var packageJSON = make(map[string]interface{})
+	var packageJSON = make(map[string]any)
 	if err := json.Unmarshal(fileContents, &packageJSON); err != nil {
-		return "", errors.Wrapf(err, "failed to read file content of %v", packageJSONPath)
+		return "", fmt.Errorf("failed to read file content of %v: %w", packageJSONPath, err)
 	}
 
 	projectNameEntry, exists := packageJSON["name"]

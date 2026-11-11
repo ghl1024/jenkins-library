@@ -8,49 +8,75 @@ import (
 	"time"
 
 	"github.com/SAP/jenkins-library/pkg/config"
+	"github.com/SAP/jenkins-library/pkg/eventing"
 	"github.com/SAP/jenkins-library/pkg/log"
+	"github.com/SAP/jenkins-library/pkg/splunk"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
+	"github.com/SAP/jenkins-library/pkg/validation"
+
 	"github.com/spf13/cobra"
 )
 
 type gctsRollbackOptions struct {
-	Username                  string `json:"username,omitempty"`
-	Password                  string `json:"password,omitempty"`
-	Repository                string `json:"repository,omitempty"`
-	Host                      string `json:"host,omitempty"`
-	Client                    string `json:"client,omitempty"`
-	Commit                    string `json:"commit,omitempty"`
-	GithubPersonalAccessToken string `json:"githubPersonalAccessToken,omitempty"`
+	Username                  string         `json:"username,omitempty"`
+	Password                  string         `json:"password,omitempty"`
+	Repository                string         `json:"repository,omitempty"`
+	Host                      string         `json:"host,omitempty"`
+	Client                    string         `json:"client,omitempty"`
+	Commit                    string         `json:"commit,omitempty"`
+	GithubPersonalAccessToken string         `json:"githubPersonalAccessToken,omitempty"`
+	QueryParameters           map[string]any `json:"queryParameters,omitempty"`
+	SkipSSLVerification       bool           `json:"skipSSLVerification,omitempty"`
+	Proxy                     string         `json:"proxy,omitempty"`
 }
 
-// GctsRollbackCommand Perfoms roll back of one (default) or several commit(s)
+// GctsRollbackCommand Perfoms a rollback of one (default) or several commits
 func GctsRollbackCommand() *cobra.Command {
 	const STEP_NAME = "gctsRollback"
 
 	metadata := gctsRollbackMetadata()
 	var stepConfig gctsRollbackOptions
 	var startTime time.Time
+	var logCollector *log.CollectorHook
+	var splunkClient *splunk.Splunk
+	telemetryClient := &telemetry.Telemetry{}
 
 	var createGctsRollbackCmd = &cobra.Command{
 		Use:   STEP_NAME,
-		Short: "Perfoms roll back of one (default) or several commit(s)",
-		Long: `This step performs a rollback of commit(s) in a local ABAP system repository. If a <commit> parameter is specified, it will be used as the target commit for the rollback.
-If no <commit> parameter is specified and the remote repository domain is 'github.com', the last commit with status 'success' will be used for the rollback. Otherwise,
-gctsRollback will rollback to the previously active commit in the local repository.`,
+		Short: "Perfoms a rollback of one (default) or several commits",
+		Long: `This step performs a rollback of commits in a local ABAP repository. If a ` + "`" + `commit` + "`" + ` parameter is specified, it will be used as the target commit for the rollback.
+If no ` + "`" + `commit` + "`" + ` parameter is specified and the remote repository domain is 'github.com', the last commit with the status 'success' will be used for the rollback. Otherwise,
+` + "`" + `gctsRollback` + "`" + ` will roll back to the previously active commit in the local repository.`,
 		PreRunE: func(cmd *cobra.Command, _ []string) error {
 			startTime = time.Now()
 			log.SetStepName(STEP_NAME)
 			log.SetVerbose(GeneralConfig.Verbose)
 
-			path, _ := os.Getwd()
+			GeneralConfig.GitHubAccessTokens = ResolveAccessTokens(GeneralConfig.GitHubTokens)
+
+			path, err := os.Getwd()
+			if err != nil {
+				return err
+			}
 			fatalHook := &log.FatalHook{CorrelationID: GeneralConfig.CorrelationID, Path: path}
 			log.RegisterHook(fatalHook)
 
-			err := PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
+			err = PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
 			if err != nil {
 				log.SetErrorCategory(log.ErrorConfiguration)
 				return err
 			}
+
+			// Set step error patterns for improved error detection
+			stepErrors := make([]log.StepError, len(metadata.Metadata.Errors))
+			for i, err := range metadata.Metadata.Errors {
+				stepErrors[i] = log.StepError{
+					Pattern:  err.Pattern,
+					Message:  err.Message,
+					Category: err.Category,
+				}
+			}
+			log.SetStepErrors(stepErrors)
 			log.RegisterSecret(stepConfig.Username)
 			log.RegisterSecret(stepConfig.Password)
 			log.RegisterSecret(stepConfig.GithubPersonalAccessToken)
@@ -60,22 +86,81 @@ gctsRollback will rollback to the previously active commit in the local reposito
 				log.RegisterHook(&sentryHook)
 			}
 
+			if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 || len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+				splunkClient = &splunk.Splunk{}
+				logCollector = &log.CollectorHook{CorrelationID: GeneralConfig.CorrelationID}
+				log.RegisterHook(logCollector)
+			}
+
+			if err = log.RegisterANSHookIfConfigured(GeneralConfig.CorrelationID); err != nil {
+				log.Entry().WithError(err).Warn("failed to set up SAP Alert Notification Service log hook")
+			}
+
+			validation, err := validation.New(validation.WithJSONNamesForStructFields(), validation.WithPredefinedErrorMessages())
+			if err != nil {
+				return err
+			}
+			if err = validation.ValidateStruct(stepConfig); err != nil {
+				log.SetErrorCategory(log.ErrorConfiguration)
+				return err
+			}
+
 			return nil
 		},
 		Run: func(_ *cobra.Command, _ []string) {
-			telemetryData := telemetry.CustomData{}
-			telemetryData.ErrorCode = "1"
+			vaultClient := config.GlobalVaultClient()
+			var oidcTokenProvider func(string) (string, error)
+			if vaultClient != nil {
+				defer vaultClient.MustRevokeToken()
+				oidcTokenProvider = vaultClient.GetOIDCTokenByValidation
+			}
+
+			stepTelemetryData := telemetry.CustomData{
+				ErrorCode: "1",
+			}
 			handler := func() {
 				config.RemoveVaultSecretFiles()
-				telemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
-				telemetryData.ErrorCategory = log.GetErrorCategory().String()
-				telemetry.Send(&telemetryData)
+				stepTelemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
+				stepTelemetryData.ErrorCategory = log.GetErrorCategory().String()
+				stepTelemetryData.PiperCommitHash = GitCommit
+				telemetryClient.SetData(&stepTelemetryData)
+				telemetryClient.LogStepTelemetryData()
+				if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.Dsn,
+						GeneralConfig.HookConfig.SplunkConfig.Token,
+						GeneralConfig.HookConfig.SplunkConfig.Index,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblToken,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblIndex,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.GCPPubSubConfig.ProjectNumber) > 0 {
+					if err := eventing.PublishTaskRunFinishedEvent(
+						oidcTokenProvider,
+						&GeneralConfig,
+						eventing.EventContext{
+							StepName:   STEP_NAME,
+							StageName:  telemetryClient.GetData().StageName,
+							ErrorCode:  stepTelemetryData.ErrorCode,
+							PipelineID: telemetryClient.GetBuildURL(),
+						},
+					); err != nil {
+						log.Entry().WithError(err).Warn("failed to publish GCP Pub/Sub event")
+					}
+				}
 			}
 			log.DeferExitHandler(handler)
 			defer handler()
-			telemetry.Initialize(GeneralConfig.NoTelemetry, STEP_NAME)
-			gctsRollback(stepConfig, &telemetryData)
-			telemetryData.ErrorCode = "0"
+			telemetryClient.Initialize(STEP_NAME)
+			gctsRollback(stepConfig, &stepTelemetryData)
+			stepTelemetryData.ErrorCode = "0"
 			log.Entry().Info("SUCCESS")
 		},
 	}
@@ -85,13 +170,16 @@ gctsRollback will rollback to the previously active commit in the local reposito
 }
 
 func addGctsRollbackFlags(cmd *cobra.Command, stepConfig *gctsRollbackOptions) {
-	cmd.Flags().StringVar(&stepConfig.Username, "username", os.Getenv("PIPER_username"), "User to authenticate to the ABAP system")
-	cmd.Flags().StringVar(&stepConfig.Password, "password", os.Getenv("PIPER_password"), "Password to authenticate to the ABAP system")
+	cmd.Flags().StringVar(&stepConfig.Username, "username", os.Getenv("PIPER_username"), "User that authenticates to the ABAP system. **Note** - Don't provide this parameter directly. Either set it in the environment, or in the Jenkins credentials store, and provide the ID as value of the `abapCredentialsId` parameter.")
+	cmd.Flags().StringVar(&stepConfig.Password, "password", os.Getenv("PIPER_password"), "Password of the ABAP user that authenticates to the ABAP system. **Note** - Don´t provide this parameter directly. Either set it in the environment, or in the Jenkins credentials store, and provide the ID as value of the `abapCredentialsId` parameter.")
 	cmd.Flags().StringVar(&stepConfig.Repository, "repository", os.Getenv("PIPER_repository"), "Specifies the name (ID) of the local repsitory on the ABAP system")
-	cmd.Flags().StringVar(&stepConfig.Host, "host", os.Getenv("PIPER_host"), "Specifies the protocol and host address, including the port. Please provide in the format '<protocol>://<host>:<port>'")
+	cmd.Flags().StringVar(&stepConfig.Host, "host", os.Getenv("PIPER_host"), "Protocol and host of the ABAP system, including the port. Please provide in the format `<protocol>://<host>:<port>`. Supported protocols are `http` and `https`.")
 	cmd.Flags().StringVar(&stepConfig.Client, "client", os.Getenv("PIPER_client"), "Specifies the client of the ABAP system to be addressed")
-	cmd.Flags().StringVar(&stepConfig.Commit, "commit", os.Getenv("PIPER_commit"), "Specifies the commit to deploy")
+	cmd.Flags().StringVar(&stepConfig.Commit, "commit", os.Getenv("PIPER_commit"), "Specifies the target commit for the rollback")
 	cmd.Flags().StringVar(&stepConfig.GithubPersonalAccessToken, "githubPersonalAccessToken", os.Getenv("PIPER_githubPersonalAccessToken"), "GitHub personal access token with at least read permissions for the remote repository")
+
+	cmd.Flags().BoolVar(&stepConfig.SkipSSLVerification, "skipSSLVerification", false, "You can skip the SSL (Secure Socket Layer) verification for the http client")
+	cmd.Flags().StringVar(&stepConfig.Proxy, "proxy", os.Getenv("PIPER_proxy"), "Proxy URL to be used for HTTP requests to the ABAP system. Provide in the format `<protocol>://<host>:<port>` (e.g., `http://proxy.company.com:8080`)")
 
 	cmd.MarkFlagRequired("username")
 	cmd.MarkFlagRequired("password")
@@ -106,10 +194,14 @@ func gctsRollbackMetadata() config.StepData {
 		Metadata: config.StepMetadata{
 			Name:        "gctsRollback",
 			Aliases:     []config.Alias{},
-			Description: "Perfoms roll back of one (default) or several commit(s)",
+			Description: "Perfoms a rollback of one (default) or several commits",
 		},
 		Spec: config.StepSpec{
 			Inputs: config.StepInputs{
+				Secrets: []config.StepSecrets{
+					{Name: "abapCredentialsId", Description: "ID taken from the Jenkins credentials store containing user name and password of the user that authenticates to the ABAP system on which you want to execute the rollback.", Type: "jenkins"},
+					{Name: "githubPersonalAccessTokenId", Description: "GitHub personal access token with at least read permissions for the remote repository", Type: "jenkins"},
+				},
 				Parameters: []config.StepParameters{
 					{
 						Name: "username",
@@ -124,6 +216,7 @@ func gctsRollbackMetadata() config.StepData {
 						Type:      "string",
 						Mandatory: true,
 						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_username"),
 					},
 					{
 						Name: "password",
@@ -138,6 +231,7 @@ func gctsRollbackMetadata() config.StepData {
 						Type:      "string",
 						Mandatory: true,
 						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_password"),
 					},
 					{
 						Name:        "repository",
@@ -146,6 +240,7 @@ func gctsRollbackMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   true,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_repository"),
 					},
 					{
 						Name:        "host",
@@ -154,6 +249,7 @@ func gctsRollbackMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   true,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_host"),
 					},
 					{
 						Name:        "client",
@@ -162,6 +258,7 @@ func gctsRollbackMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   true,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_client"),
 					},
 					{
 						Name:        "commit",
@@ -170,6 +267,7 @@ func gctsRollbackMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_commit"),
 					},
 					{
 						Name: "githubPersonalAccessToken",
@@ -183,6 +281,33 @@ func gctsRollbackMetadata() config.StepData {
 						Type:      "string",
 						Mandatory: false,
 						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_githubPersonalAccessToken"),
+					},
+					{
+						Name:        "queryParameters",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:        "map[string]any",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+					},
+					{
+						Name:        "skipSSLVerification",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:        "bool",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     false,
+					},
+					{
+						Name:        "proxy",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "GENERAL", "STAGES", "STEPS"},
+						Type:        "string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_proxy"),
 					},
 				},
 			},

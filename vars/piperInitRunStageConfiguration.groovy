@@ -34,13 +34,11 @@ import groovy.transform.Field
      * Defines the library resource that contains the stage configuration settings
      */
     'stageConfigResource'
-
 ])
 
 @Field Set PARAMETER_KEYS = STEP_CONFIG_KEYS
 
 void call(Map parameters = [:]) {
-
     def script = checkScript(this, parameters) ?: this
     String stageName = parameters.stageName ?: env.STAGE_NAME
 
@@ -57,60 +55,46 @@ void call(Map parameters = [:]) {
         .withMandatoryProperty('stageConfigResource')
         .use()
 
+    // Go logic to check if the step is active
+    String piperGoPath = parameters?.piperGoPath ?: './piper'
+    def resource = libraryResource(config.stageConfigResource)
+    config.stages = (readYaml(text: resource)).spec.stages
+    writeFile(file: ".pipeline/stage_conditions.yaml", text: resource)
+    def success = piperExecuteBin.checkIfStepActive(parameters, script, piperGoPath, ".pipeline/stage_conditions.yaml", ".pipeline/step_out.json", ".pipeline/stage_out.json")
+    if (!success) {
+        throw new Exception("checkIfStepActive finished with error")
+    }
 
-    config.stages = (readYaml(text: libraryResource(config.stageConfigResource))).stages
+    def stagesJSONObject = script.readJSON file: ".pipeline/stage_out.json"
+    def stepsJSONObject = script.readJSON file: ".pipeline/step_out.json"
+    if (stagesJSONObject) {
+        script.commonPipelineEnvironment.configuration.runStage = new LinkedHashMap(stagesJSONObject)
+    }
+    if (stepsJSONObject) {
+        script.commonPipelineEnvironment.configuration.runStep = new LinkedHashMap(stepsJSONObject)
+    }
 
-    //handling of stage and step activation
-    config.stages.each {stage ->
+    handleRenamedStages(script)
 
+    // Retaining this groovy code as some additional checks for activating-deactivating a stage seems to be done.
+    script.commonPipelineEnvironment.configuration.runStage.each {stage ->
         String currentStage = stage.getKey()
-        script.commonPipelineEnvironment.configuration.runStep[currentStage] = [:]
-
-        // Always test step conditions in order to fill runStep[currentStage] map
-        boolean anyStepConditionTrue = false
-        stage.getValue().stepConditions?.each {step ->
-            boolean stepActive = false
-            String stepName = step.getKey()
-            step.getValue().each {condition ->
-                Map stepConfig = script.commonPipelineEnvironment.getStepConfiguration(stepName, currentStage)
-                switch(condition.getKey()) {
-                    case 'config':
-                        stepActive = stepActive || checkConfig(condition, stepConfig)
-                        break
-                    case 'configKeys':
-                        stepActive = stepActive || checkConfigKeys(condition, stepConfig)
-                        break
-                    case 'filePatternFromConfig':
-                        stepActive = stepActive || checkForFilesWithPatternFromConfig(script, condition, stepConfig)
-                        break
-                    case 'filePattern':
-                        stepActive = stepActive || checkForFilesWithPattern(script, condition)
-                        break
-                    case 'npmScripts':
-                        stepActive = stepActive || checkForNpmScriptsInPackages(script, condition)
-                        break
-                }
-            }
-            script.commonPipelineEnvironment.configuration.runStep[currentStage][stepName] = stepActive
-
-            anyStepConditionTrue = anyStepConditionTrue || stepActive
-        }
-
         Map stageConfig = ConfigurationHelper.newInstance(this)
             .loadStepDefaults([:], currentStage)
             .mixinStageConfig(script.commonPipelineEnvironment, currentStage)
             .use()
 
-        boolean runStage
+        boolean runStage = stage.getValue()
         if (stageConfig.runInAllBranches == false && (config.productiveBranch != env.BRANCH_NAME)) {
             runStage = false
         } else if (ConfigurationLoader.stageConfiguration(script, currentStage)) {
             //activate stage if stage configuration is available
             runStage = true
-        } else if (stage.getValue().extensionExists == true) {
-            runStage = anyStepConditionTrue || checkExtensionExists(script, config, currentStage)
         } else {
-            runStage = anyStepConditionTrue
+            def extensionExists = config.stages.find {e -> e.displayName == currentStage && e.extensionExists == true?true:false}
+            if (extensionExists != null) {
+                runStage = runStage || checkExtensionExists(script, config, currentStage)
+            }
         }
 
         script.commonPipelineEnvironment.configuration.runStage[currentStage] = runStage
@@ -137,76 +121,26 @@ private static boolean checkExtensionExists(Script script, Map config, String st
     return script.fileExists(projectInterceptorFile) || script.fileExists(globalInterceptorFile)
 }
 
-private static boolean checkConfig(def condition, Map stepConfig) {
-    Boolean configExists = false
-    if (condition.getValue() instanceof Map) {
-        condition.getValue().each {configCondition ->
-            if (MapUtils.getByPath(stepConfig, configCondition.getKey()) in configCondition.getValue()) {
-                configExists = true
-            }
-        }
-    } else if (MapUtils.getByPath(stepConfig, condition.getValue())) {
-        configExists = true
+/**
+ Before syncing the piper-stage-config.yml file, there were differences in the display names of some stages.
+ This function duplicates the runStage and runStep values from the new stage name into the old one to ensure compatibility.
+ For example, the 'Build' is not used in Jenkins but is used by other orchestrators, whereas 'Central Build' is
+ used by Jenkins but unused by other orchestrators.
+ */
+private static void handleRenamedStages(Script script) {
+    if(script.commonPipelineEnvironment.configuration.runStage.containsKey("Build")) {
+        script.commonPipelineEnvironment.configuration.runStage["Central Build"] = script.commonPipelineEnvironment.configuration.runStage["Build"]
     }
-    return configExists
-}
 
-private static boolean checkConfigKeys(def condition, Map stepConfig) {
-    Boolean configKeyExists = false
-    if (condition.getValue() instanceof List) {
-        condition.getValue().each { configKey ->
-            if (MapUtils.getByPath(stepConfig, configKey)) {
-                configKeyExists = true
-            }
-        }
-    } else if (MapUtils.getByPath(stepConfig, condition.getValue())) {
-        configKeyExists = true
+    if(script.commonPipelineEnvironment.configuration.runStep.containsKey("Build")) {
+        script.commonPipelineEnvironment.configuration.runStep["Central Build"] = script.commonPipelineEnvironment.configuration.runStep["Build"]
     }
-    return configKeyExists
-}
 
-private static boolean checkForFilesWithPatternFromConfig (Script script, def condition, Map stepConfig) {
-    def conditionValue = MapUtils.getByPath(stepConfig, condition.getValue())
-    if (conditionValue && script.findFiles(glob: conditionValue)) {
-        return true
+    if(script.commonPipelineEnvironment.configuration.runStage.containsKey("Post")) {
+        script.commonPipelineEnvironment.configuration.runStage["Post Actions"] = script.commonPipelineEnvironment.configuration.runStage["Post"]
     }
-    return false
-}
 
-private static boolean checkForFilesWithPattern (Script script, def condition) {
-    Boolean filesExist = false
-    if (condition.getValue() instanceof List) {
-        condition.getValue().each {configKey ->
-            if (script.findFiles(glob: configKey)) {
-                filesExist = true
-            }
-        }
-    } else {
-        if (script.findFiles(glob: condition.getValue())) {
-            filesExist = true
-        }
+    if(script.commonPipelineEnvironment.configuration.runStep.containsKey("Post")) {
+        script.commonPipelineEnvironment.configuration.runStep["Post Actions"] = script.commonPipelineEnvironment.configuration.runStep["Post"]
     }
-    return filesExist
-}
-
-private static boolean checkForNpmScriptsInPackages (Script script, def condition) {
-    def packages = script.findFiles(glob: '**/package.json', excludes: '**/node_modules/**')
-    Boolean npmScriptExists = false
-    for (int i = 0; i < packages.size(); i++) {
-        String packageJsonPath = packages[i].path
-        Map packageJson = script.readJSON file: packageJsonPath
-        Map npmScripts = packageJson.scripts ?: [:]
-        if (condition.getValue() instanceof List) {
-            condition.getValue().each { configKey ->
-                if (npmScripts[configKey]) {
-                    npmScriptExists = true
-                }
-            }
-        } else {
-            if (npmScripts[condition.getValue()]) {
-                npmScriptExists = true
-            }
-        }
-    }
-    return npmScriptExists
 }

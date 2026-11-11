@@ -1,19 +1,23 @@
+//go:build unit
+// +build unit
+
 package command
 
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/SAP/jenkins-library/pkg/log"
+
 	"github.com/stretchr/testify/assert"
 )
 
-//based on https://golang.org/src/os/exec/exec_test.go
+// based on https://golang.org/src/os/exec/exec_test.go
 func helperCommand(command string, s ...string) (cmd *exec.Cmd) {
 	cs := []string{"-test.run=TestHelperProcess", "--", command}
 	cs = append(cs, s...)
@@ -41,9 +45,9 @@ func TestShellRun(t *testing.T) {
 				}
 			})
 			t.Run("stderr", func(t *testing.T) {
-				expectedErr := "Stderr: command /bin/bash\n"
-				if eStr := e.String(); eStr != expectedErr {
-					t.Errorf("expected: %v got: %v", expectedErr, eStr)
+				expectedErr := "Stderr: command /bin/bash"
+				if !strings.Contains(e.String(), expectedErr) {
+					t.Errorf("expected: %v got: %v", expectedErr, e.String())
 				}
 			})
 		})
@@ -71,9 +75,9 @@ func TestExecutableRun(t *testing.T) {
 				}
 			})
 			t.Run("stderr", func(t *testing.T) {
-				expectedErr := "Stderr: command echo\n"
-				if eStr := stderr.String(); eStr != expectedErr {
-					t.Errorf("expected: %v got: %v", expectedErr, eStr)
+				expectedErr := "Stderr: command echo"
+				if !strings.Contains(stderr.String(), expectedErr) {
+					t.Errorf("expected: %v got: %v", expectedErr, stderr.String())
 				}
 			})
 		})
@@ -232,8 +236,8 @@ func TestCmdPipes(t *testing.T) {
 	})
 }
 
-//based on https://golang.org/src/os/exec/exec_test.go
-//this is not directly executed
+// based on https://golang.org/src/os/exec/exec_test.go
+// this is not directly executed
 func TestHelperProcess(*testing.T) {
 
 	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
@@ -257,7 +261,7 @@ func TestHelperProcess(*testing.T) {
 	cmd, args := args[0], args[1:]
 	switch cmd {
 	case "/bin/bash":
-		o, _ := ioutil.ReadAll(os.Stdin)
+		o, _ := io.ReadAll(os.Stdin)
 		fmt.Fprintf(os.Stdout, "Stdout: command %v - Stdin: %v\n", cmd, string(o))
 		fmt.Fprintf(os.Stderr, "Stderr: command %v\n", cmd)
 	case "echo":

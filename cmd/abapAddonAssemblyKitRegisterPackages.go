@@ -2,7 +2,8 @@ package cmd
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"errors"
+	"os"
 	"path/filepath"
 
 	"github.com/SAP/jenkins-library/pkg/abap/aakaas"
@@ -12,7 +13,6 @@ import (
 	piperhttp "github.com/SAP/jenkins-library/pkg/http"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/pkg/errors"
 )
 
 func abapAddonAssemblyKitRegisterPackages(config abapAddonAssemblyKitRegisterPackagesOptions, telemetryData *telemetry.CustomData, cpe *abapAddonAssemblyKitRegisterPackagesCommonPipelineEnvironment) {
@@ -23,37 +23,45 @@ func abapAddonAssemblyKitRegisterPackages(config abapAddonAssemblyKitRegisterPac
 	c.Stderr(log.Writer())
 
 	client := piperhttp.Client{}
+	telemetryData.BuildTool = "AAKaaS"
 
-	// error situations should stop execution through log.Entry().Fatal() call which leads to an os.Exit(1) in the end
-	err := runAbapAddonAssemblyKitRegisterPackages(&config, telemetryData, &client, cpe, reader)
-	if err != nil {
+	if err := runAbapAddonAssemblyKitRegisterPackages(&config, &client, cpe, reader); err != nil {
+		telemetryData.ErrorCode = err.Error()
 		log.Entry().WithError(err).Fatal("step execution failed")
 	}
 }
 
-func runAbapAddonAssemblyKitRegisterPackages(config *abapAddonAssemblyKitRegisterPackagesOptions, telemetryData *telemetry.CustomData, client piperhttp.Sender,
+func runAbapAddonAssemblyKitRegisterPackages(config *abapAddonAssemblyKitRegisterPackagesOptions, client piperhttp.Sender,
 	cpe *abapAddonAssemblyKitRegisterPackagesCommonPipelineEnvironment, fileReader readFile) error {
-	var addonDescriptor abaputils.AddonDescriptor
-	json.Unmarshal([]byte(config.AddonDescriptor), &addonDescriptor)
 
-	conn := new(abapbuild.Connector)
-	conn.InitAAKaaS(config.AbapAddonAssemblyKitEndpoint, config.Username, config.Password, client)
-	err := uploadSarFiles(addonDescriptor.Repositories, *conn, fileReader)
-	if err != nil {
+	var addonDescriptor abaputils.AddonDescriptor
+	if err := json.Unmarshal([]byte(config.AddonDescriptor), &addonDescriptor); err != nil {
 		return err
 	}
 
-	// we need a second connector without the added Header
-	conn2 := new(abapbuild.Connector)
-	conn2.InitAAKaaS(config.AbapAddonAssemblyKitEndpoint, config.Username, config.Password, client)
+	conn := new(abapbuild.Connector)
+	if err := conn.InitAAKaaS(config.AbapAddonAssemblyKitEndpoint, config.Username, config.Password, client, config.AbapAddonAssemblyKitOriginHash, config.AbapAddonAssemblyKitCertificateFile, config.AbapAddonAssemblyKitCertificatePass); err != nil {
+		return err
+	}
+
+	if err := uploadSarFiles(addonDescriptor.Repositories, *conn, fileReader); err != nil {
+		return err
+	}
+
+	conn2 := new(abapbuild.Connector) // we need a second connector without the added Header
+	if err := conn2.InitAAKaaS(config.AbapAddonAssemblyKitEndpoint, config.Username, config.Password, client, config.AbapAddonAssemblyKitOriginHash, config.AbapAddonAssemblyKitCertificateFile, config.AbapAddonAssemblyKitCertificatePass); err != nil {
+		return err
+	}
+
+	var err error
 	addonDescriptor.Repositories, err = registerPackages(addonDescriptor.Repositories, *conn2)
 	if err != nil {
 		return err
 	}
 
 	log.Entry().Info("Writing package status to CommonPipelineEnvironment")
-	backToCPE, _ := json.Marshal(addonDescriptor)
-	cpe.abap.addonDescriptor = string(backToCPE)
+	cpe.abap.addonDescriptor = addonDescriptor.AsJSONstring()
+
 	return nil
 }
 
@@ -90,7 +98,7 @@ func uploadSarFiles(repos []abaputils.Repository, conn abapbuild.Connector, read
 type readFile func(path string) ([]byte, error)
 
 func reader(path string) ([]byte, error) {
-	return ioutil.ReadFile(path)
+	return os.ReadFile(path)
 }
 
 func registerPackages(repos []abaputils.Repository, conn abapbuild.Connector) ([]abaputils.Repository, error) {

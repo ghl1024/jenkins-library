@@ -1,9 +1,14 @@
+//go:build unit
+// +build unit
+
 package cmd
 
 import (
-	"github.com/SAP/jenkins-library/pkg/mock"
-	"github.com/stretchr/testify/assert"
 	"testing"
+
+	"github.com/SAP/jenkins-library/pkg/mock"
+
+	"github.com/stretchr/testify/assert"
 )
 
 var schema = []byte(`

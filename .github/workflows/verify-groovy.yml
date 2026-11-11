@@ -8,22 +8,35 @@ on:
     branches:
       - master
 
+permissions:
+  contents: read  # checkout
+  actions: write  # styfle/cancel-workflow-action cancels previous runs
+
 jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
+      - uses: styfle/cancel-workflow-action@0.11.0
 
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v1
+      - uses: actions/setup-java@v4
         with:
-          java-version: 1.8
+          java-version: 8
+          distribution: zulu
 
       - name: Cache Maven Packages
-        uses: actions/cache@v1
+        uses: actions/cache@v5
         with:
           path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          # Only the root pom drives dependencies; the ~20 poms under test/ and
+          # integration/testdata are fixtures and must not churn the cache key.
+          # The 'verify' suffix keeps this key distinct from the Documentation
+          # workflow's: that job fills ~/.m2 with only a subset of our deps, and
+          # actions/cache never updates an existing key, so sharing one key could
+          # pin the smaller cache. The restore-keys prefix still lets either
+          # workflow seed from the other's cache.
+          key: ${{ runner.os }}-maven-verify-${{ hashFiles('pom.xml') }}
           restore-keys: |
             ${{ runner.os }}-maven-
 

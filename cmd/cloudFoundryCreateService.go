@@ -7,14 +7,13 @@ import (
 	"github.com/SAP/jenkins-library/pkg/command"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/pkg/errors"
 )
 
 func cloudFoundryCreateService(config cloudFoundryCreateServiceOptions, telemetryData *telemetry.CustomData) {
 
-	cf := cloudfoundry.CFUtils{Exec: &command.Command{}}
+	c := command.Command{}
 
-	err := runCloudFoundryCreateService(&config, telemetryData, cf)
+	err := runCloudFoundryCreateService(&config, telemetryData, &c)
 
 	if err != nil {
 		log.Entry().WithError(err).Fatal("step execution failed")
@@ -22,9 +21,7 @@ func cloudFoundryCreateService(config cloudFoundryCreateServiceOptions, telemetr
 
 }
 
-func runCloudFoundryCreateService(config *cloudFoundryCreateServiceOptions, telemetryData *telemetry.CustomData, cf cloudfoundry.CFUtils) (err error) {
-	var c = cf.Exec
-
+func runCloudFoundryCreateService(config *cloudFoundryCreateServiceOptions, telemetryData *telemetry.CustomData, c command.ExecRunner) (err error) {
 	loginOptions := cloudfoundry.LoginOptions{
 		CfAPIEndpoint: config.CfAPIEndpoint,
 		CfOrg:         config.CfOrg,
@@ -33,14 +30,14 @@ func runCloudFoundryCreateService(config *cloudFoundryCreateServiceOptions, tele
 		Password:      config.Password,
 	}
 
-	err = cf.Login(loginOptions)
+	err = cloudfoundry.Login(c, loginOptions)
 
 	if err != nil {
 		return fmt.Errorf("Error while logging in: %w", err)
 	}
 
 	defer func() {
-		logoutErr := cf.Logout()
+		logoutErr := cloudfoundry.Logout(c)
 		if logoutErr != nil {
 			err = fmt.Errorf("Error while logging out occurred: %w", logoutErr)
 		}
@@ -73,6 +70,9 @@ func cloudFoundryCreateServiceRequest(config *cloudFoundryCreateServiceOptions, 
 	if config.CfServiceTags != "" {
 		cfCreateServiceScript = append(cfCreateServiceScript, "-t", config.CfServiceTags)
 	}
+	if !config.CfAsync {
+		cfCreateServiceScript = append(cfCreateServiceScript, "--wait")
+	}
 	if config.ServiceManifest != "" && fileExists(config.ServiceManifest) {
 
 		cfCreateServiceScript = []string{"create-service-push", "--no-push", "--service-manifest", config.ServiceManifest}
@@ -80,14 +80,14 @@ func cloudFoundryCreateServiceRequest(config *cloudFoundryCreateServiceOptions, 
 		if len(config.ManifestVariablesFiles) >= 0 {
 			varFileOpts, err := cloudfoundry.GetVarsFileOptions(config.ManifestVariablesFiles)
 			if err != nil {
-				return errors.Wrapf(err, "Cannot prepare var-file-options: '%v'", config.ManifestVariablesFiles)
+				return fmt.Errorf("Cannot prepare var-file-options: '%v': %w", config.ManifestVariablesFiles, err)
 			}
 			cfCreateServiceScript = append(cfCreateServiceScript, varFileOpts...)
 		}
 		if len(config.ManifestVariables) >= 0 {
 			varOptions, err := cloudfoundry.GetVarsOptions(config.ManifestVariables)
 			if err != nil {
-				return errors.Wrapf(err, "Cannot prepare var-options: '%v'", config.ManifestVariables)
+				return fmt.Errorf("Cannot prepare var-options: '%v': %w", config.ManifestVariables, err)
 			}
 			cfCreateServiceScript = append(cfCreateServiceScript, varOptions...)
 		}

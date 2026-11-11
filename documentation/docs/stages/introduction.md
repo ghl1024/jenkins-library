@@ -48,6 +48,15 @@ piperPipeline script: this
 
     You find more details about the custom defaults in the [configuration section](../configuration.md)
 
+!!! warning "using dedicated versions"
+    It is possible to use a fixed version of the library using e.g.
+
+    ```
+    @Library('piper-lib-os@v1.222.0') _
+    ```
+
+    **Make sure to only use valid git tags as versions!**
+
 ## Second step: Prepare pipeline for your main branch
 
 Extend your configuration to also contain git ssh credentials information.
@@ -133,7 +142,7 @@ You find details about this stage on the page [**Acceptance**](acceptance.md).
 
 ### Security
 
-This stage can run security checks using Checkmarx, Synopsys Detect, Fortify and WhiteSource.
+This stage can run security checks using Checkmarx, Black Duck Detect, Fortify and WhiteSource.
 
 You find details about this stage on the page [**Security**](security.md).
 

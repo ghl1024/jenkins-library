@@ -9,23 +9,28 @@ import (
 	"time"
 
 	"github.com/SAP/jenkins-library/pkg/config"
+	"github.com/SAP/jenkins-library/pkg/eventing"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/piperenv"
+	"github.com/SAP/jenkins-library/pkg/splunk"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
+	"github.com/SAP/jenkins-library/pkg/validation"
+
 	"github.com/spf13/cobra"
 )
 
 type abapEnvironmentAssembleConfirmOptions struct {
-	CfAPIEndpoint       string `json:"cfApiEndpoint,omitempty"`
-	CfOrg               string `json:"cfOrg,omitempty"`
-	CfSpace             string `json:"cfSpace,omitempty"`
-	CfServiceInstance   string `json:"cfServiceInstance,omitempty"`
-	CfServiceKeyName    string `json:"cfServiceKeyName,omitempty"`
-	Host                string `json:"host,omitempty"`
-	Username            string `json:"username,omitempty"`
-	Password            string `json:"password,omitempty"`
-	AddonDescriptor     string `json:"addonDescriptor,omitempty"`
-	MaxRuntimeInMinutes int    `json:"maxRuntimeInMinutes,omitempty"`
+	CfAPIEndpoint       string   `json:"cfApiEndpoint,omitempty"`
+	CfOrg               string   `json:"cfOrg,omitempty"`
+	CfSpace             string   `json:"cfSpace,omitempty"`
+	CfServiceInstance   string   `json:"cfServiceInstance,omitempty"`
+	CfServiceKeyName    string   `json:"cfServiceKeyName,omitempty"`
+	Host                string   `json:"host,omitempty"`
+	Username            string   `json:"username,omitempty"`
+	Password            string   `json:"password,omitempty"`
+	AddonDescriptor     string   `json:"addonDescriptor,omitempty"`
+	MaxRuntimeInMinutes int      `json:"maxRuntimeInMinutes,omitempty"`
+	CertificateNames    []string `json:"certificateNames,omitempty"`
 }
 
 type abapEnvironmentAssembleConfirmCommonPipelineEnvironment struct {
@@ -38,7 +43,7 @@ func (p *abapEnvironmentAssembleConfirmCommonPipelineEnvironment) persist(path, 
 	content := []struct {
 		category string
 		name     string
-		value    interface{}
+		value    any
 	}{
 		{category: "abap", name: "addonDescriptor", value: p.abap.addonDescriptor},
 	}
@@ -52,11 +57,11 @@ func (p *abapEnvironmentAssembleConfirmCommonPipelineEnvironment) persist(path, 
 		}
 	}
 	if errCount > 0 {
-		log.Entry().Fatal("failed to persist Piper environment")
+		log.Entry().Error("failed to persist Piper environment")
 	}
 }
 
-// AbapEnvironmentAssembleConfirmCommand Confirm the Delivery of Assembly for installation, support package or patch in SAP Cloud Platform ABAP Environment system
+// AbapEnvironmentAssembleConfirmCommand Confirm the Delivery of Assembly for installation, support package or patch in SAP BTP ABAP Environment system
 func AbapEnvironmentAssembleConfirmCommand() *cobra.Command {
 	const STEP_NAME = "abapEnvironmentAssembleConfirm"
 
@@ -64,25 +69,44 @@ func AbapEnvironmentAssembleConfirmCommand() *cobra.Command {
 	var stepConfig abapEnvironmentAssembleConfirmOptions
 	var startTime time.Time
 	var commonPipelineEnvironment abapEnvironmentAssembleConfirmCommonPipelineEnvironment
+	var logCollector *log.CollectorHook
+	var splunkClient *splunk.Splunk
+	telemetryClient := &telemetry.Telemetry{}
 
 	var createAbapEnvironmentAssembleConfirmCmd = &cobra.Command{
 		Use:   STEP_NAME,
-		Short: "Confirm the Delivery of Assembly for installation, support package or patch in SAP Cloud Platform ABAP Environment system",
-		Long:  `This step confirms the assemblies of provided [installations, support packages or patches] in SAP Cloud Platform ABAP Environment system`,
+		Short: "Confirm the Delivery of Assembly for installation, support package or patch in SAP BTP ABAP Environment system",
+		Long:  `This step confirms the assemblies of provided [installations, support packages or patches] in SAP BTP ABAP Environment system`,
 		PreRunE: func(cmd *cobra.Command, _ []string) error {
 			startTime = time.Now()
 			log.SetStepName(STEP_NAME)
 			log.SetVerbose(GeneralConfig.Verbose)
 
-			path, _ := os.Getwd()
+			GeneralConfig.GitHubAccessTokens = ResolveAccessTokens(GeneralConfig.GitHubTokens)
+
+			path, err := os.Getwd()
+			if err != nil {
+				return err
+			}
 			fatalHook := &log.FatalHook{CorrelationID: GeneralConfig.CorrelationID, Path: path}
 			log.RegisterHook(fatalHook)
 
-			err := PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
+			err = PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
 			if err != nil {
 				log.SetErrorCategory(log.ErrorConfiguration)
 				return err
 			}
+
+			// Set step error patterns for improved error detection
+			stepErrors := make([]log.StepError, len(metadata.Metadata.Errors))
+			for i, err := range metadata.Metadata.Errors {
+				stepErrors[i] = log.StepError{
+					Pattern:  err.Pattern,
+					Message:  err.Message,
+					Category: err.Category,
+				}
+			}
+			log.SetStepErrors(stepErrors)
 			log.RegisterSecret(stepConfig.Username)
 			log.RegisterSecret(stepConfig.Password)
 
@@ -91,23 +115,82 @@ func AbapEnvironmentAssembleConfirmCommand() *cobra.Command {
 				log.RegisterHook(&sentryHook)
 			}
 
+			if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 || len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+				splunkClient = &splunk.Splunk{}
+				logCollector = &log.CollectorHook{CorrelationID: GeneralConfig.CorrelationID}
+				log.RegisterHook(logCollector)
+			}
+
+			if err = log.RegisterANSHookIfConfigured(GeneralConfig.CorrelationID); err != nil {
+				log.Entry().WithError(err).Warn("failed to set up SAP Alert Notification Service log hook")
+			}
+
+			validation, err := validation.New(validation.WithJSONNamesForStructFields(), validation.WithPredefinedErrorMessages())
+			if err != nil {
+				return err
+			}
+			if err = validation.ValidateStruct(stepConfig); err != nil {
+				log.SetErrorCategory(log.ErrorConfiguration)
+				return err
+			}
+
 			return nil
 		},
 		Run: func(_ *cobra.Command, _ []string) {
-			telemetryData := telemetry.CustomData{}
-			telemetryData.ErrorCode = "1"
+			vaultClient := config.GlobalVaultClient()
+			var oidcTokenProvider func(string) (string, error)
+			if vaultClient != nil {
+				defer vaultClient.MustRevokeToken()
+				oidcTokenProvider = vaultClient.GetOIDCTokenByValidation
+			}
+
+			stepTelemetryData := telemetry.CustomData{
+				ErrorCode: "1",
+			}
 			handler := func() {
-				config.RemoveVaultSecretFiles()
 				commonPipelineEnvironment.persist(GeneralConfig.EnvRootPath, "commonPipelineEnvironment")
-				telemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
-				telemetryData.ErrorCategory = log.GetErrorCategory().String()
-				telemetry.Send(&telemetryData)
+				config.RemoveVaultSecretFiles()
+				stepTelemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
+				stepTelemetryData.ErrorCategory = log.GetErrorCategory().String()
+				stepTelemetryData.PiperCommitHash = GitCommit
+				telemetryClient.SetData(&stepTelemetryData)
+				telemetryClient.LogStepTelemetryData()
+				if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.Dsn,
+						GeneralConfig.HookConfig.SplunkConfig.Token,
+						GeneralConfig.HookConfig.SplunkConfig.Index,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblToken,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblIndex,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.GCPPubSubConfig.ProjectNumber) > 0 {
+					if err := eventing.PublishTaskRunFinishedEvent(
+						oidcTokenProvider,
+						&GeneralConfig,
+						eventing.EventContext{
+							StepName:   STEP_NAME,
+							StageName:  telemetryClient.GetData().StageName,
+							ErrorCode:  stepTelemetryData.ErrorCode,
+							PipelineID: telemetryClient.GetBuildURL(),
+						},
+					); err != nil {
+						log.Entry().WithError(err).Warn("failed to publish GCP Pub/Sub event")
+					}
+				}
 			}
 			log.DeferExitHandler(handler)
 			defer handler()
-			telemetry.Initialize(GeneralConfig.NoTelemetry, STEP_NAME)
-			abapEnvironmentAssembleConfirm(stepConfig, &telemetryData, &commonPipelineEnvironment)
-			telemetryData.ErrorCode = "0"
+			telemetryClient.Initialize(STEP_NAME)
+			abapEnvironmentAssembleConfirm(stepConfig, &stepTelemetryData, &commonPipelineEnvironment)
+			stepTelemetryData.ErrorCode = "0"
 			log.Entry().Info("SUCCESS")
 		},
 	}
@@ -122,11 +205,12 @@ func addAbapEnvironmentAssembleConfirmFlags(cmd *cobra.Command, stepConfig *abap
 	cmd.Flags().StringVar(&stepConfig.CfSpace, "cfSpace", os.Getenv("PIPER_cfSpace"), "Cloud Foundry target space")
 	cmd.Flags().StringVar(&stepConfig.CfServiceInstance, "cfServiceInstance", os.Getenv("PIPER_cfServiceInstance"), "Cloud Foundry Service Instance")
 	cmd.Flags().StringVar(&stepConfig.CfServiceKeyName, "cfServiceKeyName", os.Getenv("PIPER_cfServiceKeyName"), "Cloud Foundry Service Key")
-	cmd.Flags().StringVar(&stepConfig.Host, "host", os.Getenv("PIPER_host"), "Specifies the host address of the SAP Cloud Platform ABAP Environment system")
+	cmd.Flags().StringVar(&stepConfig.Host, "host", os.Getenv("PIPER_host"), "Specifies the host address of the SAP BTP ABAP Environment system")
 	cmd.Flags().StringVar(&stepConfig.Username, "username", os.Getenv("PIPER_username"), "User for either the Cloud Foundry API or the Communication Arrangement for SAP_COM_0582")
 	cmd.Flags().StringVar(&stepConfig.Password, "password", os.Getenv("PIPER_password"), "Password for either the Cloud Foundry API or the Communication Arrangement for SAP_COM_0582")
 	cmd.Flags().StringVar(&stepConfig.AddonDescriptor, "addonDescriptor", os.Getenv("PIPER_addonDescriptor"), "Structure in the commonPipelineEnvironment containing information about the Product Version and corresponding Software Component Versions")
 	cmd.Flags().IntVar(&stepConfig.MaxRuntimeInMinutes, "maxRuntimeInMinutes", 360, "maximal runtime of the step")
+	cmd.Flags().StringSliceVar(&stepConfig.CertificateNames, "certificateNames", []string{}, "certificates for the backend system, this certificates needs to be stored in .pipeline/trustStore")
 
 	cmd.MarkFlagRequired("username")
 	cmd.MarkFlagRequired("password")
@@ -140,10 +224,13 @@ func abapEnvironmentAssembleConfirmMetadata() config.StepData {
 		Metadata: config.StepMetadata{
 			Name:        "abapEnvironmentAssembleConfirm",
 			Aliases:     []config.Alias{},
-			Description: "Confirm the Delivery of Assembly for installation, support package or patch in SAP Cloud Platform ABAP Environment system",
+			Description: "Confirm the Delivery of Assembly for installation, support package or patch in SAP BTP ABAP Environment system",
 		},
 		Spec: config.StepSpec{
 			Inputs: config.StepInputs{
+				Secrets: []config.StepSecrets{
+					{Name: "abapCredentialsId", Description: "Jenkins credentials ID containing user and password to authenticate to the Cloud Platform ABAP Environment system or the Cloud Foundry API", Type: "jenkins", Aliases: []config.Alias{{Name: "cfCredentialsId", Deprecated: false}, {Name: "credentialsId", Deprecated: false}}},
+				},
 				Parameters: []config.StepParameters{
 					{
 						Name:        "cfApiEndpoint",
@@ -152,6 +239,7 @@ func abapEnvironmentAssembleConfirmMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "cloudFoundry/apiEndpoint"}},
+						Default:     os.Getenv("PIPER_cfApiEndpoint"),
 					},
 					{
 						Name:        "cfOrg",
@@ -160,6 +248,7 @@ func abapEnvironmentAssembleConfirmMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "cloudFoundry/org"}},
+						Default:     os.Getenv("PIPER_cfOrg"),
 					},
 					{
 						Name:        "cfSpace",
@@ -168,6 +257,7 @@ func abapEnvironmentAssembleConfirmMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "cloudFoundry/space"}},
+						Default:     os.Getenv("PIPER_cfSpace"),
 					},
 					{
 						Name:        "cfServiceInstance",
@@ -176,6 +266,7 @@ func abapEnvironmentAssembleConfirmMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "cloudFoundry/serviceInstance"}},
+						Default:     os.Getenv("PIPER_cfServiceInstance"),
 					},
 					{
 						Name:        "cfServiceKeyName",
@@ -184,14 +275,16 @@ func abapEnvironmentAssembleConfirmMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "cloudFoundry/serviceKey"}, {Name: "cloudFoundry/serviceKeyName"}, {Name: "cfServiceKey"}},
+						Default:     os.Getenv("PIPER_cfServiceKeyName"),
 					},
 					{
 						Name:        "host",
 						ResourceRef: []config.ResourceReference{},
-						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS", "GENERAL"},
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_host"),
 					},
 					{
 						Name:        "username",
@@ -200,6 +293,7 @@ func abapEnvironmentAssembleConfirmMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   true,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_username"),
 					},
 					{
 						Name:        "password",
@@ -208,6 +302,7 @@ func abapEnvironmentAssembleConfirmMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   true,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_password"),
 					},
 					{
 						Name: "addonDescriptor",
@@ -221,6 +316,7 @@ func abapEnvironmentAssembleConfirmMetadata() config.StepData {
 						Type:      "string",
 						Mandatory: true,
 						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_addonDescriptor"),
 					},
 					{
 						Name:        "maxRuntimeInMinutes",
@@ -229,19 +325,29 @@ func abapEnvironmentAssembleConfirmMetadata() config.StepData {
 						Type:        "int",
 						Mandatory:   true,
 						Aliases:     []config.Alias{},
+						Default:     360,
+					},
+					{
+						Name:        "certificateNames",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS", "GENERAL"},
+						Type:        "[]string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     []string{},
 					},
 				},
 			},
 			Containers: []config.Container{
-				{Name: "cf", Image: "ppiper/cf-cli:7"},
+				{Name: "cf", Image: "ppiper/cf-cli:latest"},
 			},
 			Outputs: config.StepOutputs{
 				Resources: []config.StepResources{
 					{
 						Name: "commonPipelineEnvironment",
 						Type: "piperEnvironment",
-						Parameters: []map[string]interface{}{
-							{"Name": "abap/addonDescriptor"},
+						Parameters: []map[string]any{
+							{"name": "abap/addonDescriptor"},
 						},
 					},
 				},

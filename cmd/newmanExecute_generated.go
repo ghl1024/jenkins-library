@@ -6,12 +6,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/SAP/jenkins-library/pkg/config"
+	"github.com/SAP/jenkins-library/pkg/eventing"
+	"github.com/SAP/jenkins-library/pkg/gcs"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/piperenv"
+	"github.com/SAP/jenkins-library/pkg/piperutils"
+	"github.com/SAP/jenkins-library/pkg/splunk"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
+	"github.com/SAP/jenkins-library/pkg/validation"
+
 	"github.com/spf13/cobra"
 )
 
@@ -41,7 +49,7 @@ func (i *newmanExecuteInflux) persist(path, resourceName string) {
 		measurement string
 		valType     string
 		name        string
-		value       interface{}
+		value       any
 	}{
 		{valType: config.InfluxField, measurement: "step_data", name: "newman", value: i.step_data.fields.newman},
 	}
@@ -55,7 +63,43 @@ func (i *newmanExecuteInflux) persist(path, resourceName string) {
 		}
 	}
 	if errCount > 0 {
-		log.Entry().Fatal("failed to persist Influx environment")
+		log.Entry().Error("failed to persist Influx environment")
+	}
+}
+
+type newmanExecuteReports struct {
+}
+
+func (p *newmanExecuteReports) persist(stepConfig newmanExecuteOptions, gcpJsonKeyFilePath string, gcsBucketId string, gcsFolderPath string, gcsSubFolder string) {
+	if gcsBucketId == "" {
+		log.Entry().Info("persisting reports to GCS is disabled, because gcsBucketId is empty")
+		return
+	}
+	log.Entry().Info("Uploading reports to Google Cloud Storage...")
+	content := []gcs.ReportOutputParam{
+		{FilePattern: "**/TEST-*.xml", ParamRef: "", StepResultType: "acceptance-test"},
+		{FilePattern: "**/requirement.mapping", ParamRef: "", StepResultType: "requirement-mapping"},
+		{FilePattern: "**/delivery.mapping", ParamRef: "", StepResultType: "delivery-mapping"},
+	}
+
+	gcsClient, err := gcs.NewClient(gcpJsonKeyFilePath, "")
+	if err != nil {
+		log.Entry().Errorf("creation of GCS client failed: %v", err)
+		return
+	}
+	defer gcsClient.Close()
+	structVal := reflect.ValueOf(&stepConfig).Elem()
+	inputParameters := map[string]string{}
+	for i := 0; i < structVal.NumField(); i++ {
+		field := structVal.Type().Field(i)
+		if field.Type.String() == "string" {
+			paramName := strings.Split(field.Tag.Get("json"), ",")
+			paramValue, _ := structVal.Field(i).Interface().(string)
+			inputParameters[paramName[0]] = paramValue
+		}
+	}
+	if err := gcs.PersistReportsToGCS(gcsClient, content, inputParameters, gcsFolderPath, gcsBucketId, gcsSubFolder, piperutils.Glob, os.Stat); err != nil {
+		log.Entry().Errorf("failed to persist reports: %v", err)
 	}
 }
 
@@ -67,6 +111,10 @@ func NewmanExecuteCommand() *cobra.Command {
 	var stepConfig newmanExecuteOptions
 	var startTime time.Time
 	var influx newmanExecuteInflux
+	var reports newmanExecuteReports
+	var logCollector *log.CollectorHook
+	var splunkClient *splunk.Splunk
+	telemetryClient := &telemetry.Telemetry{}
 
 	var createNewmanExecuteCmd = &cobra.Command{
 		Use:   STEP_NAME,
@@ -77,38 +125,114 @@ func NewmanExecuteCommand() *cobra.Command {
 			log.SetStepName(STEP_NAME)
 			log.SetVerbose(GeneralConfig.Verbose)
 
-			path, _ := os.Getwd()
+			GeneralConfig.GitHubAccessTokens = ResolveAccessTokens(GeneralConfig.GitHubTokens)
+
+			path, err := os.Getwd()
+			if err != nil {
+				return err
+			}
 			fatalHook := &log.FatalHook{CorrelationID: GeneralConfig.CorrelationID, Path: path}
 			log.RegisterHook(fatalHook)
 
-			err := PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
+			err = PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
 			if err != nil {
 				log.SetErrorCategory(log.ErrorConfiguration)
 				return err
 			}
+
+			// Set step error patterns for improved error detection
+			stepErrors := make([]log.StepError, len(metadata.Metadata.Errors))
+			for i, err := range metadata.Metadata.Errors {
+				stepErrors[i] = log.StepError{
+					Pattern:  err.Pattern,
+					Message:  err.Message,
+					Category: err.Category,
+				}
+			}
+			log.SetStepErrors(stepErrors)
 
 			if len(GeneralConfig.HookConfig.SentryConfig.Dsn) > 0 {
 				sentryHook := log.NewSentryHook(GeneralConfig.HookConfig.SentryConfig.Dsn, GeneralConfig.CorrelationID)
 				log.RegisterHook(&sentryHook)
 			}
 
+			if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 || len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+				splunkClient = &splunk.Splunk{}
+				logCollector = &log.CollectorHook{CorrelationID: GeneralConfig.CorrelationID}
+				log.RegisterHook(logCollector)
+			}
+
+			if err = log.RegisterANSHookIfConfigured(GeneralConfig.CorrelationID); err != nil {
+				log.Entry().WithError(err).Warn("failed to set up SAP Alert Notification Service log hook")
+			}
+
+			validation, err := validation.New(validation.WithJSONNamesForStructFields(), validation.WithPredefinedErrorMessages())
+			if err != nil {
+				return err
+			}
+			if err = validation.ValidateStruct(stepConfig); err != nil {
+				log.SetErrorCategory(log.ErrorConfiguration)
+				return err
+			}
+
 			return nil
 		},
 		Run: func(_ *cobra.Command, _ []string) {
-			telemetryData := telemetry.CustomData{}
-			telemetryData.ErrorCode = "1"
+			vaultClient := config.GlobalVaultClient()
+			var oidcTokenProvider func(string) (string, error)
+			if vaultClient != nil {
+				defer vaultClient.MustRevokeToken()
+				oidcTokenProvider = vaultClient.GetOIDCTokenByValidation
+			}
+
+			stepTelemetryData := telemetry.CustomData{
+				ErrorCode: "1",
+			}
 			handler := func() {
-				config.RemoveVaultSecretFiles()
 				influx.persist(GeneralConfig.EnvRootPath, "influx")
-				telemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
-				telemetryData.ErrorCategory = log.GetErrorCategory().String()
-				telemetry.Send(&telemetryData)
+				reports.persist(stepConfig, GeneralConfig.GCPJsonKeyFilePath, GeneralConfig.GCSBucketId, GeneralConfig.GCSFolderPath, GeneralConfig.GCSSubFolder)
+				config.RemoveVaultSecretFiles()
+				stepTelemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
+				stepTelemetryData.ErrorCategory = log.GetErrorCategory().String()
+				stepTelemetryData.PiperCommitHash = GitCommit
+				telemetryClient.SetData(&stepTelemetryData)
+				telemetryClient.LogStepTelemetryData()
+				if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.Dsn,
+						GeneralConfig.HookConfig.SplunkConfig.Token,
+						GeneralConfig.HookConfig.SplunkConfig.Index,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblToken,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblIndex,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.GCPPubSubConfig.ProjectNumber) > 0 {
+					if err := eventing.PublishTaskRunFinishedEvent(
+						oidcTokenProvider,
+						&GeneralConfig,
+						eventing.EventContext{
+							StepName:   STEP_NAME,
+							StageName:  telemetryClient.GetData().StageName,
+							ErrorCode:  stepTelemetryData.ErrorCode,
+							PipelineID: telemetryClient.GetBuildURL(),
+						},
+					); err != nil {
+						log.Entry().WithError(err).Warn("failed to publish GCP Pub/Sub event")
+					}
+				}
 			}
 			log.DeferExitHandler(handler)
 			defer handler()
-			telemetry.Initialize(GeneralConfig.NoTelemetry, STEP_NAME)
-			newmanExecute(stepConfig, &telemetryData, &influx)
-			telemetryData.ErrorCode = "0"
+			telemetryClient.Initialize(STEP_NAME)
+			newmanExecute(stepConfig, &stepTelemetryData, &influx)
+			stepTelemetryData.ErrorCode = "0"
 			log.Entry().Info("SUCCESS")
 		},
 	}
@@ -120,7 +244,7 @@ func NewmanExecuteCommand() *cobra.Command {
 func addNewmanExecuteFlags(cmd *cobra.Command, stepConfig *newmanExecuteOptions) {
 	cmd.Flags().StringVar(&stepConfig.NewmanCollection, "newmanCollection", `**/*.postman_collection.json`, "The test collection that should be executed. This could also be a file pattern.")
 	cmd.Flags().StringVar(&stepConfig.NewmanRunCommand, "newmanRunCommand", os.Getenv("PIPER_newmanRunCommand"), "+++ Deprecated +++ Please use list parameter `runOptions` instead.")
-	cmd.Flags().StringSliceVar(&stepConfig.RunOptions, "runOptions", []string{`run`, `{{.NewmanCollection}}`, `--reporters`, `cli,junit,html`, `--reporter-junit-export`, `target/newman/TEST-{{.CollectionDisplayName}}.xml`, `--reporter-html-export`, `target/newman/TEST-{{.CollectionDisplayName}}.html`}, "The newman command that will be executed inside the docker container.")
+	cmd.Flags().StringSliceVar(&stepConfig.RunOptions, "runOptions", []string{`run`, `{{.NewmanCollection}}`, `--reporters`, `cli,junit,html`, `--reporter-junit-export`, `target/newman/TEST-{{.CollectionDisplayName}}.xml`, `--reporter-html-export`, `target/newman/TEST-{{.CollectionDisplayName}}.html`}, "The newman command that will be executed inside the docker container. Env vars can be passed via template as in \"{{getenv MY_ENV_VAR}}\".")
 	cmd.Flags().StringVar(&stepConfig.NewmanInstallCommand, "newmanInstallCommand", `npm install newman newman-reporter-html --global --quiet`, "The shell command that will be executed inside the docker container to install Newman.")
 	cmd.Flags().StringVar(&stepConfig.NewmanEnvironment, "newmanEnvironment", os.Getenv("PIPER_newmanEnvironment"), "Specify an environment file path or URL. Environments provide a set of variables that one can use within collections.")
 	cmd.Flags().StringVar(&stepConfig.NewmanGlobals, "newmanGlobals", os.Getenv("PIPER_newmanGlobals"), "Specify the file path or URL for global variables. Global variables are similar to environment variables but have a lower precedence and can be overridden by environment variables having the same name.")
@@ -150,6 +274,7 @@ func newmanExecuteMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `**/*.postman_collection.json`,
 					},
 					{
 						Name:        "newmanRunCommand",
@@ -158,6 +283,7 @@ func newmanExecuteMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_newmanRunCommand"),
 					},
 					{
 						Name:        "runOptions",
@@ -166,6 +292,7 @@ func newmanExecuteMetadata() config.StepData {
 						Type:        "[]string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     []string{`run`, `{{.NewmanCollection}}`, `--reporters`, `cli,junit,html`, `--reporter-junit-export`, `target/newman/TEST-{{.CollectionDisplayName}}.xml`, `--reporter-html-export`, `target/newman/TEST-{{.CollectionDisplayName}}.html`},
 					},
 					{
 						Name:        "newmanInstallCommand",
@@ -174,6 +301,7 @@ func newmanExecuteMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `npm install newman newman-reporter-html --global --quiet`,
 					},
 					{
 						Name:        "newmanEnvironment",
@@ -182,6 +310,7 @@ func newmanExecuteMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_newmanEnvironment"),
 					},
 					{
 						Name:        "newmanGlobals",
@@ -190,6 +319,7 @@ func newmanExecuteMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_newmanGlobals"),
 					},
 					{
 						Name:        "failOnError",
@@ -198,6 +328,7 @@ func newmanExecuteMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     true,
 					},
 					{
 						Name:        "cfAppsWithSecrets",
@@ -206,19 +337,29 @@ func newmanExecuteMetadata() config.StepData {
 						Type:        "[]string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     []string{},
 					},
 				},
 			},
 			Containers: []config.Container{
-				{Name: "newman", Image: "node:lts-stretch", WorkingDir: "/home/node"},
+				{Name: "newman", Image: "docker.io/node:24-bookworm", WorkingDir: "/home/node"},
 			},
 			Outputs: config.StepOutputs{
 				Resources: []config.StepResources{
 					{
 						Name: "influx",
 						Type: "influx",
-						Parameters: []map[string]interface{}{
-							{"Name": "step_data"}, {"fields": []map[string]string{{"name": "newman"}}},
+						Parameters: []map[string]any{
+							{"name": "step_data", "fields": []map[string]string{{"name": "newman"}}},
+						},
+					},
+					{
+						Name: "reports",
+						Type: "reports",
+						Parameters: []map[string]any{
+							{"filePattern": "**/TEST-*.xml", "type": "acceptance-test"},
+							{"filePattern": "**/requirement.mapping", "type": "requirement-mapping"},
+							{"filePattern": "**/delivery.mapping", "type": "delivery-mapping"},
 						},
 					},
 				},

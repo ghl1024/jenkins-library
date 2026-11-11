@@ -3,8 +3,10 @@ package helper
 import (
 	"bytes"
 	"fmt"
-	"strings"
+	"go/format"
 	"text/template"
+
+	"github.com/SAP/jenkins-library/pkg/piperutils"
 )
 
 // PiperEnvironmentResource defines a piper environement resource which stores data across multiple pipeline steps
@@ -43,7 +45,7 @@ func (p *{{ .StepName }}{{ .Name | title}}) persist(path, resourceName string) {
 	content := []struct{
 		category string
 		name string
-		value interface{}
+		value any
 	}{
 		{{- range $notused, $param := .Parameters }}
 		{{- if not $param.Category}}
@@ -63,19 +65,19 @@ func (p *{{ .StepName }}{{ .Name | title}}) persist(path, resourceName string) {
 		}
 	}
 	if errCount > 0 {
-		log.Entry().Fatal("failed to persist Piper environment")
+		log.Entry().Error("failed to persist Piper environment")
 	}
 }`
 
 // StructName returns the name of the environment resource struct
 func (p *PiperEnvironmentResource) StructName() string {
-	return fmt.Sprintf("%v%v", p.StepName, strings.Title(p.Name))
+	return fmt.Sprintf("%v%v", p.StepName, piperutils.Title(p.Name))
 }
 
 // StructString returns the golang coding for the struct definition of the environment resource
 func (p *PiperEnvironmentResource) StructString() (string, error) {
 	funcMap := template.FuncMap{
-		"title":             strings.Title,
+		"title":             piperutils.Title,
 		"golangName":        golangName,
 		"resourceFieldType": resourceFieldType,
 	}
@@ -91,7 +93,11 @@ func (p *PiperEnvironmentResource) StructString() (string, error) {
 		return "", err
 	}
 
-	return string(generatedCode.Bytes()), nil
+	formatted, err := format.Source(generatedCode.Bytes())
+	if err != nil {
+		return "", fmt.Errorf("Error formatting generated code: %v\n", err)
+	}
+	return string(formatted), nil
 }
 
 // InfluxResource defines an Influx resouece that holds measurement information for a pipeline run
@@ -144,7 +150,7 @@ func (i *{{ .StepName }}{{ .Name | title}}) persist(path, resourceName string) {
 		measurement string
 		valType     string
 		name        string
-		value       interface{}
+		value       any
 	}{
 		{{- range $notused, $measurement := .Measurements }}
 		{{- range $notused, $field := $measurement.Fields }}
@@ -165,14 +171,14 @@ func (i *{{ .StepName }}{{ .Name | title}}) persist(path, resourceName string) {
 		}
 	}
 	if errCount > 0 {
-		log.Entry().Fatal("failed to persist Influx environment")
+		log.Entry().Error("failed to persist Influx environment")
 	}
 }`
 
 // StructString returns the golang coding for the struct definition of the InfluxResource
 func (i *InfluxResource) StructString() (string, error) {
 	funcMap := template.FuncMap{
-		"title":             strings.Title,
+		"title":             piperutils.Title,
 		"golangName":        golangName,
 		"resourceFieldType": resourceFieldType,
 	}
@@ -183,15 +189,98 @@ func (i *InfluxResource) StructString() (string, error) {
 	}
 
 	var generatedCode bytes.Buffer
-	err = tmpl.Execute(&generatedCode, &i)
-	if err != nil {
+	if err = tmpl.Execute(&generatedCode, &i); err != nil {
 		return "", err
 	}
 
-	return string(generatedCode.Bytes()), nil
+	formatted, err := format.Source(generatedCode.Bytes())
+	if err != nil {
+		return "", fmt.Errorf("Error formatting generated code: %v\n", err)
+	}
+	return string(formatted), nil
 }
 
 // StructName returns the name of the influx resource struct
 func (i *InfluxResource) StructName() string {
-	return fmt.Sprintf("%v%v", i.StepName, strings.Title(i.Name))
+	return fmt.Sprintf("%v%v", i.StepName, piperutils.Title(i.Name))
+}
+
+// PiperEnvironmentResource defines a piper environement resource which stores data across multiple pipeline steps
+type ReportsResource struct {
+	Name       string
+	StepName   string
+	Parameters []ReportsParameter
+}
+
+// PiperEnvironmentParameter defines a parameter within the Piper environment
+type ReportsParameter struct {
+	FilePattern string
+	ParamRef    string
+	Type        string
+}
+
+const reportsStructTemplate = `type {{ .StepName }}{{ .Name | title}} struct {
+}
+
+func (p *{{ .StepName }}{{ .Name | title}}) persist(stepConfig {{ .StepName }}Options, gcpJsonKeyFilePath string, gcsBucketId string, gcsFolderPath string, gcsSubFolder string) {
+	if gcsBucketId == "" {
+		log.Entry().Info("persisting reports to GCS is disabled, because gcsBucketId is empty")
+		return
+	}
+	log.Entry().Info("Uploading reports to Google Cloud Storage...")
+	content := []gcs.ReportOutputParam{
+		{{- range $notused, $param := .Parameters }}
+		{FilePattern: "{{ $param.FilePattern }}", ParamRef: "{{ $param.ParamRef }}", StepResultType: "{{ $param.Type }}"},
+		{{- end }}
+	}
+
+	gcsClient, err := gcs.NewClient(gcpJsonKeyFilePath, "")
+	if err != nil {
+		log.Entry().Errorf("creation of GCS client failed: %v", err)
+        	return
+	}
+	defer gcsClient.Close()
+	structVal := reflect.ValueOf(&stepConfig).Elem()
+	inputParameters := map[string]string{}
+	for i := 0; i < structVal.NumField(); i++ {
+		field := structVal.Type().Field(i)
+		if field.Type.String() == "string" {
+			paramName := strings.Split(field.Tag.Get("json"), ",")
+			paramValue, _ := structVal.Field(i).Interface().(string)
+			inputParameters[paramName[0]] = paramValue
+		}
+	}
+	if err := gcs.PersistReportsToGCS(gcsClient, content, inputParameters, gcsFolderPath, gcsBucketId, gcsSubFolder, piperutils.Glob, os.Stat); err != nil {
+		log.Entry().Errorf("failed to persist reports: %v", err)
+	}
+}`
+
+// StructName returns the name of the environment resource struct
+func (p *ReportsResource) StructName() string {
+	return fmt.Sprintf("%v%v", p.StepName, piperutils.Title(p.Name))
+}
+
+// StructString returns the golang coding for the struct definition of the environment resource
+func (p *ReportsResource) StructString() (string, error) {
+	funcMap := template.FuncMap{
+		"title":             piperutils.Title,
+		"golangName":        golangName,
+		"resourceFieldType": resourceFieldType,
+	}
+
+	tmpl, err := template.New("resources").Funcs(funcMap).Parse(reportsStructTemplate)
+	if err != nil {
+		return "", err
+	}
+
+	var generatedCode bytes.Buffer
+	if err = tmpl.Execute(&generatedCode, &p); err != nil {
+		return "", err
+	}
+
+	formatted, err := format.Source(generatedCode.Bytes())
+	if err != nil {
+		return "", fmt.Errorf("Error formatting generated code: %v\n", err)
+	}
+	return string(formatted), nil
 }

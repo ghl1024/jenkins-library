@@ -286,122 +286,157 @@ class BuildExecuteTest extends BasePiperTest {
 
     @Test
     void testDocker() {
+        boolean buildToolCalled = false
         binding.setVariable('docker', new DockerMock('test'))
         def pushParams = [:]
-        helper.registerAllowedMethod('containerPushToRegistry', [Map.class], { m ->
-            pushParams = m
+        helper.registerAllowedMethod('kanikoExecute', [Map.class], { m ->
+            buildToolCalled = true
             return
         })
         stepRule.step.buildExecute(
             script: nullScript,
             buildTool: 'docker',
-            dockerImageName: 'path/to/myImage',
-            dockerImageTag: 'myTag',
-            dockerRegistryUrl: 'https://my.registry:55555'
         )
-
-        assertThat(pushParams.dockerBuildImage.image.toString(), is('path/to/myImage:myTag'))
-        assertThat(pushParams.dockerRegistryUrl.toString(), is('https://my.registry:55555'))
-        assertThat(nullScript.commonPipelineEnvironment.getValue('containerImage').toString(), is('path/to/myImage:myTag'))
+        assertThat(buildToolCalled, is(true))
     }
 
     @Test
-    void testDockerWithEnv() {
-        nullScript.commonPipelineEnvironment.setArtifactVersion('1.0.0')
+    void testDockerWithoutCNB() {
+        boolean kanikoExecuteCalled = false
+        boolean cnbBuildCalled = false
         binding.setVariable('docker', new DockerMock('test'))
         def pushParams = [:]
-        helper.registerAllowedMethod('containerPushToRegistry', [Map.class], { m ->
-            pushParams = m
+        helper.registerAllowedMethod('kanikoExecute', [Map.class], { m ->
+            kanikoExecuteCalled = true
+            return
+        })
+        helper.registerAllowedMethod('cnbBuild', [Map.class], { m ->
+            cnbBuildCalled = true
             return
         })
         stepRule.step.buildExecute(
-            script: nullScript,
-            buildTool: 'docker',
-            dockerImageName: 'path/to/myImage',
-            dockerRegistryUrl: 'https://my.registry:55555'
+                script: nullScript,
+                buildTool: 'docker',
         )
-
-        assertThat(pushParams.dockerBuildImage.image.toString(), is('path/to/myImage:1.0.0'))
-        assertThat(pushParams.dockerRegistryUrl.toString(), is('https://my.registry:55555'))
-        assertThat(nullScript.commonPipelineEnvironment.getValue('containerImage').toString(), is('path/to/myImage:1.0.0'))
+        assertThat(cnbBuildCalled, is(false))
+        assertThat(kanikoExecuteCalled, is(true))
     }
 
     @Test
-    void testDockerNoPush() {
+    void testDockerWithCNB() {
+        boolean kanikoExecuteCalled = false
+        boolean cnbBuildCalled = false
         binding.setVariable('docker', new DockerMock('test'))
         def pushParams = [:]
-        helper.registerAllowedMethod('containerPushToRegistry', [Map.class], { m ->
-            pushParams = m
+        helper.registerAllowedMethod('kanikoExecute', [Map.class], { m ->
+            kanikoExecuteCalled = true
+            return
+        })
+        helper.registerAllowedMethod('cnbBuild', [Map.class], { m ->
+            cnbBuildCalled = true
             return
         })
         stepRule.step.buildExecute(
-            script: nullScript,
-            buildTool: 'docker',
-            dockerImageName: 'path/to/myImage',
-            dockerImageTag: 'myTag',
-            dockerRegistryUrl: ''
+                script: nullScript,
+                buildTool: 'docker',
+                cnbBuild: true
         )
-
-        assertThat(pushParams.dockerBuildImage, nullValue())
-        assertThat(pushParams.dockerRegistryUrl, nullValue())
+        assertThat(cnbBuildCalled, is(true))
+        assertThat(kanikoExecuteCalled, is(false))
     }
 
     @Test
     void testKaniko() {
-        def kanikoParams = [:]
+        binding.setVariable('docker', new DockerMock('test'))
+        def buildToolCalled = false
         helper.registerAllowedMethod('kanikoExecute', [Map.class], { m ->
-            kanikoParams = m
+            buildToolCalled = true
             return
         })
-
         stepRule.step.buildExecute(
             script: nullScript,
             buildTool: 'kaniko',
-            dockerImageName: 'path/to/myImage',
-            dockerImageTag: 'myTag',
-            dockerRegistryUrl: 'https://my.registry:55555'
         )
-
-        assertThat(kanikoParams.containerImageNameAndTag.toString(), is('my.registry:55555/path/to/myImage:myTag'))
+        assertThat(buildToolCalled, is(true))
     }
 
     @Test
-    void testKanikoNoPush() {
-        def kanikoParams = [:]
-        helper.registerAllowedMethod('kanikoExecute', [Map.class], { m ->
-            kanikoParams = m
+    void testCnbBuildCalledWhenConfigured() {
+        def cnbBuildCalled = false
+        def npmExecuteScriptsCalled = false
+        helper.registerAllowedMethod('npmExecuteScripts', [Map.class], { m ->
+            npmExecuteScriptsCalled = true
+        })
+        helper.registerAllowedMethod('cnbBuild', [Map.class], { m ->
+            cnbBuildCalled = true
             return
         })
+        assertThat(nullScript.commonPipelineEnvironment.getContainerProperty('buildpacks'), nullValue())
 
         stepRule.step.buildExecute(
             script: nullScript,
-            buildTool: 'kaniko',
-            dockerImageName: 'path/to/myImage',
-            dockerImageTag: 'myTag',
-            dockerRegistryUrl: ''
+            buildTool: 'npm',
+            cnbBuild: true
         )
 
-        assertThat(kanikoParams.containerImageNameAndTag, is(''))
+        assertThat(npmExecuteScriptsCalled, is(true))
+        assertThat(cnbBuildCalled, is(true))
     }
 
     @Test
-    void testSwitchToKaniko() {
-        shellCallRule.setReturnValue('docker ps -q > /dev/null', 1)
-        def kanikoParams = [:]
-        helper.registerAllowedMethod('kanikoExecute', [Map.class], { m ->
-            kanikoParams = m
+    void testCnbBuildNotCalledWhenNotConfigured() {
+        def cnbBuildCalled = false
+        def npmExecuteScriptsCalled = false
+        helper.registerAllowedMethod('npmExecuteScripts', [Map.class], { m ->
+            npmExecuteScriptsCalled = true
+        })
+        helper.registerAllowedMethod('cnbBuild', [Map.class], { m ->
+            cnbBuildCalled = true
             return
+        })
+        stepRule.step.buildExecute(
+            script: nullScript,
+            buildTool: 'npm',
+            cnbBuild: false
+        )
+        assertThat(npmExecuteScriptsCalled, is(true))
+        assertThat(cnbBuildCalled, is(false))
+    }
+
+    @Test
+    void testHelmExecuteCalledWhenConfigured() {
+        def helmExecuteCalled = false
+        helper.registerAllowedMethod('helmExecute', [Map.class], { m ->
+            helmExecuteCalled = true
+            return
+        })
+        helper.registerAllowedMethod('npmExecuteScripts', [Map.class], { m ->
         })
 
         stepRule.step.buildExecute(
             script: nullScript,
-            buildTool: 'kaniko',
-            dockerImageName: 'path/to/myImage',
-            dockerImageTag: 'myTag',
-            dockerRegistryUrl: 'https://my.registry:55555'
+            buildTool: 'npm',
+            helmExecute: true
         )
 
-        assertThat(kanikoParams.containerImageNameAndTag.toString(), is('my.registry:55555/path/to/myImage:myTag'))
+        assertThat(helmExecuteCalled, is(true))
     }
 
+    @Test
+    void testHelmExecuteNotCalledWhenNotConfigured() {
+        def helmExecuteCalled = false
+        helper.registerAllowedMethod('helmExecute', [Map.class], { m ->
+            helmExecuteCalled = true
+            return
+        })
+        helper.registerAllowedMethod('npmExecuteScripts', [Map.class], { m ->
+        })
+        stepRule.step.buildExecute(
+            script: nullScript,
+            buildTool: 'npm',
+            helmExecute: false
+        )
+
+        assertThat(helmExecuteCalled, is(false))
+    }
 }

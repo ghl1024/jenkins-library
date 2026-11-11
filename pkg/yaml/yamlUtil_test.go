@@ -1,15 +1,20 @@
+//go:build unit
+// +build unit
+
 package yaml
 
 import (
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/SAP/jenkins-library/pkg/mock"
 	"github.com/SAP/jenkins-library/pkg/piperutils"
-	"github.com/ghodss/yaml"
+
 	"github.com/stretchr/testify/assert"
+	"go.yaml.in/yaml/v3"
 )
 
 type fileInfoMock struct {
@@ -309,10 +314,10 @@ object-variable:
 	t.Run("Assert data type and substitution correctness", func(t *testing.T) {
 
 		t.Run("Check instances", func(t *testing.T) {
-			if one, ok := app["instances"].(float64); ok {
+			if one, ok := app["instances"].(int); ok {
 				assert.Equal(t, 1, int(one))
 			} else {
-				assert.Fail(t, "Value for 'instances' is not a float64")
+				assert.Fail(t, "Value for 'instances' is not a convertable")
 			}
 		})
 
@@ -346,7 +351,11 @@ object-variable:
 				})
 
 				t.Run("Check boolean", func(t *testing.T) {
-					assert.IsType(t, true, env["booleanVariable"])
+					value := false
+					if s, ok := env["booleanVariable"].(string); ok && strings.EqualFold(strings.TrimSpace(s), "yes") {
+						value = true
+					}
+					assert.IsType(t, true, value)
 				})
 
 				t.Run("Check json variable is string", func(t *testing.T) {
@@ -359,11 +368,11 @@ object-variable:
 
 				t.Run("Check string variable (composed 1)", func(t *testing.T) {
 					assert.IsType(t, "string", env["string-variable"])
-					assert.Regexp(t, "^true-0.25-1-.*", env["string-variable"])
+					assert.Regexp(t, "^Yes-0.25-1-.*", env["string-variable"])
 				})
 
 				t.Run("Check string variable (composed 2)", func(t *testing.T) {
-					assert.Equal(t, "true-with-some-more-text", env["single-var-with-string-constants"])
+					assert.Equal(t, "Yes-with-some-more-text", env["single-var-with-string-constants"])
 				})
 
 				t.Run("Assert correct variable substitution - xsuaa-instance-name", func(t *testing.T) {

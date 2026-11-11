@@ -5,46 +5,17 @@ import (
 	b64 "encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 
-	"github.com/Jeffail/gabs/v2"
-	"github.com/SAP/jenkins-library/pkg/command"
 	"github.com/SAP/jenkins-library/pkg/cpi"
 	piperhttp "github.com/SAP/jenkins-library/pkg/http"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/piperutils"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/pkg/errors"
+
+	"github.com/Jeffail/gabs/v2"
 )
-
-type integrationArtifactUploadUtils interface {
-	command.ExecRunner
-
-	// Add more methods here, or embed additional interfaces, or remove/replace as required.
-	// The integrationArtifactUploadUtils interface should be descriptive of your runtime dependencies,
-	// i.e. include everything you need to be able to mock in tests.
-	// Unit tests shall be executable in parallel (not depend on global state), and don't (re-)test dependencies.
-}
-
-type integrationArtifactUploadUtilsBundle struct {
-	*command.Command
-
-	// Embed more structs as necessary to implement methods or interfaces you add to integrationArtifactUploadUtils.
-	// Structs embedded in this way must each have a unique set of methods attached.
-	// If there is no struct which implements the method you need, attach the method to
-	// integrationArtifactUploadUtilsBundle and forward to the implementation of the dependency.
-}
-
-func newIntegrationArtifactUploadUtils() integrationArtifactUploadUtils {
-	utils := integrationArtifactUploadUtilsBundle{
-		Command: &command.Command{},
-	}
-	// Reroute command output to logging framework
-	utils.Stdout(log.Writer())
-	utils.Stderr(log.Writer())
-	return &utils
-}
 
 func integrationArtifactUpload(config integrationArtifactUploadOptions, telemetryData *telemetry.CustomData) {
 	// Utils can be used wherever the command.ExecRunner interface is expected.
@@ -64,14 +35,20 @@ func integrationArtifactUpload(config integrationArtifactUploadOptions, telemetr
 }
 
 func runIntegrationArtifactUpload(config *integrationArtifactUploadOptions, telemetryData *telemetry.CustomData, fileUtils piperutils.FileUtils, httpClient piperhttp.Sender) error {
+
+	serviceKey, err := cpi.ReadCpiServiceKey(config.APIServiceKey)
+	if err != nil {
+		return err
+	}
+
 	clientOptions := piperhttp.ClientOptions{}
 	header := make(http.Header)
 	header.Add("Accept", "application/json")
-	iFlowStatusServiceURL := fmt.Sprintf("%s/api/v1/IntegrationDesigntimeArtifacts(Id='%s',Version='%s')", config.Host, config.IntegrationFlowID, config.IntegrationFlowVersion)
-	tokenParameters := cpi.TokenParameters{TokenURL: config.OAuthTokenProviderURL, Username: config.Username, Password: config.Password, Client: httpClient}
+	iFlowStatusServiceURL := fmt.Sprintf("%s/api/v1/IntegrationDesigntimeArtifacts(Id='%s',Version='%s')", serviceKey.OAuth.Host, config.IntegrationFlowID, "Active")
+	tokenParameters := cpi.TokenParameters{TokenURL: serviceKey.OAuth.OAuthTokenProviderURL, Username: serviceKey.OAuth.ClientID, Password: serviceKey.OAuth.ClientSecret, Client: httpClient}
 	token, err := cpi.CommonUtils.GetBearerToken(tokenParameters)
 	if err != nil {
-		return errors.Wrap(err, "failed to fetch Bearer Token")
+		return fmt.Errorf("failed to fetch Bearer Token: %w", err)
 	}
 	clientOptions.Token = fmt.Sprintf("Bearer %s", token)
 	httpClient.SetOptions(clientOptions)
@@ -84,35 +61,35 @@ func runIntegrationArtifactUpload(config *integrationArtifactUploadOptions, tele
 		defer iFlowStatusResp.Body.Close()
 	}
 	if iFlowStatusResp.StatusCode == 200 {
-		return UpdateIntegrationArtifact(config, httpClient, fileUtils)
+		return UpdateIntegrationArtifact(config, httpClient, fileUtils, serviceKey.OAuth.Host)
 	} else if httpErr != nil && iFlowStatusResp.StatusCode == 404 {
-		return UploadIntegrationArtifact(config, httpClient, fileUtils)
+		return UploadIntegrationArtifact(config, httpClient, fileUtils, serviceKey.OAuth.Host)
 	}
 
 	if iFlowStatusResp == nil {
-		return errors.Errorf("did not retrieve a HTTP response: %v", httpErr)
+		return fmt.Errorf("did not retrieve a HTTP response: %v", httpErr)
 	}
 
 	if httpErr != nil {
-		responseBody, readErr := ioutil.ReadAll(iFlowStatusResp.Body)
+		responseBody, readErr := io.ReadAll(iFlowStatusResp.Body)
 		if readErr != nil {
-			return errors.Wrapf(readErr, "HTTP response body could not be read, Response status code: %v", iFlowStatusResp.StatusCode)
+			return fmt.Errorf("HTTP response body could not be read, Response status code: %v: %w", iFlowStatusResp.StatusCode, readErr)
 		}
 		log.Entry().Errorf("a HTTP error occurred! Response body: %v, Response status code: %v", responseBody, iFlowStatusResp.StatusCode)
-		return errors.Wrapf(httpErr, "HTTP %v request to %v failed with error: %v", httpMethod, iFlowStatusServiceURL, responseBody)
+		return fmt.Errorf("HTTP %v request to %v failed with error: %v: %w", httpMethod, iFlowStatusServiceURL, string(responseBody), httpErr)
 	}
-	return errors.Errorf("Failed to check integration flow availability, Response Status code: %v", iFlowStatusResp.StatusCode)
+	return fmt.Errorf("Failed to check integration flow availability, Response Status code: %v", iFlowStatusResp.StatusCode)
 }
 
-//UploadIntegrationArtifact - Upload new integration artifact
-func UploadIntegrationArtifact(config *integrationArtifactUploadOptions, httpClient piperhttp.Sender, fileUtils piperutils.FileUtils) error {
+// UploadIntegrationArtifact - Upload new integration artifact
+func UploadIntegrationArtifact(config *integrationArtifactUploadOptions, httpClient piperhttp.Sender, fileUtils piperutils.FileUtils, apiHost string) error {
 	httpMethod := "POST"
-	uploadIflowStatusURL := fmt.Sprintf("%s/api/v1/IntegrationDesigntimeArtifacts", config.Host)
+	uploadIflowStatusURL := fmt.Sprintf("%s/api/v1/IntegrationDesigntimeArtifacts", apiHost)
 	header := make(http.Header)
 	header.Add("content-type", "application/json")
 	payload, jsonError := GetJSONPayloadAsByteArray(config, "create", fileUtils)
 	if jsonError != nil {
-		return errors.Wrapf(jsonError, "Failed to get json payload for file %v, failed with error", config.FilePath)
+		return fmt.Errorf("Failed to get json payload for file %v, failed with error: %w", config.FilePath, jsonError)
 	}
 
 	uploadIflowStatusResp, httpErr := httpClient.SendRequest(httpMethod, uploadIflowStatusURL, payload, header, nil)
@@ -122,7 +99,7 @@ func UploadIntegrationArtifact(config *integrationArtifactUploadOptions, httpCli
 	}
 
 	if uploadIflowStatusResp == nil {
-		return errors.Errorf("did not retrieve a HTTP response: %v", httpErr)
+		return fmt.Errorf("did not retrieve a HTTP response: %v", httpErr)
 	}
 
 	if uploadIflowStatusResp.StatusCode == http.StatusCreated {
@@ -132,25 +109,25 @@ func UploadIntegrationArtifact(config *integrationArtifactUploadOptions, httpCli
 		return nil
 	}
 	if httpErr != nil {
-		responseBody, readErr := ioutil.ReadAll(uploadIflowStatusResp.Body)
+		responseBody, readErr := io.ReadAll(uploadIflowStatusResp.Body)
 		if readErr != nil {
-			return errors.Wrapf(readErr, "HTTP response body could not be read, Response status code: %v", uploadIflowStatusResp.StatusCode)
+			return fmt.Errorf("HTTP response body could not be read, Response status code: %v: %w", uploadIflowStatusResp.StatusCode, readErr)
 		}
 		log.Entry().Errorf("a HTTP error occurred! Response body: %v, Response status code: %v", responseBody, uploadIflowStatusResp.StatusCode)
-		return errors.Wrapf(httpErr, "HTTP %v request to %v failed with error: %v", httpMethod, uploadIflowStatusURL, responseBody)
+		return fmt.Errorf("HTTP %v request to %v failed with error: %v: %w", httpMethod, uploadIflowStatusURL, string(responseBody), httpErr)
 	}
-	return errors.Errorf("Failed to create Integration Flow artefact, Response Status code: %v", uploadIflowStatusResp.StatusCode)
+	return fmt.Errorf("Failed to create Integration Flow artefact, Response Status code: %v", uploadIflowStatusResp.StatusCode)
 }
 
-//UpdateIntegrationArtifact - Update existing integration artifact
-func UpdateIntegrationArtifact(config *integrationArtifactUploadOptions, httpClient piperhttp.Sender, fileUtils piperutils.FileUtils) error {
-	httpMethod := "POST"
+// UpdateIntegrationArtifact - Update existing integration artifact
+func UpdateIntegrationArtifact(config *integrationArtifactUploadOptions, httpClient piperhttp.Sender, fileUtils piperutils.FileUtils, apiHost string) error {
+	httpMethod := "PUT"
 	header := make(http.Header)
 	header.Add("content-type", "application/json")
-	updateIflowStatusURL := fmt.Sprintf("%s/api/v1/IntegrationDesigntimeArtifactSaveAsVersion?Id='%s'&SaveAsVersion='%s'", config.Host, config.IntegrationFlowID, config.IntegrationFlowVersion)
+	updateIflowStatusURL := fmt.Sprintf("%s/api/v1/IntegrationDesigntimeArtifacts(Id='%s',Version='%s')", apiHost, config.IntegrationFlowID, "Active")
 	payload, jsonError := GetJSONPayloadAsByteArray(config, "update", fileUtils)
 	if jsonError != nil {
-		return errors.Wrapf(jsonError, "Failed to get json payload for file %v, failed with error", config.FilePath)
+		return fmt.Errorf("Failed to get json payload for file %v, failed with error: %w", config.FilePath, jsonError)
 	}
 	updateIflowStatusResp, httpErr := httpClient.SendRequest(httpMethod, updateIflowStatusURL, payload, header, nil)
 
@@ -159,7 +136,7 @@ func UpdateIntegrationArtifact(config *integrationArtifactUploadOptions, httpCli
 	}
 
 	if updateIflowStatusResp == nil {
-		return errors.Errorf("did not retrieve a HTTP response: %v", httpErr)
+		return fmt.Errorf("did not retrieve a HTTP response: %v", httpErr)
 	}
 
 	if updateIflowStatusResp.StatusCode == http.StatusOK {
@@ -169,29 +146,30 @@ func UpdateIntegrationArtifact(config *integrationArtifactUploadOptions, httpCli
 		return nil
 	}
 	if httpErr != nil {
-		responseBody, readErr := ioutil.ReadAll(updateIflowStatusResp.Body)
+		responseBody, readErr := io.ReadAll(updateIflowStatusResp.Body)
 		if readErr != nil {
-			return errors.Wrapf(readErr, "HTTP response body could not be read, Response status code: %v", updateIflowStatusResp.StatusCode)
+			return fmt.Errorf("HTTP response body could not be read, Response status code: %v: %w", updateIflowStatusResp.StatusCode, readErr)
 		}
-		log.Entry().Errorf("a HTTP error occurred! Response body: %v, Response status code: %v", responseBody, updateIflowStatusResp.StatusCode)
-		return errors.Wrapf(httpErr, "HTTP %v request to %v failed with error: %v", httpMethod, updateIflowStatusURL, responseBody)
+		log.Entry().Errorf("a HTTP error occurred! Response body: %v, Response status code: %v", string(responseBody), updateIflowStatusResp.StatusCode)
+		return fmt.Errorf("HTTP %v request to %v failed with error: %v: %w", httpMethod, updateIflowStatusURL, string(responseBody), httpErr)
 	}
-	return errors.Errorf("Failed to update Integration Flow artefact, Response Status code: %v", updateIflowStatusResp.StatusCode)
+	return fmt.Errorf("Failed to update Integration Flow artefact, Response Status code: %v", updateIflowStatusResp.StatusCode)
 }
 
-//GetJSONPayloadAsByteArray -return http payload as byte array
+// GetJSONPayloadAsByteArray -return http payload as byte array
 func GetJSONPayloadAsByteArray(config *integrationArtifactUploadOptions, mode string, fileUtils piperutils.FileUtils) (*bytes.Buffer, error) {
 	fileContent, readError := fileUtils.FileRead(config.FilePath)
 	if readError != nil {
-		return nil, errors.Wrapf(readError, "Error reading file")
+		return nil, fmt.Errorf("Error reading file: %w", readError)
 	}
 	jsonObj := gabs.New()
 	if mode == "create" {
-		jsonObj.Set(config.IntegrationFlowID, "Name")
+		jsonObj.Set(config.IntegrationFlowName, "Name")
 		jsonObj.Set(config.IntegrationFlowID, "Id")
 		jsonObj.Set(config.PackageID, "PackageId")
 		jsonObj.Set(b64.StdEncoding.EncodeToString(fileContent), "ArtifactContent")
 	} else if mode == "update" {
+		jsonObj.Set(config.IntegrationFlowName, "Name")
 		jsonObj.Set(b64.StdEncoding.EncodeToString(fileContent), "ArtifactContent")
 	} else {
 		return nil, fmt.Errorf("Unkown node: '%s'", mode)
@@ -200,7 +178,7 @@ func GetJSONPayloadAsByteArray(config *integrationArtifactUploadOptions, mode st
 	jsonBody, jsonErr := json.Marshal(jsonObj)
 
 	if jsonErr != nil {
-		return nil, errors.Wrapf(jsonErr, "json payload is invalid for integration flow artifact %q", config.IntegrationFlowID)
+		return nil, fmt.Errorf("json payload is invalid for integration flow artifact %q: %w", config.IntegrationFlowID, jsonErr)
 	}
 	return bytes.NewBuffer(jsonBody), nil
 }

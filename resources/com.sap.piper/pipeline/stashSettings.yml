@@ -28,6 +28,12 @@ Acceptance:
     - deployDescriptor
   stashes: []
 
+Compliance:
+  unstash:
+    - source
+    - classFiles
+  stashes: []
+
 Performance:
   unstash:
     - source

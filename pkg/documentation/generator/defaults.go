@@ -40,10 +40,17 @@ func consolidateContextDefaults(stepData *config.StepData) {
 					}
 				}
 			}
+		} else {
+			for paramName, val := range containerParams {
+				if _, ok := paramConditions[paramName]; !ok {
+					paramConditions[paramName] = &conditionDefaults{}
+				}
+				paramConditions[paramName].equal = append(paramConditions[paramName].equal, conditionDefault{def: val})
+			}
 		}
 	}
 
-	stashes := []interface{}{}
+	stashes := []any{}
 	conditionalStashes := []conditionDefault{}
 	for _, res := range stepData.Spec.Inputs.Resources {
 		//consider only resources of type stash, others not relevant for conditions yet
@@ -134,5 +141,5 @@ type conditionDefaults struct {
 type conditionDefault struct {
 	key   string
 	value string
-	def   interface{}
+	def   any
 }

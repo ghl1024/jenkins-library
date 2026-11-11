@@ -1,12 +1,12 @@
-// +build !release
+//go:build !release
 
 package mock
 
 import (
 	"io"
-	"io/ioutil"
 	"regexp"
 	"strings"
+	"syscall"
 
 	"github.com/SAP/jenkins-library/pkg/command"
 )
@@ -16,17 +16,20 @@ type ExecMockRunner struct {
 	Env                 []string
 	ExitCode            int
 	Calls               []ExecCall
+	stdin               io.Reader
 	stdout              io.Writer
 	stderr              io.Writer
+	Stub                func(call string, stdoutReturn map[string]string, shouldFailOnCommand map[string]error, stdout io.Writer) error
 	StdoutReturn        map[string]string
 	ShouldFailOnCommand map[string]error
 }
 
 type ExecCall struct {
-	Execution *Execution
-	Async     bool
-	Exec      string
-	Params    []string
+	Execution    *Execution
+	SysProcAttrs *syscall.SysProcAttr
+	Async        bool
+	Exec         string
+	Params       []string
 }
 
 type Execution struct {
@@ -39,6 +42,7 @@ type ShellMockRunner struct {
 	ExitCode            int
 	Calls               []string
 	Shell               []string
+	stdin               io.Reader
 	stdout              io.Writer
 	stderr              io.Writer
 	StdoutReturn        map[string]string
@@ -58,13 +62,16 @@ func (m *ExecMockRunner) AppendEnv(e []string) {
 }
 
 func (m *ExecMockRunner) RunExecutable(e string, p ...string) error {
+	return m.RunExecutableWithAttrs(e, nil, p...)
+}
 
-	exec := ExecCall{Exec: e, Params: p}
+func (m *ExecMockRunner) RunExecutableWithAttrs(e string, attrs *syscall.SysProcAttr, p ...string) error {
+	exec := ExecCall{Exec: e, SysProcAttrs: attrs, Params: p}
 	m.Calls = append(m.Calls, exec)
 
 	c := strings.Join(append([]string{e}, p...), " ")
 
-	return handleCall(c, m.StdoutReturn, m.ShouldFailOnCommand, m.stdout)
+	return m.handleCall(c, m.StdoutReturn, m.ShouldFailOnCommand, m.stdout)
 }
 
 func (m *ExecMockRunner) GetExitCode() int {
@@ -79,11 +86,15 @@ func (m *ExecMockRunner) RunExecutableInBackground(e string, p ...string) (comma
 
 	c := strings.Join(append([]string{e}, p...), " ")
 
-	err := handleCall(c, m.StdoutReturn, m.ShouldFailOnCommand, m.stdout)
+	err := m.handleCall(c, m.StdoutReturn, m.ShouldFailOnCommand, m.stdout)
 	if err != nil {
 		return nil, err
 	}
 	return &execution, nil
+}
+
+func (m *ExecMockRunner) Stdin(in io.Reader) {
+	m.stdin = in
 }
 
 func (m *ExecMockRunner) Stdout(out io.Writer) {
@@ -100,6 +111,14 @@ func (m *ExecMockRunner) Stderr(err io.Writer) {
 
 func (m *ExecMockRunner) GetStderr() io.Writer {
 	return m.stderr
+}
+
+func (m *ExecMockRunner) handleCall(call string, stdoutReturn map[string]string, shouldFailOnCommand map[string]error, stdout io.Writer) error {
+	if m.Stub != nil {
+		return m.Stub(call, stdoutReturn, shouldFailOnCommand, stdout)
+	} else {
+		return handleCall(call, stdoutReturn, shouldFailOnCommand, stdout)
+	}
 }
 
 func (m *ShellMockRunner) SetDir(d string) {
@@ -193,6 +212,10 @@ func handleCall(call string, stdoutReturn map[string]string, shouldFailOnCommand
 	return nil
 }
 
+func (m *ShellMockRunner) Stdin(in io.Reader) {
+	m.stdin = in
+}
+
 func (m *ShellMockRunner) Stdout(out io.Writer) {
 	m.stdout = out
 }
@@ -213,7 +236,7 @@ type StepOptions struct {
 	TestParam string `json:"testParam,omitempty"`
 }
 
-func OpenFileMock(name string) (io.ReadCloser, error) {
+func OpenFileMock(name string, tokens map[string]string) (io.ReadCloser, error) {
 	var r string
 	switch name {
 	case "testDefaults.yml":
@@ -223,5 +246,5 @@ func OpenFileMock(name string) (io.ReadCloser, error) {
 	default:
 		r = ""
 	}
-	return ioutil.NopCloser(strings.NewReader(r)), nil
+	return io.NopCloser(strings.NewReader(r)), nil
 }

@@ -2,21 +2,35 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"mime"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/SAP/jenkins-library/pkg/log"
-	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/google/go-github/v32/github"
-	"github.com/pkg/errors"
+	"time"
 
 	piperGithub "github.com/SAP/jenkins-library/pkg/github"
+	"github.com/SAP/jenkins-library/pkg/log"
+	"github.com/SAP/jenkins-library/pkg/telemetry"
+
+	"github.com/google/go-github/v68/github"
 )
 
-type githubRepoClient interface {
+var errOwnerOrRepositoryEmpty = errors.New("'owner' or 'repository' is empty")
+
+var errNoGitHubToken = errors.New("no GitHub token available: provide 'token' via configuration, System Trust, Vault or the GITHUB_TOKEN environment variable")
+
+// resolveGitHubToken returns the configured token or, if empty, the GitHub Actions token from the environment.
+func resolveGitHubToken(configured string) (string, error) {
+	_, token := piperGithub.WithActionsTokenFallback("", configured)
+	if token == "" {
+		return "", errNoGitHubToken
+	}
+	return token, nil
+}
+
+type GithubRepoClient interface {
 	CreateRelease(ctx context.Context, owner string, repo string, release *github.RepositoryRelease) (*github.RepositoryRelease, *github.Response, error)
 	DeleteReleaseAsset(ctx context.Context, owner string, repo string, id int64) (*github.Response, error)
 	GetLatestRelease(ctx context.Context, owner string, repo string) (*github.RepositoryRelease, *github.Response, error)
@@ -29,7 +43,17 @@ type githubIssueClient interface {
 }
 
 func githubPublishRelease(config githubPublishReleaseOptions, telemetryData *telemetry.CustomData) {
-	ctx, client, err := piperGithub.NewClient(config.Token, config.APIURL, config.UploadURL)
+	token, err := resolveGitHubToken(config.Token)
+	if err != nil {
+		log.SetErrorCategory(log.ErrorConfiguration)
+		log.Entry().WithError(err).Fatal("Failed to publish GitHub release.")
+	}
+
+	// TODO provide parameter for trusted certs
+	ctx, client, err := piperGithub.NewClientBuilder(token, config.APIURL).
+		WithTimeout(time.Duration(config.GithubAPITimeout) * time.Second).
+		WithUploadURL(config.UploadURL).
+		Build()
 	if err != nil {
 		log.Entry().WithError(err).Fatal("Failed to get GitHub client.")
 	}
@@ -40,26 +64,40 @@ func githubPublishRelease(config githubPublishReleaseOptions, telemetryData *tel
 	}
 }
 
-func runGithubPublishRelease(ctx context.Context, config *githubPublishReleaseOptions, ghRepoClient githubRepoClient, ghIssueClient githubIssueClient) error {
+func runGithubPublishRelease(ctx context.Context, config *githubPublishReleaseOptions, ghRepoClient GithubRepoClient, ghIssueClient githubIssueClient) error {
+	if len(config.Owner) == 0 || len(config.Repository) == 0 {
+		log.Entry().Errorf("Cannot publish GitHub release: 'owner'=%q, 'repository'=%q. Set the 'owner' (alias 'githubOrg') and 'repository' (alias 'githubRepo') parameters in your step configuration, or ensure 'github/owner' and 'github/repository' are provided via commonPipelineEnvironment.", config.Owner, config.Repository)
+		return errOwnerOrRepositoryEmpty
+	}
 
 	var publishedAt github.Timestamp
 
 	lastRelease, resp, err := ghRepoClient.GetLatestRelease(ctx, config.Owner, config.Repository)
 	if err != nil {
 		if resp != nil && resp.StatusCode == 404 {
-			//no previous release found -> first release
+			// no previous release found -> first release
 			config.AddDeltaToLastRelease = false
 			log.Entry().Debug("This is the first release.")
 		} else {
-			return errors.Wrapf(err, "Error occurred when retrieving latest GitHub release (%v/%v)", config.Owner, config.Repository)
+			return fmt.Errorf("Error occurred when retrieving latest GitHub release (%v/%v): %w", config.Owner, config.Repository, err)
 		}
 	}
 	publishedAt = lastRelease.GetPublishedAt()
 	log.Entry().Debugf("Previous GitHub release published: '%v'", publishedAt)
 
-	//updating assets only supported on latest release
+	// updating assets only supported on latest release
 	if len(config.AssetPath) > 0 && config.Version == "latest" {
 		return uploadReleaseAsset(ctx, lastRelease.GetID(), config, ghRepoClient)
+	} else if len(config.AssetPathList) > 0 && config.Version == "latest" {
+		return uploadReleaseAssetList(ctx, lastRelease.GetID(), config, ghRepoClient)
+	}
+
+	if config.AutoDetectPreRelease {
+		ver := config.Version
+		// Strip build metadata if present (after '+')
+		ver, _, _ = strings.Cut(ver, "+")
+		// Pre-release if a hyphen exists after MAJOR.MINOR.PATCH
+		config.PreRelease = strings.Contains(ver, "-")
 	}
 
 	releaseBody := ""
@@ -76,8 +114,10 @@ func runGithubPublishRelease(ctx context.Context, config *githubPublishReleaseOp
 		releaseBody += getReleaseDeltaText(config, lastRelease)
 	}
 
+	prefixedTagName := config.TagPrefix + config.Version
+
 	release := github.RepositoryRelease{
-		TagName:         &config.Version,
+		TagName:         &prefixedTagName,
 		TargetCommitish: &config.Commitish,
 		Name:            &config.Version,
 		Body:            &releaseBody,
@@ -86,12 +126,14 @@ func runGithubPublishRelease(ctx context.Context, config *githubPublishReleaseOp
 
 	createdRelease, _, err := ghRepoClient.CreateRelease(ctx, config.Owner, config.Repository, &release)
 	if err != nil {
-		return errors.Wrapf(err, "Creation of release '%v' failed", *release.TagName)
+		return fmt.Errorf("Creation of release '%v' failed: %w", *release.TagName, err)
 	}
 	log.Entry().Infof("Release %v created on %v/%v", *createdRelease.TagName, config.Owner, config.Repository)
 
 	if len(config.AssetPath) > 0 {
 		return uploadReleaseAsset(ctx, createdRelease.GetID(), config, ghRepoClient)
+	} else if len(config.AssetPathList) > 0 {
+		return uploadReleaseAssetList(ctx, createdRelease.GetID(), config, ghRepoClient)
 	}
 
 	return nil
@@ -108,19 +150,47 @@ func getClosedIssuesText(ctx context.Context, publishedAt github.Timestamp, conf
 	if len(config.Labels) > 0 {
 		options.Labels = config.Labels
 	}
-	ghIssues, _, err := ghIssueClient.ListByRepo(ctx, config.Owner, config.Repository, &options)
-	if err != nil {
-		log.Entry().WithError(err).Error("Failed to get GitHub issues.")
+
+	var ghIssues []*github.Issue
+	for {
+		issues, resp, err := ghIssueClient.ListByRepo(ctx, config.Owner, config.Repository, &options)
+		if err != nil {
+			log.Entry().WithError(err).Error("failed to get GitHub issues")
+		}
+
+		ghIssues = append(ghIssues, issues...)
+		if resp.NextPage == 0 {
+			break
+		}
+		options.Page = resp.NextPage
 	}
 
 	prTexts := []string{"**List of closed pull-requests since last release**"}
 	issueTexts := []string{"**List of closed issues since last release**"}
 
 	for _, issue := range ghIssues {
-		if issue.IsPullRequest() && !isExcluded(issue, config.ExcludeLabels) {
+		if isExcluded(issue, config.ExcludeLabels) {
+			continue
+		}
+		// the API's 'since' parameter filters by updated_at, so the result may
+		// contain items closed before the last release which were merely updated since
+		if !publishedAt.Time.IsZero() && !issue.GetClosedAt().After(publishedAt.Time) {
+			continue
+		}
+		if issue.IsPullRequest() {
+			// closed pull requests include those closed without being merged
+			if issue.GetPullRequestLinks().MergedAt == nil {
+				log.Entry().Debugf("Skipping unmerged PR #%v", issue.GetNumber())
+				continue
+			}
 			prTexts = append(prTexts, fmt.Sprintf("[#%v](%v): %v", issue.GetNumber(), issue.GetHTMLURL(), issue.GetTitle()))
 			log.Entry().Debugf("Added PR #%v to release", issue.GetNumber())
-		} else if !issue.IsPullRequest() && !isExcluded(issue, config.ExcludeLabels) {
+		} else {
+			// issues auto-closed as stale or closed as won't-fix are not resolved by this release
+			if issue.GetStateReason() == "not_planned" {
+				log.Entry().Debugf("Skipping issue #%v closed as not planned", issue.GetNumber())
+				continue
+			}
 			issueTexts = append(issueTexts, fmt.Sprintf("[#%v](%v): %v", issue.GetNumber(), issue.GetHTMLURL(), issue.GetTitle()))
 			log.Entry().Debugf("Added Issue #%v to release", issue.GetNumber())
 		}
@@ -138,27 +208,38 @@ func getClosedIssuesText(ctx context.Context, publishedAt github.Timestamp, conf
 
 func getReleaseDeltaText(config *githubPublishReleaseOptions, lastRelease *github.RepositoryRelease) string {
 	releaseDeltaText := ""
+	tagName := config.TagPrefix + config.Version
 
-	//add delta link to previous release
+	// add delta link to previous release
 	releaseDeltaText += "\n**Changes**\n"
 	releaseDeltaText += fmt.Sprintf(
 		"[%v...%v](%v/%v/%v/compare/%v...%v)\n",
 		lastRelease.GetTagName(),
-		config.Version,
+		tagName,
 		config.ServerURL,
 		config.Owner,
 		config.Repository,
-		lastRelease.GetTagName(), config.Version,
+		lastRelease.GetTagName(), tagName,
 	)
 
 	return releaseDeltaText
 }
 
-func uploadReleaseAsset(ctx context.Context, releaseID int64, config *githubPublishReleaseOptions, ghRepoClient githubRepoClient) error {
+func uploadReleaseAssetList(ctx context.Context, releaseID int64, config *githubPublishReleaseOptions, ghRepoClient GithubRepoClient) error {
+	for _, asset := range config.AssetPathList {
+		config.AssetPath = asset
+		err := uploadReleaseAsset(ctx, releaseID, config, ghRepoClient)
+		if err != nil {
+			return fmt.Errorf("failed to upload release asset: %w", err)
+		}
+	}
+	return nil
+}
 
+func uploadReleaseAsset(ctx context.Context, releaseID int64, config *githubPublishReleaseOptions, ghRepoClient GithubRepoClient) error {
 	assets, _, err := ghRepoClient.ListReleaseAssets(ctx, config.Owner, config.Repository, releaseID, &github.ListOptions{})
 	if err != nil {
-		return errors.Wrap(err, "Failed to get list of release assets.")
+		return fmt.Errorf("Failed to get list of release assets.: %w", err)
 	}
 	var assetID int64
 	for _, a := range assets {
@@ -168,10 +249,10 @@ func uploadReleaseAsset(ctx context.Context, releaseID int64, config *githubPubl
 		}
 	}
 	if assetID != 0 {
-		//asset needs to be deleted first since API does not allow for replacement
+		// asset needs to be deleted first since API does not allow for replacement
 		_, err := ghRepoClient.DeleteReleaseAsset(ctx, config.Owner, config.Repository, assetID)
 		if err != nil {
-			return errors.Wrap(err, "Failed to delete release asset.")
+			return fmt.Errorf("Failed to delete release asset.: %w", err)
 		}
 	}
 
@@ -189,15 +270,18 @@ func uploadReleaseAsset(ctx context.Context, releaseID int64, config *githubPubl
 		MediaType: mediaType,
 	}
 	file, err := os.Open(config.AssetPath)
+	if err != nil {
+		return fmt.Errorf("failed to open release asset %v: %w", config.AssetPath, err)
+	}
 	defer file.Close()
 	if err != nil {
-		return errors.Wrapf(err, "Failed to load release asset '%v'", config.AssetPath)
+		return fmt.Errorf("Failed to load release asset '%v': %w", config.AssetPath, err)
 	}
 
 	log.Entry().Info("Starting to upload release asset.")
 	asset, _, err := ghRepoClient.UploadReleaseAsset(ctx, config.Owner, config.Repository, releaseID, &opts, file)
 	if err != nil {
-		return errors.Wrap(err, "Failed to upload release asset.")
+		return fmt.Errorf("Failed to upload release asset.: %w", err)
 	}
 	log.Entry().Infof("Done uploading asset '%v'.", asset.GetURL())
 
@@ -205,7 +289,7 @@ func uploadReleaseAsset(ctx context.Context, releaseID int64, config *githubPubl
 }
 
 func isExcluded(issue *github.Issue, excludeLabels []string) bool {
-	//issue.Labels[0].GetName()
+	// issue.Labels[0].GetName()
 	for _, ex := range excludeLabels {
 		for _, l := range issue.Labels {
 			if ex == l.GetName() {

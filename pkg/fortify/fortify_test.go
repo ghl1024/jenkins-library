@@ -1,8 +1,11 @@
+//go:build unit
+// +build unit
+
 package fortify
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,64 +13,47 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-openapi/strfmt"
-	ff "github.com/piper-validation/fortify-client-go/fortify"
-	"github.com/piper-validation/fortify-client-go/models"
+	piperHttp "github.com/SAP/jenkins-library/pkg/http"
+
+	"github.com/SAP/jenkins-library/pkg/fortify/models"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
-
-	piperHttp "github.com/SAP/jenkins-library/pkg/http"
 )
 
 func spinUpServer(f func(http.ResponseWriter, *http.Request)) (*SystemInstance, *httptest.Server) {
 	server := httptest.NewServer(http.HandlerFunc(f))
 
-	parts := strings.Split(server.URL, "://")
-	client := ff.NewHTTPClientWithConfig(strfmt.Default, &ff.TransportConfig{
-		Host:     parts[1],
-		Schemes:  []string{parts[0]},
-		BasePath: ""},
-	)
-
 	httpClient := &piperHttp.Client{}
 	httpClientOptions := piperHttp.ClientOptions{Token: "test2456", TransportTimeout: 60 * time.Second}
 	httpClient.SetOptions(httpClientOptions)
 
-	sys := NewSystemInstanceForClient(client, httpClient, server.URL, "test2456", 60*time.Second)
+	sys := NewSystemInstanceForClient(httpClient, server.URL, server.URL, "test2456", 60*time.Second)
 	return sys, server
 }
 
-func TestCreateTransportConfig(t *testing.T) {
+func TestCreateAPIBaseURL(t *testing.T) {
 	t.Run("Valid URL", func(t *testing.T) {
-		config := createTransportConfig("http://some.fortify.host.com/ssc", "/api/v2")
-		assert.Equal(t, []string{"http"}, config.Schemes)
-		assert.Equal(t, "some.fortify.host.com", config.Host)
-		assert.Equal(t, "ssc/api/v2", config.BasePath)
+		baseURL := createAPIBaseURL("http://some.fortify.host.com/ssc", "/api/v2")
+		assert.Equal(t, "http://some.fortify.host.com/ssc/api/v2", baseURL)
 	})
 	t.Run("Slashes are trimmed", func(t *testing.T) {
-		config := createTransportConfig("http://some.fortify.host.com/ssc//", "//api/v2/")
-		assert.Equal(t, []string{"http"}, config.Schemes)
-		assert.Equal(t, "some.fortify.host.com", config.Host)
-		assert.Equal(t, "ssc/api/v2", config.BasePath)
+		baseURL := createAPIBaseURL("http://some.fortify.host.com/ssc//", "//api/v2/")
+		assert.Equal(t, "http://some.fortify.host.com/ssc/api/v2", baseURL)
 	})
 	t.Run("URL missing scheme results in no error", func(t *testing.T) {
-		config := createTransportConfig("some.fortify.host.com/ssc", "api/v1")
-		assert.Equal(t, []string{"https"}, config.Schemes)
-		assert.Equal(t, "some.fortify.host.com", config.Host)
-		assert.Equal(t, "ssc/api/v1", config.BasePath)
+		baseURL := createAPIBaseURL("some.fortify.host.com/ssc", "api/v1")
+		assert.Equal(t, "https://some.fortify.host.com/ssc/api/v1", baseURL)
 	})
 	t.Run("URL with more than one slash is accepted", func(t *testing.T) {
-		config := createTransportConfig("https://some.fortify.host.com/some/path/ssc", "api/v1")
-		assert.Equal(t, []string{"https"}, config.Schemes)
-		assert.Equal(t, "some.fortify.host.com", config.Host)
-		assert.Equal(t, "some/path/ssc/api/v1", config.BasePath)
+		baseURL := createAPIBaseURL("https://some.fortify.host.com/some/path/ssc", "api/v1")
+		assert.Equal(t, "https://some.fortify.host.com/some/path/ssc/api/v1", baseURL)
 	})
 }
 
 func TestNewSystemInstance(t *testing.T) {
 	t.Run("fields are initialized", func(t *testing.T) {
-		sys := NewSystemInstance("https://some.fortify.host.com/ssc", "api/v1", "akjhskjhks", 10*time.Second)
-		assert.IsType(t, ff.Fortify{}, *sys.client, "Expected to get a Fortify client instance")
+		sys := NewSystemInstance("https://some.fortify.host.com/ssc", "api/v1", "akjhskjhks", "", 10*time.Second)
+		assert.Equal(t, "https://some.fortify.host.com/ssc/api/v1", sys.apiBaseURL, "Expected different API base URL")
 		assert.IsType(t, piperHttp.Client{}, *sys.httpClient, "Expected to get a HTTP client instance")
 		assert.IsType(t, logrus.Entry{}, *sys.logger, "Expected to get a logrus entry instance")
 		assert.Equal(t, 10*time.Second, sys.timeout, "Expected different timeout value")
@@ -75,7 +61,7 @@ func TestNewSystemInstance(t *testing.T) {
 		assert.Equal(t, "https://some.fortify.host.com/ssc", sys.serverURL)
 	})
 	t.Run("SSC URL is trimmed", func(t *testing.T) {
-		sys := NewSystemInstance("https://some.fortify.host.com/ssc/", "api/v1", "akjhskjhks", 10*time.Second)
+		sys := NewSystemInstance("https://some.fortify.host.com/ssc/", "api/v1", "akjhskjhks", "", 10*time.Second)
 		assert.Equal(t, "https://some.fortify.host.com/ssc", sys.serverURL)
 	})
 }
@@ -85,24 +71,34 @@ func TestGetProjectByName(t *testing.T) {
 	autocreateCalled := false
 	commitCalled := false
 	sys, server := spinUpServer(func(rw http.ResponseWriter, req *http.Request) {
-		if req.URL.Path == "/projects" && req.URL.RawQuery == "q=name%3Dpython-test" {
+		if req.URL.Path == "/projects" && req.URL.RawQuery == "q=name%3A%22python-test%22" {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
 			rw.Write([]byte(
 				`{"data": [{"_href": "https://fortify/ssc/api/v1/projects/4711","createdBy": "someUser","name": "python-test",
 				"description": "","id": 4711,"creationDate": "2018-12-03T06:29:38.197+0000","issueTemplateId": "dasdasdasdsadasdasdasdasdas"}],
 				"count": 1,"responseCode": 200,"links": {"last": {"href": "https://fortify/ssc/api/v1/projects?q=name%A3python-test&start=0"},
-				"first": {"href": "https://fortify/ssc/api/v1/projects?q=name%A3python-test&start=0"}}}`))
+				"first": {"href": "https://fortify/ssc/api/v1/projects?q=name%3Apython-test&start=0"}}}`))
 			return
 		}
-		if req.URL.Path == "/projects" && req.URL.RawQuery == "q=name%3Dpython-empty" {
+		if req.URL.Path == "/projects" && req.URL.RawQuery == "q=name%3A%22python+with+space+test%22" {
+			header := rw.Header()
+			header.Add("Content-type", "application/json")
+			rw.Write([]byte(
+				`{"data": [{"_href": "https://fortify/ssc/api/v1/projects/4711","createdBy": "someUser","name": "python with space test",
+				"description": "","id": 4711,"creationDate": "2018-12-03T06:29:38.197+0000","issueTemplateId": "dasdasdasdsadasdasdasdasdas"}],
+				"count": 1,"responseCode": 200,"links": {"last": {"href": "https://fortify/ssc/api/v1/projects?q=name%3A%22python+with+space+test%22&start=0"},
+				"first": {"href": "https://fortify/ssc/api/v1/projects?q=name%3A%22python+with+space+test%22&start=0"}}}`))
+			return
+		}
+		if req.URL.Path == "/projects" && req.URL.RawQuery == "q=name%3A%22python-empty%22" {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
 			rw.Write([]byte(
 				`{"data": [],"count": 0,"responseCode": 404,"links": {}}`))
 			return
 		}
-		if req.URL.Path == "/projects" && req.URL.RawQuery == "q=name%3Dpython-error" {
+		if req.URL.Path == "/projects" && req.URL.RawQuery == "q=name%3A%22python-error%22" {
 			rw.WriteHeader(400)
 			return
 		}
@@ -116,7 +112,7 @@ func TestGetProjectByName(t *testing.T) {
 				"project":{"id":815,"name":"autocreate","description":"","creationDate":"2018-12-03T06:29:38.197+0000","createdBy":"someUser",
 				"issueTemplateId":"dasdasdasdsadasdasdasdasdas"},"sourceBasePath":null,"mode":"BASIC","masterAttrGuid":"sddasdasda","obfuscatedId":null,
 				"id":10172,"customTagValuesAutoApply":null,"issueTemplateId":"dasdasdasdsadasdasdasdasdas","loadProperties":null,"predictionPolicy":null,
-				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify.mo.sap.corp/ssc/api/v1/projectVersions/10172",
+				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify/ssc/api/v1/projectVersions/10172",
 				"committed":true,"bugTrackerEnabled":false,"active":true,"snapshotOutOfDate":false,"issueTemplateModifiedTime":1578411924701,
 				"securityGroup":null,"creationDate":"2018-02-09T16:59:41.297+0000","refreshRequired":false,"issueTemplateName":"someTemplate",
 				"migrationVersion":null,"createdBy":"admin","name":"0","siteId":null,"staleIssueTemplate":false,"autoPredict":null,
@@ -124,8 +120,8 @@ func TestGetProjectByName(t *testing.T) {
 				"lastFprUploadDate":"2018-02-09T16:59:53.497+0000","extraMessage":null,"analysisUploadEnabled":true,"batchBugSubmissionExists":false,
 				"hasCustomIssues":false,"metricEvaluationDate":"2018-03-10T00:02:45.553+0000","deltaPeriod":7,"issueCountDelta":0,"percentAuditedDelta":0.0,
 				"criticalPriorityIssueCountDelta":0,"percentCriticalPriorityIssuesAuditedDelta":0.0},"assignedIssuesCount":0,"status":null},
-				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/815/versions?start=0"},
-				"first":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/815/versions?start=0"}}}`))
+				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify/ssc/api/v1/projects/815/versions?start=0"},
+				"first":{"href":"https://fortify/ssc/api/v1/projects/815/versions?start=0"}}}`))
 			return
 		}
 		if req.URL.Path == "/projectVersions/10172" {
@@ -135,7 +131,7 @@ func TestGetProjectByName(t *testing.T) {
 			rw.Write([]byte(
 				`{"data": {"_href": "https://fortify/ssc/api/v1/projects/815", "committed": true,"createdBy": "someUser","name": "autocreate",
 				"description": "","id": 815,"creationDate": "2018-12-03T06:29:38.197+0000","issueTemplateId": "dasdasdasdsadasdasdasdasdas"},
-				"count": 1,"responseCode": 200,"links": {"last": {"href": "https://fortify/ssc/api/v1/projects?q=name%A3python-test&start=0"},
+				"count": 1,"responseCode": 200,"links": {"last": {"href": "https://fortify/ssc/api/v1/projects?q=name%3Apython-test&start=0"},
 				"first": {"href": ""}}}`))
 			return
 		}
@@ -147,6 +143,12 @@ func TestGetProjectByName(t *testing.T) {
 		result, err := sys.GetProjectByName("python-test", false, "")
 		assert.NoError(t, err, "GetProjectByName call not successful")
 		assert.Equal(t, "python-test", strings.ToLower(*result.Name), "Expected to get python-test")
+	})
+
+	t.Run("test space", func(t *testing.T) {
+		result, err := sys.GetProjectByName("python with space test", false, "")
+		assert.NoError(t, err, "GetProjectByName call not successful")
+		assert.Equal(t, "python with space test", strings.ToLower(*result.Name), "Expected to get python with space test")
 	})
 
 	t.Run("test empty", func(t *testing.T) {
@@ -179,7 +181,7 @@ func TestGetProjectVersionDetailsByProjectIDAndVersionName(t *testing.T) {
 				"project":{"id":4711,"name":"python-test","description":"","creationDate":"2018-12-03T06:29:38.197+0000","createdBy":"someUser",
 				"issueTemplateId":"dasdasdasdsadasdasdasdasdas"},"sourceBasePath":null,"mode":"BASIC","masterAttrGuid":"sddasdasda","obfuscatedId":null,
 				"id":10172,"customTagValuesAutoApply":null,"issueTemplateId":"dasdasdasdsadasdasdasdasdas","loadProperties":null,"predictionPolicy":null,
-				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify.mo.sap.corp/ssc/api/v1/projectVersions/10172",
+				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify/ssc/api/v1/projectVersions/10172",
 				"committed":true,"bugTrackerEnabled":false,"active":true,"snapshotOutOfDate":false,"issueTemplateModifiedTime":1578411924701,
 				"securityGroup":null,"creationDate":"2018-02-09T16:59:41.297+0000","refreshRequired":false,"issueTemplateName":"someTemplate",
 				"migrationVersion":null,"createdBy":"admin","name":"0","siteId":null,"staleIssueTemplate":false,"autoPredict":null,
@@ -187,8 +189,8 @@ func TestGetProjectVersionDetailsByProjectIDAndVersionName(t *testing.T) {
 				"lastFprUploadDate":"2018-02-09T16:59:53.497+0000","extraMessage":null,"analysisUploadEnabled":true,"batchBugSubmissionExists":false,
 				"hasCustomIssues":false,"metricEvaluationDate":"2018-03-10T00:02:45.553+0000","deltaPeriod":7,"issueCountDelta":0,"percentAuditedDelta":0.0,
 				"criticalPriorityIssueCountDelta":0,"percentCriticalPriorityIssuesAuditedDelta":0.0},"assignedIssuesCount":0,"status":null}],
-				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/4711/versions?start=0"},
-				"first":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/4711/versions?start=0"}}}`))
+				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify/ssc/api/v1/projects/4711/versions?start=0"},
+				"first":{"href":"https://fortify/ssc/api/v1/projects/4711/versions?start=0"}}}`))
 			return
 		}
 		if req.URL.Path == "/projects/777/versions" {
@@ -211,7 +213,7 @@ func TestGetProjectVersionDetailsByProjectIDAndVersionName(t *testing.T) {
 				"project":{"id":815,"name":"autocreate","description":"","creationDate":"2018-12-03T06:29:38.197+0000","createdBy":"someUser",
 				"issueTemplateId":"dasdasdasdsadasdasdasdasdas"},"sourceBasePath":null,"mode":"BASIC","masterAttrGuid":"sddasdasda","obfuscatedId":null,
 				"id":10172,"customTagValuesAutoApply":null,"issueTemplateId":"dasdasdasdsadasdasdasdasdas","loadProperties":null,"predictionPolicy":null,
-				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify.mo.sap.corp/ssc/api/v1/projectVersions/10172",
+				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify/ssc/api/v1/projectVersions/10172",
 				"committed":true,"bugTrackerEnabled":false,"active":true,"snapshotOutOfDate":false,"issueTemplateModifiedTime":1578411924701,
 				"securityGroup":null,"creationDate":"2018-02-09T16:59:41.297+0000","refreshRequired":false,"issueTemplateName":"someTemplate",
 				"migrationVersion":null,"createdBy":"admin","name":"0","siteId":null,"staleIssueTemplate":false,"autoPredict":null,
@@ -219,8 +221,8 @@ func TestGetProjectVersionDetailsByProjectIDAndVersionName(t *testing.T) {
 				"lastFprUploadDate":"2018-02-09T16:59:53.497+0000","extraMessage":null,"analysisUploadEnabled":true,"batchBugSubmissionExists":false,
 				"hasCustomIssues":false,"metricEvaluationDate":"2018-03-10T00:02:45.553+0000","deltaPeriod":7,"issueCountDelta":0,"percentAuditedDelta":0.0,
 				"criticalPriorityIssueCountDelta":0,"percentCriticalPriorityIssuesAuditedDelta":0.0},"assignedIssuesCount":0,"status":null},
-				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/815/versions?start=0"},
-				"first":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/815/versions?start=0"}}}`))
+				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify/ssc/api/v1/projects/815/versions?start=0"},
+				"first":{"href":"https://fortify/ssc/api/v1/projects/815/versions?start=0"}}}`))
 			return
 		}
 		if req.URL.Path == "/projectVersions/0" {
@@ -231,7 +233,7 @@ func TestGetProjectVersionDetailsByProjectIDAndVersionName(t *testing.T) {
 				"project":{"id":815,"name":"autocreate","description":"","creationDate":"2018-12-03T06:29:38.197+0000","createdBy":"someUser",
 				"issueTemplateId":"dasdasdasdsadasdasdasdasdas"},"sourceBasePath":null,"mode":"BASIC","masterAttrGuid":"sddasdasda","obfuscatedId":null,
 				"id":10172,"customTagValuesAutoApply":null,"issueTemplateId":"dasdasdasdsadasdasdasdasdas","loadProperties":null,"predictionPolicy":null,
-				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify.mo.sap.corp/ssc/api/v1/projectVersions/10172",
+				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify/ssc/api/v1/projectVersions/10172",
 				"committed":true,"bugTrackerEnabled":false,"active":true,"snapshotOutOfDate":false,"issueTemplateModifiedTime":1578411924701,
 				"securityGroup":null,"creationDate":"2018-02-09T16:59:41.297+0000","refreshRequired":false,"issueTemplateName":"someTemplate",
 				"migrationVersion":null,"createdBy":"admin","name":"0","siteId":null,"staleIssueTemplate":false,"autoPredict":null,
@@ -239,8 +241,23 @@ func TestGetProjectVersionDetailsByProjectIDAndVersionName(t *testing.T) {
 				"lastFprUploadDate":"2018-02-09T16:59:53.497+0000","extraMessage":null,"analysisUploadEnabled":true,"batchBugSubmissionExists":false,
 				"hasCustomIssues":false,"metricEvaluationDate":"2018-03-10T00:02:45.553+0000","deltaPeriod":7,"issueCountDelta":0,"percentAuditedDelta":0.0,
 				"criticalPriorityIssueCountDelta":0,"percentCriticalPriorityIssuesAuditedDelta":0.0},"assignedIssuesCount":0,"status":null},
-				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/815/versions?start=0"},
-				"first":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/815/versions?start=0"}}}`))
+				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify/ssc/api/v1/projects/815/versions?start=0"},
+				"first":{"href":"https://fortify/ssc/api/v1/projects/815/versions?start=0"}}}`))
+			return
+		}
+		if req.URL.Path == "/projects/8888/versions" && req.URL.RawQuery == "q=name%3A%221%22" {
+			header := rw.Header()
+			header.Add("Content-type", "application/json")
+			rw.Write([]byte(`{"data":[{"id":9910,"project":{"id":8888,"name":"test","description":"Created by Go script","creationDate":"2022-06-24T04:44:12.344+0000",
+				"createdBy":"jajajajja","issueTemplateId":"asxasca-asff-b57aedaf41"},"name":"1","description":"","createdBy":"afsafa","creationDate":"2021-07-17T04:09:17.909+0000",
+				"sourceBasePath":null,"committed":true,"issueTemplateId":"asdawffbcad88eb041","issueTemplateName":"aiudfnwofn","loadProperties":null,"staleIssueTemplate":false,
+				"snapshotOutOfDate":false,"refreshRequired":false,"attachmentsOutOfDate":false,"migrationVersion":null,"masterAttrGuid":"akjnfkjsnfkj686b","tracesOutOfDate":false,
+				"issueTemplateModifiedTime":1556502937909,"active":true,"obfuscatedId":null,"owner":"","serverVersion":21.2,"siteId":null,"latestScanId":null,"mode":"BASIC",
+				"currentState":{"id":9910,"committed":true,"attentionRequired":false,"analysisResultsExist":false,"auditEnabled":false,"lastFprUploadDate":null,"extraMessage":null,
+				"analysisUploadEnabled":true,"batchBugSubmissionExists":false,"hasCustomIssues":false,"metricEvaluationDate":null,"deltaPeriod":7,"issueCountDelta":0,"percentAuditedDelta":0,
+				"criticalPriorityIssueCountDelta":0,"percentCriticalPriorityIssuesAuditedDelta":0},"bugTrackerPluginId":null,"bugTrackerEnabled":false,"securityGroup":null,"status":null,
+				"assignedIssuesCount":0,"customTagValuesAutoApply":null,"autoPredict":null,"predictionPolicy":null,"_href":"https://fortify/ssc/api/v1/projectVersions/8888"}],"count":1,
+				"responseCode":200,"links":{"last":{"href":"https://fortify/ssc/api/v1/projects/8888/versions?q=name%3A1&start=0"},"first":{"href":"https://fortify/ssc/api/v1/projects/8888/versions?q=name%3A1&start=0"}}}`))
 			return
 		}
 	})
@@ -270,6 +287,11 @@ func TestGetProjectVersionDetailsByProjectIDAndVersionName(t *testing.T) {
 		assert.Equal(t, "0", *result.Name, "Expected to get project version with different name")
 		assert.Equal(t, "autocreate", *result.Project.Name, "Expected to get project with different name")
 	})
+	t.Run("test filter projectVersion", func(t *testing.T) {
+		result, err := sys.GetProjectVersionDetailsByProjectIDAndVersionName(8888, "1", true, "autocreate")
+		assert.NoError(t, err, "GetProjectVersionDetailsByNameAndProjectID call not successful")
+		assert.Equal(t, "1", *result.Name, "Expected to get exact project version")
+	})
 }
 
 func TestGetProjectVersionAttributesByProjectVersionID(t *testing.T) {
@@ -279,7 +301,7 @@ func TestGetProjectVersionAttributesByProjectVersionID(t *testing.T) {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
 			rw.Write([]byte(
-				`{"data": [{"_href": "https://fortify.mo.sap.corp/ssc/api/v1/projectVersions/4711/attributes/4712","attributeDefinitionId": 31,
+				`{"data": [{"_href": "https://fortify/ssc/api/v1/projectVersions/4711/attributes/4712","attributeDefinitionId": 31,
 				"values": null,"guid": "gdgfdgfdgfdgfd","id": 4712,"value": "abcd"}],"count": 8,"responseCode": 200}`))
 			return
 		}
@@ -324,7 +346,7 @@ func TestSetProjectVersionAttributesByProjectVersionID(t *testing.T) {
 		if req.URL.Path == "/projectVersions/4711/attributes" {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
-			bodyBytes, _ := ioutil.ReadAll(req.Body)
+			bodyBytes, _ := io.ReadAll(req.Body)
 			bodyString := string(bodyBytes)
 			response := `{"data": `
 			response += bodyString
@@ -356,7 +378,7 @@ func TestCreateProjectVersion(t *testing.T) {
 		if req.URL.Path == "/projectVersions" {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
-			bodyBytes, _ := ioutil.ReadAll(req.Body)
+			bodyBytes, _ := io.ReadAll(req.Body)
 			bodyContent := string(bodyBytes)
 			responseContent := `{"data": `
 			responseContent += bodyContent
@@ -410,14 +432,14 @@ func TestProjectVersionCopyFromPartial(t *testing.T) {
 		if req.URL.Path == "/projectVersions/action/copyFromPartial" {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
-			bodyBytes, _ := ioutil.ReadAll(req.Body)
+			bodyBytes, _ := io.ReadAll(req.Body)
 			bodyContent = string(bodyBytes)
 			rw.Write([]byte(
 				`{"data":[{"latestScanId":null,"serverVersion":17.2,"tracesOutOfDate":false,"attachmentsOutOfDate":false,"description":"",
 				"project":{"id":4711,"name":"python-test","description":"","creationDate":"2018-12-03T06:29:38.197+0000","createdBy":"someUser",
 				"issueTemplateId":"dasdasdasdsadasdasdasdasdas"},"sourceBasePath":null,"mode":"BASIC","masterAttrGuid":"sddasdasda","obfuscatedId":null,
 				"id":10172,"customTagValuesAutoApply":null,"issueTemplateId":"dasdasdasdsadasdasdasdasdas","loadProperties":null,"predictionPolicy":null,
-				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify.mo.sap.corp/ssc/api/v1/projectVersions/10172",
+				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify/ssc/api/v1/projectVersions/10172",
 				"committed":true,"bugTrackerEnabled":false,"active":true,"snapshotOutOfDate":false,"issueTemplateModifiedTime":1578411924701,
 				"securityGroup":null,"creationDate":"2018-02-09T16:59:41.297+0000","refreshRequired":false,"issueTemplateName":"someTemplate",
 				"migrationVersion":null,"createdBy":"admin","name":"0","siteId":null,"staleIssueTemplate":false,"autoPredict":null,
@@ -425,8 +447,8 @@ func TestProjectVersionCopyFromPartial(t *testing.T) {
 				"lastFprUploadDate":"2018-02-09T16:59:53.497+0000","extraMessage":null,"analysisUploadEnabled":true,"batchBugSubmissionExists":false,
 				"hasCustomIssues":false,"metricEvaluationDate":"2018-03-10T00:02:45.553+0000","deltaPeriod":7,"issueCountDelta":0,"percentAuditedDelta":0.0,
 				"criticalPriorityIssueCountDelta":0,"percentCriticalPriorityIssuesAuditedDelta":0.0},"assignedIssuesCount":0,"status":null}],
-				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/4711/versions?start=0"},
-				"first":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/4711/versions?start=0"}}}`))
+				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify/ssc/api/v1/projects/4711/versions?start=0"},
+				"first":{"href":"https://fortify/ssc/api/v1/projects/4711/versions?start=0"}}}`))
 			return
 		}
 	})
@@ -449,14 +471,14 @@ func TestProjectVersionCopyCurrentState(t *testing.T) {
 		if req.URL.Path == "/projectVersions/action/copyCurrentState" {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
-			bodyBytes, _ := ioutil.ReadAll(req.Body)
+			bodyBytes, _ := io.ReadAll(req.Body)
 			bodyContent = string(bodyBytes)
 			rw.Write([]byte(
 				`{"data":[{"latestScanId":null,"serverVersion":17.2,"tracesOutOfDate":false,"attachmentsOutOfDate":false,"description":"",
 				"project":{"id":4711,"name":"python-test","description":"","creationDate":"2018-12-03T06:29:38.197+0000","createdBy":"someUser",
 				"issueTemplateId":"dasdasdasdsadasdasdasdasdas"},"sourceBasePath":null,"mode":"BASIC","masterAttrGuid":"sddasdasda","obfuscatedId":null,
 				"id":10172,"customTagValuesAutoApply":null,"issueTemplateId":"dasdasdasdsadasdasdasdasdas","loadProperties":null,"predictionPolicy":null,
-				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify.mo.sap.corp/ssc/api/v1/projectVersions/10172",
+				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify/ssc/api/v1/projectVersions/10172",
 				"committed":true,"bugTrackerEnabled":false,"active":true,"snapshotOutOfDate":false,"issueTemplateModifiedTime":1578411924701,
 				"securityGroup":null,"creationDate":"2018-02-09T16:59:41.297+0000","refreshRequired":false,"issueTemplateName":"someTemplate",
 				"migrationVersion":null,"createdBy":"admin","name":"0","siteId":null,"staleIssueTemplate":false,"autoPredict":null,
@@ -464,8 +486,8 @@ func TestProjectVersionCopyCurrentState(t *testing.T) {
 				"lastFprUploadDate":"2018-02-09T16:59:53.497+0000","extraMessage":null,"analysisUploadEnabled":true,"batchBugSubmissionExists":false,
 				"hasCustomIssues":false,"metricEvaluationDate":"2018-03-10T00:02:45.553+0000","deltaPeriod":7,"issueCountDelta":0,"percentAuditedDelta":0.0,
 				"criticalPriorityIssueCountDelta":0,"percentCriticalPriorityIssuesAuditedDelta":0.0},"assignedIssuesCount":0,"status":null}],
-				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/4711/versions?start=0"},
-				"first":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/4711/versions?start=0"}}}`))
+				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify/ssc/api/v1/projects/4711/versions?start=0"},
+				"first":{"href":"https://fortify/ssc/api/v1/projects/4711/versions?start=0"}}}`))
 			return
 		}
 	})
@@ -499,7 +521,7 @@ func TestProjectVersionCopyPermissions(t *testing.T) {
 		if req.URL.Path == "/projectVersions/10173/authEntities" {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
-			bodyBytes, _ := ioutil.ReadAll(req.Body)
+			bodyBytes, _ := io.ReadAll(req.Body)
 			bodyContent = string(bodyBytes)
 			rw.Write([]byte(response))
 			return
@@ -527,7 +549,7 @@ func TestCommitProjectVersion(t *testing.T) {
 		if req.URL.Path == "/projectVersions/10172" {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
-			bodyBytes, _ := ioutil.ReadAll(req.Body)
+			bodyBytes, _ := io.ReadAll(req.Body)
 			bodyContent = string(bodyBytes)
 			rw.Write([]byte(response))
 			return
@@ -556,7 +578,7 @@ func TestInactivateProjectVersion(t *testing.T) {
 		if req.URL.Path == "/projectVersions/10172" {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
-			bodyBytes, _ := ioutil.ReadAll(req.Body)
+			bodyBytes, _ := io.ReadAll(req.Body)
 			bodyContent = string(bodyBytes)
 			rw.Write([]byte(response))
 			return
@@ -828,7 +850,7 @@ func TestGenerateQGateReport(t *testing.T) {
 		if req.URL.Path == "/reports" {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
-			bodyBytes, _ := ioutil.ReadAll(req.Body)
+			bodyBytes, _ := io.ReadAll(req.Body)
 			data = string(bodyBytes)
 			response := `{"data": `
 			response += data
@@ -883,7 +905,7 @@ func TestGetFileToken(t *testing.T) {
 		if req.URL.Path == "/fileTokens" {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
-			bodyBytes, _ := ioutil.ReadAll(req.Body)
+			bodyBytes, _ := io.ReadAll(req.Body)
 			bodyContent = string(bodyBytes)
 			rw.WriteHeader(201)
 			rw.Write([]byte(response))
@@ -947,7 +969,7 @@ func TestUploadResultFile(t *testing.T) {
 		if req.URL.Path == "/upload/resultFileUpload.html" && req.URL.RawQuery == "mat=89ee873" {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
-			bodyBytes, _ := ioutil.ReadAll(req.Body)
+			bodyBytes, _ := io.ReadAll(req.Body)
 			bodyContent = string(bodyBytes)
 			rw.WriteHeader(200)
 			rw.Write([]byte("OK"))
@@ -957,7 +979,7 @@ func TestUploadResultFile(t *testing.T) {
 	// Close the server when test finishes
 	defer server.Close()
 
-	testFile, err := ioutil.TempFile("", "result.fpr")
+	testFile, err := os.CreateTemp("", "result.fpr")
 	if err != nil {
 		t.FailNow()
 	}
@@ -1072,7 +1094,7 @@ func TestLookupOrCreateProjectVersionDetailsForPullRequest(t *testing.T) {
 		if req.URL.Path == "/projectVersions" && req.Method == "POST" {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
-			bodyBytes, _ := ioutil.ReadAll(req.Body)
+			bodyBytes, _ := io.ReadAll(req.Body)
 			bodyContent := string(bodyBytes)
 			responseContent := `{"data": `
 			responseContent += bodyContent
@@ -1086,14 +1108,14 @@ func TestLookupOrCreateProjectVersionDetailsForPullRequest(t *testing.T) {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
 			rw.Write([]byte(
-				`{"data": [{"_href": "https://fortify.mo.sap.corp/ssc/api/v1/projectVersions/4711/attributes/4712","attributeDefinitionId": 31,
+				`{"data": [{"_href": "https://fortify/ssc/api/v1/projectVersions/4711/attributes/4712","attributeDefinitionId": 31,
 				"values": null,"guid": "gdgfdgfdgfdgfd","id": 4712,"value": "abcd"}],"count": 8,"responseCode": 200}`))
 			return
 		}
 		if req.URL.Path == "/projectVersions/4712/attributes" {
 			header := rw.Header()
 			header.Add("Content-type", "application/json")
-			bodyBytes, _ := ioutil.ReadAll(req.Body)
+			bodyBytes, _ := io.ReadAll(req.Body)
 			bodyString := string(bodyBytes)
 			response := `{"data": `
 			response += bodyString
@@ -1110,7 +1132,7 @@ func TestLookupOrCreateProjectVersionDetailsForPullRequest(t *testing.T) {
 				"project":{"id":4711,"name":"python-test","description":"","creationDate":"2018-12-03T06:29:38.197+0000","createdBy":"someUser",
 				"issueTemplateId":"dasdasdasdsadasdasdasdasdas"},"sourceBasePath":null,"mode":"BASIC","masterAttrGuid":"sddasdasda","obfuscatedId":null,
 				"id":10172,"customTagValuesAutoApply":null,"issueTemplateId":"dasdasdasdsadasdasdasdasdas","loadProperties":null,"predictionPolicy":null,
-				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify.mo.sap.corp/ssc/api/v1/projectVersions/10172",
+				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify/ssc/api/v1/projectVersions/10172",
 				"committed":true,"bugTrackerEnabled":false,"active":true,"snapshotOutOfDate":false,"issueTemplateModifiedTime":1578411924701,
 				"securityGroup":null,"creationDate":"2018-02-09T16:59:41.297+0000","refreshRequired":false,"issueTemplateName":"someTemplate",
 				"migrationVersion":null,"createdBy":"admin","name":"0","siteId":null,"staleIssueTemplate":false,"autoPredict":null,
@@ -1118,8 +1140,8 @@ func TestLookupOrCreateProjectVersionDetailsForPullRequest(t *testing.T) {
 				"lastFprUploadDate":"2018-02-09T16:59:53.497+0000","extraMessage":null,"analysisUploadEnabled":true,"batchBugSubmissionExists":false,
 				"hasCustomIssues":false,"metricEvaluationDate":"2018-03-10T00:02:45.553+0000","deltaPeriod":7,"issueCountDelta":0,"percentAuditedDelta":0.0,
 				"criticalPriorityIssueCountDelta":0,"percentCriticalPriorityIssuesAuditedDelta":0.0},"assignedIssuesCount":0,"status":null}],
-				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/4711/versions?start=0"},
-				"first":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/4711/versions?start=0"}}}`))
+				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify/ssc/api/v1/projects/4711/versions?start=0"},
+				"first":{"href":"https://fortify/ssc/api/v1/projects/4711/versions?start=0"}}}`))
 			return
 		}
 		if req.URL.Path == "/projectVersions/10172" {
@@ -1136,7 +1158,7 @@ func TestLookupOrCreateProjectVersionDetailsForPullRequest(t *testing.T) {
 				"project":{"id":4711,"name":"python-test","description":"","creationDate":"2018-12-03T06:29:38.197+0000","createdBy":"someUser",
 				"issueTemplateId":"dasdasdasdsadasdasdasdasdas"},"sourceBasePath":null,"mode":"BASIC","masterAttrGuid":"sddasdasda","obfuscatedId":null,
 				"id":10172,"customTagValuesAutoApply":null,"issueTemplateId":"dasdasdasdsadasdasdasdasdas","loadProperties":null,"predictionPolicy":null,
-				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify.mo.sap.corp/ssc/api/v1/projectVersions/10172",
+				"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify/ssc/api/v1/projectVersions/10172",
 				"committed":true,"bugTrackerEnabled":false,"active":true,"snapshotOutOfDate":false,"issueTemplateModifiedTime":1578411924701,
 				"securityGroup":null,"creationDate":"2018-02-09T16:59:41.297+0000","refreshRequired":false,"issueTemplateName":"someTemplate",
 				"migrationVersion":null,"createdBy":"admin","name":"0","siteId":null,"staleIssueTemplate":false,"autoPredict":null,
@@ -1144,8 +1166,8 @@ func TestLookupOrCreateProjectVersionDetailsForPullRequest(t *testing.T) {
 				"lastFprUploadDate":"2018-02-09T16:59:53.497+0000","extraMessage":null,"analysisUploadEnabled":true,"batchBugSubmissionExists":false,
 				"hasCustomIssues":false,"metricEvaluationDate":"2018-03-10T00:02:45.553+0000","deltaPeriod":7,"issueCountDelta":0,"percentAuditedDelta":0.0,
 				"criticalPriorityIssueCountDelta":0,"percentCriticalPriorityIssuesAuditedDelta":0.0},"assignedIssuesCount":0,"status":null}],
-				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/4711/versions?start=0"},
-				"first":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/4711/versions?start=0"}}}`))
+				"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify/ssc/api/v1/projects/4711/versions?start=0"},
+				"first":{"href":"https://fortify/ssc/api/v1/projects/4711/versions?start=0"}}}`))
 			return
 		}
 		if req.URL.Path == "/projectVersions/10172/authEntities" {
@@ -1218,7 +1240,7 @@ func TestMergeProjectVersionStateOfPRIntoMaster(t *testing.T) {
 			"project":{"id":4711,"name":"product.some.com","description":"","creationDate":"2018-12-03T06:29:38.197+0000","createdBy":"someUser",
 			"issueTemplateId":"dasdasdasdsadasdasdasdasdas"},"sourceBasePath":null,"mode":"BASIC","masterAttrGuid":"sddasdasda","obfuscatedId":null,
 			"id":10172,"customTagValuesAutoApply":null,"issueTemplateId":"dasdasdasdsadasdasdasdasdas","loadProperties":null,"predictionPolicy":null,
-			"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify.mo.sap.corp/ssc/api/v1/projectVersions/10172",
+			"bugTrackerPluginId":null,"owner":"admin","_href":"https://fortify/ssc/api/v1/projectVersions/10172",
 			"committed":true,"bugTrackerEnabled":false,"active":true,"snapshotOutOfDate":false,"issueTemplateModifiedTime":1578411924701,
 			"securityGroup":null,"creationDate":"2018-02-09T16:59:41.297+0000","refreshRequired":false,"issueTemplateName":"someTemplate",
 			"migrationVersion":null,"createdBy":"admin","name":"PR-815","siteId":null,"staleIssueTemplate":false,"autoPredict":null,
@@ -1226,8 +1248,8 @@ func TestMergeProjectVersionStateOfPRIntoMaster(t *testing.T) {
 			"lastFprUploadDate":"2018-02-09T16:59:53.497+0000","extraMessage":null,"analysisUploadEnabled":true,"batchBugSubmissionExists":false,
 			"hasCustomIssues":false,"metricEvaluationDate":"2018-03-10T00:02:45.553+0000","deltaPeriod":7,"issueCountDelta":0,"percentAuditedDelta":0.0,
 			"criticalPriorityIssueCountDelta":0,"percentCriticalPriorityIssuesAuditedDelta":0.0},"assignedIssuesCount":0,"status":null}],
-			"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/4711/versions?start=0"},
-			"first":{"href":"https://fortify.mo.sap.corp/ssc/api/v1/projects/4711/versions?start=0"}}}`))
+			"count":1,"responseCode":200,"links":{"last":{"href":"https://fortify/ssc/api/v1/projects/4711/versions?start=0"},
+			"first":{"href":"https://fortify/ssc/api/v1/projects/4711/versions?start=0"}}}`))
 			getPRProjectVersionCalled = true
 			return
 		}
@@ -1296,5 +1318,77 @@ func TestBase64EndodePlainToken(t *testing.T) {
 		token := "95387046-5ac8-4570-875d-a5ec8bd8d3d2"
 		encodedToken := base64EndodePlainToken(token)
 		assert.Equal(t, "OTUzODcwNDYtNWFjOC00NTcwLTg3NWQtYTVlYzhiZDhkM2Qy", encodedToken)
+	})
+}
+
+func TestCreateJSONReport(t *testing.T) {
+	t.Run("test success", func(t *testing.T) {
+		spotChecksCountByCategory := []SpotChecksAuditCount{}
+		spotChecksCountByCategory = append(spotChecksCountByCategory, SpotChecksAuditCount{Audited: 3, Total: 3, Type: "J2EE Misconfiguration: Missing Error Handling"})
+		spotChecksCountByCategory = append(spotChecksCountByCategory, SpotChecksAuditCount{Audited: 1, Total: 3, Type: "J2EE Bad Practices: Leftover Debug Code"})
+		fortifyReportData := FortifyReportData{CorporateAudited: 30, CorporateTotal: 30, AuditAllTotal: 1, AuditAllAudited: 1, ProjectVersionID: 4999}
+		jsonReport := CreateJSONReport(fortifyReportData, spotChecksCountByCategory, "https://fortify-test.com/ssc")
+		assert.Equal(t, true, jsonReport.AtleastOneSpotChecksCategoryAudited)
+		assert.Equal(t, true, jsonReport.IsSpotChecksPerCategoryAudited)
+		assert.Equal(t, 1, jsonReport.AuditAllAudited)
+		assert.Equal(t, 1, jsonReport.AuditAllTotal)
+		assert.Equal(t, 30, jsonReport.CorporateAudited)
+		assert.Equal(t, 30, jsonReport.CorporateTotal)
+		assert.Equal(t, "https://fortify-test.com/ssc/html/ssc/version/4999", jsonReport.URL)
+		assert.Equal(t, "https://fortify-test.com/ssc", jsonReport.ToolInstance)
+	})
+
+	t.Run("atleast one category spotchecks failed", func(t *testing.T) {
+		spotChecksCountByCategory := []SpotChecksAuditCount{}
+		spotChecksCountByCategory = append(spotChecksCountByCategory, SpotChecksAuditCount{Audited: 3, Total: 3, Type: "J2EE Misconfiguration: Missing Error Handling"})
+		spotChecksCountByCategory = append(spotChecksCountByCategory, SpotChecksAuditCount{Audited: 0, Total: 1, Type: "J2EE Bad Practices: Leftover Debug Code"})
+		fortifyReportData := FortifyReportData{CorporateAudited: 0, CorporateTotal: 0, AuditAllTotal: 0, AuditAllAudited: 0}
+		jsonReport := CreateJSONReport(fortifyReportData, spotChecksCountByCategory, "https://fortify-test.com/ssc")
+		assert.Equal(t, false, jsonReport.AtleastOneSpotChecksCategoryAudited)
+		assert.Equal(t, false, jsonReport.IsSpotChecksPerCategoryAudited)
+	})
+
+	t.Run("no spot checks audited", func(t *testing.T) {
+		spotChecksCountByCategory := []SpotChecksAuditCount{}
+		fortifyReportData := FortifyReportData{CorporateAudited: 0, CorporateTotal: 0, AuditAllTotal: 0, AuditAllAudited: 0}
+		jsonReport := CreateJSONReport(fortifyReportData, spotChecksCountByCategory, "https://fortify-test.com/ssc")
+		assert.Equal(t, true, jsonReport.AtleastOneSpotChecksCategoryAudited)
+		assert.Equal(t, true, jsonReport.IsSpotChecksPerCategoryAudited)
+	})
+
+	t.Run("isSpotChecksPerCategoryAudited passed spotchecks test 1", func(t *testing.T) {
+		spotChecksCountByCategory := []SpotChecksAuditCount{}
+		spotChecksCountByCategory = append(spotChecksCountByCategory, SpotChecksAuditCount{Audited: 10, Total: 100, Type: "J2EE Misconfiguration: Missing Error Handling"})
+		fortifyReportData := FortifyReportData{CorporateAudited: 0, CorporateTotal: 0, AuditAllTotal: 0, AuditAllAudited: 0}
+		jsonReport := CreateJSONReport(fortifyReportData, spotChecksCountByCategory, "https://fortify-test.com/ssc")
+		assert.Equal(t, true, jsonReport.AtleastOneSpotChecksCategoryAudited)
+		assert.Equal(t, true, jsonReport.IsSpotChecksPerCategoryAudited)
+	})
+
+	t.Run("isSpotChecksPerCategoryAudited failed spotchecks test 2", func(t *testing.T) {
+		spotChecksCountByCategory := []SpotChecksAuditCount{}
+		spotChecksCountByCategory = append(spotChecksCountByCategory, SpotChecksAuditCount{Audited: 3, Total: 100, Type: "J2EE Misconfiguration: Missing Error Handling"})
+		fortifyReportData := FortifyReportData{CorporateAudited: 0, CorporateTotal: 0, AuditAllTotal: 0, AuditAllAudited: 0}
+		jsonReport := CreateJSONReport(fortifyReportData, spotChecksCountByCategory, "https://fortify-test.com/ssc")
+		assert.Equal(t, true, jsonReport.AtleastOneSpotChecksCategoryAudited)
+		assert.Equal(t, false, jsonReport.IsSpotChecksPerCategoryAudited)
+	})
+
+	t.Run("isSpotChecksPerCategoryAudited failed spotchecks test 3", func(t *testing.T) {
+		spotChecksCountByCategory := []SpotChecksAuditCount{}
+		spotChecksCountByCategory = append(spotChecksCountByCategory, SpotChecksAuditCount{Audited: 9, Total: 200, Type: "J2EE Misconfiguration: Missing Error Handling"})
+		fortifyReportData := FortifyReportData{CorporateAudited: 0, CorporateTotal: 0, AuditAllTotal: 0, AuditAllAudited: 0}
+		jsonReport := CreateJSONReport(fortifyReportData, spotChecksCountByCategory, "https://fortify-test.com/ssc")
+		assert.Equal(t, true, jsonReport.AtleastOneSpotChecksCategoryAudited)
+		assert.Equal(t, false, jsonReport.IsSpotChecksPerCategoryAudited)
+	})
+
+	t.Run("isSpotChecksPerCategoryAudited passed spotchecks test 4", func(t *testing.T) {
+		spotChecksCountByCategory := []SpotChecksAuditCount{}
+		spotChecksCountByCategory = append(spotChecksCountByCategory, SpotChecksAuditCount{Audited: 10, Total: 200, Type: "J2EE Misconfiguration: Missing Error Handling"})
+		fortifyReportData := FortifyReportData{CorporateAudited: 0, CorporateTotal: 0, AuditAllTotal: 0, AuditAllAudited: 0}
+		jsonReport := CreateJSONReport(fortifyReportData, spotChecksCountByCategory, "https://fortify-test.com/ssc")
+		assert.Equal(t, true, jsonReport.AtleastOneSpotChecksCategoryAudited)
+		assert.Equal(t, true, jsonReport.IsSpotChecksPerCategoryAudited)
 	})
 }

@@ -7,11 +7,10 @@ This stage is responsible for building an ABAP add-on for the SAP BTP, ABAP envi
 The following steps are executed in this stage:
 
 - [cloudFoundryCreateServiceKey](../../../steps/cloudFoundryCreateServiceKey.md)
-- [abapAddonAssemblyKitReserveNextPackages](../../../steps/abapAddonAssemblyKitReserveNextPackages.md)
 - [abapEnvironmentAssemblePackages](../../../steps/abapEnvironmentAssemblePackages.md)
 - [abapAddonAssemblyKitRegisterPackages](../../../steps/abapAddonAssemblyKitRegisterPackages.md)
-- [abapEnvironmentAssembleConfirm](../../../steps/abapEnvironmentAssembleConfirm.md)
 - [abapAddonAssemblyKitReleasePackages](../../../steps/abapAddonAssemblyKitReleasePackages.md)
+- [abapEnvironmentAssembleConfirm](../../../steps/abapEnvironmentAssembleConfirm.md)
 - [abapAddonAssemblyKitCreateTargetVector](../../../steps/abapAddonAssemblyKitCreateTargetVector.md)
 - [abapAddonAssemblyKitPublishTargetVector](../../../steps/abapAddonAssemblyKitPublishTargetVector.md)
 
@@ -36,7 +35,7 @@ general:
   cfSpace: 'mySpaceBld'
   cfCredentialsId: 'cfAuthentification'
   cfServiceInstance: 'bld_system'
-  cfServiceKeyName: 'JENKINS_SAP_COM_0510'
+  cfServiceKeyName: 'JENKINS_SAP_COM_0948'
 stages:
   Build:
     cfServiceKeyName: 'JENKINS_SAP_COM_0582'

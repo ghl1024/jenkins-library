@@ -1,9 +1,13 @@
+//go:build unit
+// +build unit
+
 package maven
 
 import (
+	"testing"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"testing"
 )
 
 const aggregatorPomXML = `<?xml version="1.0" encoding="UTF-8"?>

@@ -37,6 +37,7 @@ class abapEnvironmentPipelineStagePostTest extends BasePiperTest {
             return null
         })
         helper.registerAllowedMethod('cloudFoundryDeleteService', [Map.class], {m -> stepsCalled.add('cloudFoundryDeleteService')})
+        helper.registerAllowedMethod('btpDeleteServiceInstance', [Map.class], {m -> stepsCalled.add('btpDeleteServiceInstance')})
     }
 
     @Test
@@ -72,5 +73,27 @@ class abapEnvironmentPipelineStagePostTest extends BasePiperTest {
         jsr.step.abapEnvironmentPipelineStagePost(script: nullScript)
 
         assertThat(stepsCalled, not(hasItem('cloudFoundryDeleteService')))
+    }
+
+    @Test
+    void testCloudFoundryDeleteServiceDebugTrue() {
+
+        nullScript.commonPipelineEnvironment.configuration.runStage = [
+            'Prepare System': true
+        ]
+        jsr.step.abapEnvironmentPipelineStagePost(script: nullScript, debug: true)
+
+        assertThat(stepsCalled, not(hasItem('cloudFoundryDeleteService')))
+    }
+
+    @Test
+    void testCloudFoundryDeleteServiceDebugFalse() {
+
+        nullScript.commonPipelineEnvironment.configuration.runStage = [
+            'Prepare System': true
+        ]
+        jsr.step.abapEnvironmentPipelineStagePost(script: nullScript, debug: false)
+
+        assertThat(stepsCalled, hasItem('cloudFoundryDeleteService'))
     }
 }

@@ -1,6 +1,7 @@
 package jenkins
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -11,7 +12,7 @@ import (
 // StringCredentials store only secret text
 type StringCredentials = gojenkins.StringCredentials
 
-//UsernameCredentials struct representing credential for storing username-password pair
+// UsernameCredentials struct representing credential for storing username-password pair
 type UsernameCredentials = gojenkins.UsernameCredentials
 
 // SSHCredentials store credentials for ssh keys.
@@ -22,7 +23,7 @@ type DockerServerCredentials = gojenkins.DockerServerCredentials
 
 // CredentialsManager is utility to control credential plugin
 type CredentialsManager interface {
-	Update(string, string, interface{}) error
+	Update(context.Context, string, string, any) error
 }
 
 // NewCredentialsManager returns a new CredentialManager
@@ -31,7 +32,7 @@ func NewCredentialsManager(jenkins *gojenkins.Jenkins) CredentialsManager {
 }
 
 // UpdateCredential overwrites an existing credential
-func UpdateCredential(credentialsManager CredentialsManager, domain string, credential interface{}) error {
+func UpdateCredential(ctx context.Context, credentialsManager CredentialsManager, domain string, credential any) error {
 	credValue := reflect.ValueOf(credential)
 	if credValue.Kind() != reflect.Struct {
 		return fmt.Errorf("'credential' parameter is supposed to be a Credentials struct not '%s'", credValue.Type())
@@ -44,8 +45,8 @@ func UpdateCredential(credentialsManager CredentialsManager, domain string, cred
 
 	secretID := idField.String()
 	if secretID == "" {
-		return errors.New("Secret ID should not be empty")
+		return errors.New("secret ID should not be empty")
 	}
 
-	return credentialsManager.Update(domain, secretID, credential)
+	return credentialsManager.Update(ctx, domain, secretID, credential)
 }

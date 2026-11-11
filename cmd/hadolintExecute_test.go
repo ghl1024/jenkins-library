@@ -1,10 +1,15 @@
+//go:build unit
+// +build unit
+
 package cmd
 
 import (
+	"fmt"
 	"testing"
 
-	"github.com/SAP/jenkins-library/pkg/hadolint/mocks"
+	"github.com/SAP/jenkins-library/cmd/mocks"
 	piperMocks "github.com/SAP/jenkins-library/pkg/mock"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -21,7 +26,10 @@ func TestRunHadolintExecute(t *testing.T) {
 		}
 
 		fileMock.
-			On("FileExists", config.ConfigurationFile).Return(false, nil)
+			On("FileExists", config.ConfigurationFile).Return(false, nil).
+			On("Glob", config.DockerFile).Return([]string{config.DockerFile}, nil).
+			On("WriteFile", "hadolintExecute_reports.json", mock.Anything, mock.Anything).Return(nil).
+			On("WriteFile", "hadolintExecute_links.json", mock.Anything, mock.Anything).Return(nil)
 
 		// test
 		err := runHadolint(config, hadolintUtils{
@@ -62,7 +70,11 @@ func TestRunHadolintExecute(t *testing.T) {
 			// checks if config exists before downloading
 			On("FileExists", config.ConfigurationFile).Return(false, nil).Once().
 			// checks again but config is now downloaded
-			On("FileExists", config.ConfigurationFile).Return(true, nil)
+			On("FileExists", config.ConfigurationFile).Return(true, nil).
+			On("Glob", config.DockerFile).Return([]string{config.DockerFile}, nil).
+			On("WriteFile", "hadolintExecute_reports.json", mock.Anything, mock.Anything).Return(nil).
+			On("WriteFile", "hadolintExecute_links.json", mock.Anything, mock.Anything).Return(nil)
+
 		// test
 		err := runHadolint(config, hadolintUtils{
 			HadolintPiperFileUtils: fileMock,
@@ -80,6 +92,177 @@ func TestRunHadolintExecute(t *testing.T) {
 			assert.Contains(t, runnerMock.Calls[0].Params, config.ConfigurationFile)
 		}
 		// assert that mocks are called as previously defined
+		fileMock.AssertExpectations(t)
+		clientMock.AssertExpectations(t)
+	})
+
+	t.Run("with glob pattern", func(t *testing.T) {
+		// init
+		fileMock := &mocks.HadolintPiperFileUtils{}
+		clientMock := &mocks.HadolintClient{}
+		runnerMock := &piperMocks.ExecMockRunner{}
+		config := hadolintExecuteOptions{
+			DockerFile:        "images/**/Dockerfile",
+			ConfigurationFile: ".hadolint.yaml",
+		}
+		matchedFiles := []string{
+			"images/a/Dockerfile",
+			"images/b/Dockerfile",
+		}
+
+		fileMock.
+			On("FileExists", config.ConfigurationFile).Return(false, nil).
+			On("Glob", config.DockerFile).Return(matchedFiles, nil).
+			On("WriteFile", "hadolintExecute_reports.json", mock.Anything, mock.Anything).Return(nil).
+			On("WriteFile", "hadolintExecute_links.json", mock.Anything, mock.Anything).Return(nil)
+
+		// test
+		err := runHadolint(config, hadolintUtils{
+			HadolintPiperFileUtils: fileMock,
+			HadolintClient:         clientMock,
+			hadolintRunner:         runnerMock,
+		})
+		// assert
+		assert.NoError(t, err)
+		if assert.Len(t, runnerMock.Calls, 1) {
+			assert.Equal(t, "hadolint", runnerMock.Calls[0].Exec)
+			assert.Contains(t, runnerMock.Calls[0].Params, "images/a/Dockerfile")
+			assert.Contains(t, runnerMock.Calls[0].Params, "images/b/Dockerfile")
+			assert.Contains(t, runnerMock.Calls[0].Params, "--format")
+			assert.Contains(t, runnerMock.Calls[0].Params, "checkstyle")
+		}
+		fileMock.AssertExpectations(t)
+		clientMock.AssertExpectations(t)
+	})
+
+	t.Run("with file directory and glob exclusions", func(t *testing.T) {
+		// init
+		fileMock := &mocks.HadolintPiperFileUtils{}
+		clientMock := &mocks.HadolintClient{}
+		runnerMock := &piperMocks.ExecMockRunner{}
+		config := hadolintExecuteOptions{
+			DockerFile:        "**/Dockerfile*",
+			DockerFileExclude: []string{"src/tests/endToEnd", "docs/Dockerfile", "**/Dockerfile.base"},
+			ConfigurationFile: ".hadolint.yaml",
+		}
+		matchedFiles := []string{
+			"Dockerfile",
+			"ai_eligibility/Dockerfile",
+			"src/tests/endToEnd/Dockerfile",
+			"init_containers/hana/Dockerfile",
+			"src/tests/endToEnd/Dockerfile.base",
+			"docs/Dockerfile",
+		}
+
+		fileMock.
+			On("FileExists", config.ConfigurationFile).Return(false, nil).
+			On("Glob", config.DockerFile).Return(matchedFiles, nil).
+			On("WriteFile", "hadolintExecute_reports.json", mock.Anything, mock.Anything).Return(nil).
+			On("WriteFile", "hadolintExecute_links.json", mock.Anything, mock.Anything).Return(nil)
+
+		// test
+		err := runHadolint(config, hadolintUtils{
+			HadolintPiperFileUtils: fileMock,
+			HadolintClient:         clientMock,
+			hadolintRunner:         runnerMock,
+		})
+
+		// assert
+		assert.NoError(t, err)
+		if assert.Len(t, runnerMock.Calls, 1) {
+			assert.Contains(t, runnerMock.Calls[0].Params, "Dockerfile")
+			assert.Contains(t, runnerMock.Calls[0].Params, "ai_eligibility/Dockerfile")
+			assert.Contains(t, runnerMock.Calls[0].Params, "init_containers/hana/Dockerfile")
+			assert.NotContains(t, runnerMock.Calls[0].Params, "src/tests/endToEnd/Dockerfile")
+			assert.NotContains(t, runnerMock.Calls[0].Params, "src/tests/endToEnd/Dockerfile.base")
+			assert.NotContains(t, runnerMock.Calls[0].Params, "docs/Dockerfile")
+		}
+		fileMock.AssertExpectations(t)
+		clientMock.AssertExpectations(t)
+	})
+
+	t.Run("all files excluded", func(t *testing.T) {
+		// init
+		fileMock := &mocks.HadolintPiperFileUtils{}
+		clientMock := &mocks.HadolintClient{}
+		runnerMock := &piperMocks.ExecMockRunner{}
+		config := hadolintExecuteOptions{
+			DockerFile:        "**/Dockerfile",
+			DockerFileExclude: []string{"**"},
+			ConfigurationFile: ".hadolint.yaml",
+		}
+
+		fileMock.
+			On("FileExists", config.ConfigurationFile).Return(false, nil).
+			On("Glob", config.DockerFile).Return([]string{"Dockerfile"}, nil)
+
+		// test
+		err := runHadolint(config, hadolintUtils{
+			HadolintPiperFileUtils: fileMock,
+			HadolintClient:         clientMock,
+			hadolintRunner:         runnerMock,
+		})
+
+		// assert
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "after applying dockerFileExclude")
+		assert.Empty(t, runnerMock.Calls)
+		fileMock.AssertExpectations(t)
+		clientMock.AssertExpectations(t)
+	})
+
+	t.Run("no matching files", func(t *testing.T) {
+		// init
+		fileMock := &mocks.HadolintPiperFileUtils{}
+		clientMock := &mocks.HadolintClient{}
+		runnerMock := &piperMocks.ExecMockRunner{}
+		config := hadolintExecuteOptions{
+			DockerFile:        "images/**/Dockerfile",
+			ConfigurationFile: ".hadolint.yaml",
+		}
+
+		fileMock.
+			On("FileExists", config.ConfigurationFile).Return(false, nil).
+			On("Glob", config.DockerFile).Return([]string{}, nil)
+
+		// test
+		err := runHadolint(config, hadolintUtils{
+			HadolintPiperFileUtils: fileMock,
+			HadolintClient:         clientMock,
+			hadolintRunner:         runnerMock,
+		})
+		// assert
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "no Dockerfiles found")
+		assert.Empty(t, runnerMock.Calls)
+		fileMock.AssertExpectations(t)
+		clientMock.AssertExpectations(t)
+	})
+
+	t.Run("glob error", func(t *testing.T) {
+		// init
+		fileMock := &mocks.HadolintPiperFileUtils{}
+		clientMock := &mocks.HadolintClient{}
+		runnerMock := &piperMocks.ExecMockRunner{}
+		config := hadolintExecuteOptions{
+			DockerFile:        "images/**/Dockerfile",
+			ConfigurationFile: ".hadolint.yaml",
+		}
+
+		fileMock.
+			On("FileExists", config.ConfigurationFile).Return(false, nil).
+			On("Glob", config.DockerFile).Return([]string(nil), fmt.Errorf("permission denied"))
+
+		// test
+		err := runHadolint(config, hadolintUtils{
+			HadolintPiperFileUtils: fileMock,
+			HadolintClient:         clientMock,
+			hadolintRunner:         runnerMock,
+		})
+		// assert
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to expand glob pattern")
+		assert.Empty(t, runnerMock.Calls)
 		fileMock.AssertExpectations(t)
 		clientMock.AssertExpectations(t)
 	})

@@ -45,7 +45,7 @@ class InfluxData implements Serializable{
         List influxDataFiles = script.findFiles(glob: "${pathPrefix}**")?.toList()
 
         influxDataFiles.each({f ->
-            script.echo "Reading file form disk: ${f}"
+            script.echo "Reading file from disk: ${f}"
             List parts = f.toString().replace(pathPrefix, '')?.split('/')?.toList()
 
             if(parts?.size() == 3){
@@ -61,16 +61,11 @@ class InfluxData implements Serializable{
                         name = name.replace(".json","")
                         // net.sf.json.JSONSerializer does only handle lists and maps
                         // http://json-lib.sourceforge.net/apidocs/net/sf/json/package-summary.html
-                        try{
-                            value = script.readJSON(text: fileContent)
-                        }catch(net.sf.json.JSONException e){
-                            // try to wrap the value in an object and read again
-                            if (e.getMessage() == "Invalid JSON String"){
-                                value = script.readJSON(text: "{\"content\": ${fileContent}}").content
-                            }else{
-                                throw e
-                            }
-                        }
+                        // Scalar values (e.g. "0") make readJSON throw "Invalid JSON String", and
+                        // Jenkins records that on the step node even when it is caught here.
+                        // Always wrap the content in an object so readJSON never fails.
+                        // Nested objects/arrays come back as the same net.sf.json types as before.
+                        value = script.readJSON(text: "{\"content\": ${fileContent}}").content
                     }else{
                         // handle boolean values
                         if(fileContent == 'true'){

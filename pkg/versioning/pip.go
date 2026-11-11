@@ -2,12 +2,9 @@ package versioning
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"strings"
-
-	"github.com/pkg/errors"
 )
 
 const (
@@ -28,17 +25,17 @@ type Pip struct {
 
 func (p *Pip) init() error {
 	if p.readFile == nil {
-		p.readFile = ioutil.ReadFile
+		p.readFile = os.ReadFile
 	}
 
 	if p.writeFile == nil {
-		p.writeFile = ioutil.WriteFile
+		p.writeFile = os.WriteFile
 	}
 
 	if len(p.buildDescriptorContent) == 0 {
 		content, err := p.readFile(p.path)
 		if err != nil {
-			return errors.Wrapf(err, "failed to read file '%v'", p.path)
+			return fmt.Errorf("failed to read file '%v': %w", p.path, err)
 		}
 		p.buildDescriptorContent = string(content)
 	}
@@ -54,14 +51,14 @@ func (p *Pip) GetVersion() (string, error) {
 		if err != nil {
 			initErr := p.init()
 			if initErr != nil {
-				return "", errors.Wrapf(initErr, "failed to read file '%v'", p.path)
+				return "", fmt.Errorf("failed to read file '%v': %w", p.path, initErr)
 			}
 			if evaluateResult(p.buildDescriptorContent, VersionRegex) {
 				compile := regexp.MustCompile(VersionRegex)
 				values := compile.FindStringSubmatch(p.buildDescriptorContent)
 				return values[2], nil
 			}
-			return "", errors.Wrap(err, "failed to retrieve version")
+			return "", fmt.Errorf("failed to retrieve version: %w", err)
 		}
 	}
 	artifact := &Versionfile{
@@ -81,7 +78,7 @@ func (p *Pip) SetVersion(v string) error {
 		if err != nil {
 			initErr := p.init()
 			if initErr != nil {
-				return errors.Wrapf(initErr, "failed to read file '%v'", p.path)
+				return fmt.Errorf("failed to read file '%v': %w", p.path, initErr)
 			}
 			if evaluateResult(p.buildDescriptorContent, VersionRegex) {
 				compile := regexp.MustCompile(VersionRegex)
@@ -90,7 +87,7 @@ func (p *Pip) SetVersion(v string) error {
 				p.buildDescriptorContent = strings.ReplaceAll(p.buildDescriptorContent, fmt.Sprintf("version=\"%v\"", values[2]), fmt.Sprintf("version=\"%v\"", v))
 				p.writeFile(p.path, []byte(p.buildDescriptorContent), 0600)
 			} else {
-				return errors.Wrap(err, "failed to retrieve version")
+				return fmt.Errorf("failed to retrieve version: %w", err)
 			}
 		}
 	}
@@ -125,7 +122,7 @@ func (p *Pip) GetCoordinates() (Coordinates, error) {
 
 	result.Version, err = p.GetVersion()
 	if err != nil {
-		return result, errors.Wrap(err, "failed to retrieve coordinates")
+		return result, fmt.Errorf("failed to retrieve coordinates: %w", err)
 	}
 
 	return result, nil

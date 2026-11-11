@@ -1,16 +1,23 @@
+//go:build unit
+// +build unit
+
 package cmd
 
 import (
 	"context"
 	"fmt"
+	piperGithub "github.com/SAP/jenkins-library/pkg/github"
 	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/google/go-github/v32/github"
+	"github.com/SAP/jenkins-library/cmd/mocks"
+
+	"github.com/google/go-github/v68/github"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 )
 
 type ghRCMock struct {
@@ -29,7 +36,6 @@ type ghRCMock struct {
 	listOpts          *github.ListOptions
 	latestStatusCode  int
 	latestErr         error
-	preRelease        bool
 	uploadID          int64
 	uploadOpts        *github.UploadOptions
 	uploadOwner       string
@@ -80,6 +86,7 @@ func (g *ghRCMock) UploadReleaseAsset(ctx context.Context, owner string, repo st
 
 type ghICMock struct {
 	issues        []*github.Issue
+	response      github.Response
 	lastPublished time.Time
 	owner         string
 	repo          string
@@ -91,7 +98,7 @@ func (g *ghICMock) ListByRepo(ctx context.Context, owner string, repo string, op
 	g.repo = repo
 	g.options = opt
 	g.lastPublished = opt.Since
-	return g.issues, nil, nil
+	return g.issues, &g.response, nil
 }
 
 func TestRunGithubPublishRelease(t *testing.T) {
@@ -119,11 +126,38 @@ func TestRunGithubPublishRelease(t *testing.T) {
 
 		assert.Equal(t, "Header\n", ghRepoClient.release.GetBody())
 		assert.Equal(t, true, ghRepoClient.release.GetPrerelease())
+		assert.Equal(t, "1.0", ghRepoClient.release.GetTagName())
+	})
+
+	t.Run("Success - first release with tag prefix set & no body", func(t *testing.T) {
+		ghIssueClient := ghICMock{}
+		ghRepoClient := ghRCMock{
+			latestStatusCode: 404,
+			latestErr:        fmt.Errorf("not found"),
+		}
+
+		myGithubPublishReleaseOptions := githubPublishReleaseOptions{
+			AddDeltaToLastRelease: true,
+			Commitish:             "master",
+			Owner:                 "TEST",
+			PreRelease:            true,
+			Repository:            "test",
+			ServerURL:             "https://github.com",
+			ReleaseBodyHeader:     "Header",
+			Version:               "1.0",
+			TagPrefix:             "v",
+		}
+		err := runGithubPublishRelease(ctx, &myGithubPublishReleaseOptions, &ghRepoClient, &ghIssueClient)
+		assert.NoError(t, err, "Error occurred but none expected.")
+
+		assert.Equal(t, "Header\n", ghRepoClient.release.GetBody())
+		assert.Equal(t, true, ghRepoClient.release.GetPrerelease())
+		assert.Equal(t, "v1.0", ghRepoClient.release.GetTagName())
 	})
 
 	t.Run("Success - subsequent releases & with body", func(t *testing.T) {
 		lastTag := "1.0"
-		lastPublishedAt := github.Timestamp{Time: time.Date(2019, 01, 01, 0, 0, 0, 0, time.UTC)}
+		lastPublishedAt := github.Timestamp{Time: time.Date(2019, 1, 1, 0, 0, 0, 0, time.UTC)}
 		ghRepoClient := ghRCMock{
 			createErr: nil,
 			latestRelease: &github.RepositoryRelease{
@@ -139,10 +173,13 @@ func TestRunGithubPublishRelease(t *testing.T) {
 		issTitle := "Issue"
 		issNo := 2
 
+		closedAt := github.Timestamp{Time: time.Date(2019, 6, 1, 0, 0, 0, 0, time.UTC)}
+		mergedAt := closedAt
+
 		ghIssueClient := ghICMock{
 			issues: []*github.Issue{
-				{Number: &prNo, Title: &prTitle, HTMLURL: &prHTMLURL, PullRequestLinks: &github.PullRequestLinks{URL: &prHTMLURL}},
-				{Number: &issNo, Title: &issTitle, HTMLURL: &issHTMLURL},
+				{Number: &prNo, Title: &prTitle, HTMLURL: &prHTMLURL, ClosedAt: &closedAt, PullRequestLinks: &github.PullRequestLinks{URL: &prHTMLURL, MergedAt: &mergedAt}},
+				{Number: &issNo, Title: &issTitle, HTMLURL: &issHTMLURL, ClosedAt: &closedAt},
 			},
 		}
 		myGithubPublishReleaseOptions := githubPublishReleaseOptions{
@@ -177,8 +214,10 @@ func TestRunGithubPublishRelease(t *testing.T) {
 		}
 
 		myGithubPublishReleaseOptions := githubPublishReleaseOptions{
-			AssetPath: filepath.Join("testdata", t.Name()+"_test.txt"),
-			Version:   "latest",
+			Owner:      "TEST",
+			Repository: "test",
+			AssetPath:  filepath.Join("testdata", t.Name()+"_test.txt"),
+			Version:    "latest",
 		}
 
 		err := runGithubPublishRelease(ctx, &myGithubPublishReleaseOptions, &ghRepoClient, &ghIssueClient)
@@ -189,6 +228,49 @@ func TestRunGithubPublishRelease(t *testing.T) {
 
 		assert.Equal(t, releaseID, ghRepoClient.listID)
 		assert.Equal(t, releaseID, ghRepoClient.uploadID)
+	})
+
+	t.Run("Success - auto-detect pre-release from SemVer (hyphen)", func(t *testing.T) {
+		ghIssueClient := ghICMock{}
+		ghRepoClient := ghRCMock{
+			latestStatusCode: 404,
+			latestErr:        fmt.Errorf("not found"),
+		}
+
+		myGithubPublishReleaseOptions := githubPublishReleaseOptions{
+			Owner:                "TEST",
+			Repository:           "test",
+			Version:              "1.2.3-beta.1",
+			AutoDetectPreRelease: true,
+			// PreRelease intentionally not set to verify auto-detection kicks in
+		}
+		err := runGithubPublishRelease(ctx, &myGithubPublishReleaseOptions, &ghRepoClient, &ghIssueClient)
+		assert.NoError(t, err, "Error occurred but none expected.")
+
+		assert.Equal(t, true, ghRepoClient.release.GetPrerelease(), "Pre-release should be auto-detected as true")
+		assert.Equal(t, "1.2.3-beta.1", ghRepoClient.release.GetTagName())
+		assert.Equal(t, "1.2.3-beta.1", ghRepoClient.release.GetName())
+	})
+
+	t.Run("Success - auto-detect ignores build metadata", func(t *testing.T) {
+		ghIssueClient := ghICMock{}
+		ghRepoClient := ghRCMock{
+			latestStatusCode: 404,
+			latestErr:        fmt.Errorf("not found"),
+		}
+
+		myGithubPublishReleaseOptions := githubPublishReleaseOptions{
+			Owner:                "TEST",
+			Repository:           "test",
+			Version:              "2.0.0+build.123",
+			AutoDetectPreRelease: true,
+		}
+		err := runGithubPublishRelease(ctx, &myGithubPublishReleaseOptions, &ghRepoClient, &ghIssueClient)
+		assert.NoError(t, err, "Error occurred but none expected.")
+
+		assert.Equal(t, false, ghRepoClient.release.GetPrerelease(), "Pre-release should remain false when only build metadata is present")
+		assert.Equal(t, "2.0.0+build.123", ghRepoClient.release.GetTagName())
+		assert.Equal(t, "2.0.0+build.123", ghRepoClient.release.GetName())
 	})
 
 	t.Run("Error - get release", func(t *testing.T) {
@@ -211,12 +293,12 @@ func TestRunGithubPublishRelease(t *testing.T) {
 			latestErr: fmt.Errorf("Latest release error, no response"),
 		}
 		myGithubPublishReleaseOptions := githubPublishReleaseOptions{
-			Owner:      "",
+			Owner:      "TEST",
 			Repository: "test",
 		}
 		err := runGithubPublishRelease(ctx, &myGithubPublishReleaseOptions, &ghRepoClient, &ghIssueClient)
 
-		assert.Equal(t, "Error occurred when retrieving latest GitHub release (/test): Latest release error, no response", fmt.Sprint(err))
+		assert.Equal(t, "Error occurred when retrieving latest GitHub release (TEST/test): Latest release error, no response", fmt.Sprint(err))
 	})
 
 	t.Run("Error - create release", func(t *testing.T) {
@@ -225,17 +307,45 @@ func TestRunGithubPublishRelease(t *testing.T) {
 			createErr: fmt.Errorf("Create release error"),
 		}
 		myGithubPublishReleaseOptions := githubPublishReleaseOptions{
-			Version: "1.0",
+			Owner:      "TEST",
+			Repository: "test",
+			Version:    "1.0",
 		}
 		err := runGithubPublishRelease(ctx, &myGithubPublishReleaseOptions, &ghRepoClient, &ghIssueClient)
 
 		assert.Equal(t, "Creation of release '1.0' failed: Create release error", fmt.Sprint(err))
 	})
+
+	t.Run("Error - empty owner", func(t *testing.T) {
+		ghIssueClient := ghICMock{}
+		ghRepoClient := ghRCMock{}
+		myGithubPublishReleaseOptions := githubPublishReleaseOptions{
+			Owner:      "",
+			Repository: "test",
+			Version:    "1.0",
+		}
+		err := runGithubPublishRelease(ctx, &myGithubPublishReleaseOptions, &ghRepoClient, &ghIssueClient)
+
+		assert.ErrorIs(t, err, errOwnerOrRepositoryEmpty)
+	})
+
+	t.Run("Error - empty repository", func(t *testing.T) {
+		ghIssueClient := ghICMock{}
+		ghRepoClient := ghRCMock{}
+		myGithubPublishReleaseOptions := githubPublishReleaseOptions{
+			Owner:      "TEST",
+			Repository: "",
+			Version:    "1.0",
+		}
+		err := runGithubPublishRelease(ctx, &myGithubPublishReleaseOptions, &ghRepoClient, &ghIssueClient)
+
+		assert.ErrorIs(t, err, errOwnerOrRepositoryEmpty)
+	})
 }
 
 func TestGetClosedIssuesText(t *testing.T) {
 	ctx := context.Background()
-	publishedAt := github.Timestamp{Time: time.Date(2019, 01, 01, 0, 0, 0, 0, time.UTC)}
+	publishedAt := github.Timestamp{Time: time.Date(2019, 1, 1, 0, 0, 0, 0, time.UTC)}
 
 	t.Run("No issues", func(t *testing.T) {
 		ghIssueClient := ghICMock{}
@@ -250,7 +360,7 @@ func TestGetClosedIssuesText(t *testing.T) {
 
 	t.Run("All issues", func(t *testing.T) {
 		ctx := context.Background()
-		publishedAt := github.Timestamp{Time: time.Date(2019, 01, 01, 0, 0, 0, 0, time.UTC)}
+		publishedAt := github.Timestamp{Time: time.Date(2019, 1, 1, 0, 0, 0, 0, time.UTC)}
 
 		prHTMLURL := []string{"https://github.com/TEST/test/pull/1", "https://github.com/TEST/test/pull/2"}
 		prTitle := []string{"Pull1", "Pull2"}
@@ -260,12 +370,15 @@ func TestGetClosedIssuesText(t *testing.T) {
 		issTitle := []string{"Issue3", "Issue4"}
 		issNo := []int{3, 4}
 
+		closedAt := github.Timestamp{Time: time.Date(2019, 6, 1, 0, 0, 0, 0, time.UTC)}
+		mergedAt := closedAt
+
 		ghIssueClient := ghICMock{
 			issues: []*github.Issue{
-				{Number: &prNo[0], Title: &prTitle[0], HTMLURL: &prHTMLURL[0], PullRequestLinks: &github.PullRequestLinks{URL: &prHTMLURL[0]}},
-				{Number: &prNo[1], Title: &prTitle[1], HTMLURL: &prHTMLURL[1], PullRequestLinks: &github.PullRequestLinks{URL: &prHTMLURL[1]}},
-				{Number: &issNo[0], Title: &issTitle[0], HTMLURL: &issHTMLURL[0]},
-				{Number: &issNo[1], Title: &issTitle[1], HTMLURL: &issHTMLURL[1]},
+				{Number: &prNo[0], Title: &prTitle[0], HTMLURL: &prHTMLURL[0], ClosedAt: &closedAt, PullRequestLinks: &github.PullRequestLinks{URL: &prHTMLURL[0], MergedAt: &mergedAt}},
+				{Number: &prNo[1], Title: &prTitle[1], HTMLURL: &prHTMLURL[1], ClosedAt: &closedAt, PullRequestLinks: &github.PullRequestLinks{URL: &prHTMLURL[1], MergedAt: &mergedAt}},
+				{Number: &issNo[0], Title: &issTitle[0], HTMLURL: &issHTMLURL[0], ClosedAt: &closedAt},
+				{Number: &issNo[1], Title: &issTitle[1], HTMLURL: &issHTMLURL[1], ClosedAt: &closedAt},
 			},
 		}
 
@@ -284,23 +397,112 @@ func TestGetClosedIssuesText(t *testing.T) {
 		assert.Equal(t, publishedAt.Time, ghIssueClient.options.Since, "PublishedAt not properly passed")
 	})
 
+	t.Run("Skips pull requests closed without merge", func(t *testing.T) {
+		prHTMLURL := []string{"https://github.com/TEST/test/pull/1", "https://github.com/TEST/test/pull/2"}
+		prTitle := []string{"Merged", "ClosedUnmerged"}
+		prNo := []int{1, 2}
+		closedAt := github.Timestamp{Time: time.Date(2019, 6, 1, 0, 0, 0, 0, time.UTC)}
+		mergedAt := closedAt
+
+		ghIssueClient := ghICMock{
+			issues: []*github.Issue{
+				{Number: &prNo[0], Title: &prTitle[0], HTMLURL: &prHTMLURL[0], ClosedAt: &closedAt, PullRequestLinks: &github.PullRequestLinks{URL: &prHTMLURL[0], MergedAt: &mergedAt}},
+				{Number: &prNo[1], Title: &prTitle[1], HTMLURL: &prHTMLURL[1], ClosedAt: &closedAt, PullRequestLinks: &github.PullRequestLinks{URL: &prHTMLURL[1]}},
+			},
+		}
+		myGithubPublishReleaseOptions := githubPublishReleaseOptions{
+			Owner:      "TEST",
+			Repository: "test",
+		}
+
+		res := getClosedIssuesText(ctx, publishedAt, &myGithubPublishReleaseOptions, &ghIssueClient)
+
+		assert.Contains(t, res, "[#1](https://github.com/TEST/test/pull/1): Merged")
+		assert.NotContains(t, res, "#2")
+	})
+
+	t.Run("Skips items closed before last release", func(t *testing.T) {
+		issHTMLURL := []string{"https://github.com/TEST/test/issues/3", "https://github.com/TEST/test/issues/4"}
+		issTitle := []string{"InWindow", "ClosedBeforeLastRelease"}
+		issNo := []int{3, 4}
+		closedInWindow := github.Timestamp{Time: time.Date(2019, 6, 1, 0, 0, 0, 0, time.UTC)}
+		closedBefore := github.Timestamp{Time: time.Date(2018, 6, 1, 0, 0, 0, 0, time.UTC)}
+
+		ghIssueClient := ghICMock{
+			issues: []*github.Issue{
+				{Number: &issNo[0], Title: &issTitle[0], HTMLURL: &issHTMLURL[0], ClosedAt: &closedInWindow},
+				// closed before the last release but updated afterwards, so returned by the API ('since' filters on updated_at)
+				{Number: &issNo[1], Title: &issTitle[1], HTMLURL: &issHTMLURL[1], ClosedAt: &closedBefore},
+			},
+		}
+		myGithubPublishReleaseOptions := githubPublishReleaseOptions{
+			Owner:      "TEST",
+			Repository: "test",
+		}
+
+		res := getClosedIssuesText(ctx, publishedAt, &myGithubPublishReleaseOptions, &ghIssueClient)
+
+		assert.Contains(t, res, "[#3](https://github.com/TEST/test/issues/3): InWindow")
+		assert.NotContains(t, res, "#4")
+	})
+
+	t.Run("Skips issues closed as not planned", func(t *testing.T) {
+		issHTMLURL := []string{"https://github.com/TEST/test/issues/5", "https://github.com/TEST/test/issues/6"}
+		issTitle := []string{"Completed", "NotPlanned"}
+		issNo := []int{5, 6}
+		closedAt := github.Timestamp{Time: time.Date(2019, 6, 1, 0, 0, 0, 0, time.UTC)}
+		completed := "completed"
+		notPlanned := "not_planned"
+
+		ghIssueClient := ghICMock{
+			issues: []*github.Issue{
+				{Number: &issNo[0], Title: &issTitle[0], HTMLURL: &issHTMLURL[0], ClosedAt: &closedAt, StateReason: &completed},
+				{Number: &issNo[1], Title: &issTitle[1], HTMLURL: &issHTMLURL[1], ClosedAt: &closedAt, StateReason: &notPlanned},
+			},
+		}
+		myGithubPublishReleaseOptions := githubPublishReleaseOptions{
+			Owner:      "TEST",
+			Repository: "test",
+		}
+
+		res := getClosedIssuesText(ctx, publishedAt, &myGithubPublishReleaseOptions, &ghIssueClient)
+
+		assert.Contains(t, res, "[#5](https://github.com/TEST/test/issues/5): Completed")
+		assert.NotContains(t, res, "#6")
+	})
 }
 
 func TestGetReleaseDeltaText(t *testing.T) {
-	myGithubPublishReleaseOptions := githubPublishReleaseOptions{
-		Owner:      "TEST",
-		Repository: "test",
-		ServerURL:  "https://github.com",
-		Version:    "1.1",
-	}
-	lastTag := "1.0"
-	lastRelease := github.RepositoryRelease{
-		TagName: &lastTag,
-	}
+	t.Run("test case without TagPrefix for new release", func(t *testing.T) {
+		myGithubPublishReleaseOptions := githubPublishReleaseOptions{
+			Owner:      "TEST",
+			Repository: "test",
+			ServerURL:  "https://github.com",
+			Version:    "1.1",
+		}
+		lastTag := "1.0"
+		lastRelease := github.RepositoryRelease{
+			TagName: &lastTag,
+		}
+		res := getReleaseDeltaText(&myGithubPublishReleaseOptions, &lastRelease)
+		assert.Equal(t, "\n**Changes**\n[1.0...1.1](https://github.com/TEST/test/compare/1.0...1.1)\n", res)
+	})
 
-	res := getReleaseDeltaText(&myGithubPublishReleaseOptions, &lastRelease)
-
-	assert.Equal(t, "\n**Changes**\n[1.0...1.1](https://github.com/TEST/test/compare/1.0...1.1)\n", res)
+	t.Run("test case with TagPrefix for new release", func(t *testing.T) {
+		myGithubPublishReleaseOptions := githubPublishReleaseOptions{
+			Owner:      "TEST",
+			Repository: "test",
+			ServerURL:  "https://github.com",
+			Version:    "1.1",
+			TagPrefix:  "release/",
+		}
+		lastTag := "1.0"
+		lastRelease := github.RepositoryRelease{
+			TagName: &lastTag,
+		}
+		res := getReleaseDeltaText(&myGithubPublishReleaseOptions, &lastRelease)
+		assert.Equal(t, "\n**Changes**\n[1.0...release/1.1](https://github.com/TEST/test/compare/1.0...release/1.1)\n", res)
+	})
 }
 
 func TestUploadReleaseAsset(t *testing.T) {
@@ -381,8 +583,77 @@ func TestUploadReleaseAsset(t *testing.T) {
 	})
 }
 
-func TestIsExcluded(t *testing.T) {
+func TestUploadReleaseAssetList(t *testing.T) {
+	ctx := context.Background()
+	owner := "OWNER"
+	repository := "REPOSITORY"
+	var releaseID int64 = 1
 
+	t.Run("Success - multiple asset", func(t *testing.T) {
+		// init
+		assetURL := mock.Anything
+		asset1 := filepath.Join("testdata", t.Name()+"_1_test.txt")
+		asset2 := filepath.Join("testdata", t.Name()+"_2_test.txt")
+		assetName1 := filepath.Base(asset1)
+		assetName2 := filepath.Base(asset2)
+		var assetID1 int64 = 11
+		var assetID2 int64 = 12
+		stepConfig := githubPublishReleaseOptions{
+			Owner:         owner,
+			Repository:    repository,
+			AssetPathList: []string{asset1, asset2},
+		}
+		// mocking
+		ghClient := &mocks.GithubRepoClient{}
+		ghClient.Test(t)
+		ghClient.
+			On("ListReleaseAssets", ctx, owner, repository, releaseID, mock.AnythingOfType("*github.ListOptions")).Return(
+			[]*github.ReleaseAsset{
+				{Name: &assetName1, ID: &assetID1, URL: &assetURL},
+				{Name: &assetName2, ID: &assetID2, URL: &assetURL},
+			},
+			nil,
+			nil,
+		).
+			On("DeleteReleaseAsset", ctx, owner, repository, mock.AnythingOfType("int64")).Return(
+			&github.Response{Response: &http.Response{StatusCode: 200}},
+			nil,
+		).
+			On("UploadReleaseAsset", ctx, owner, repository, releaseID, mock.AnythingOfType("*github.UploadOptions"), mock.AnythingOfType("*os.File")).Return(
+			&github.ReleaseAsset{URL: &assetURL},
+			&github.Response{Response: &http.Response{StatusCode: 200}},
+			nil,
+		)
+		// test
+		err := uploadReleaseAssetList(ctx, releaseID, &stepConfig, ghClient)
+		// asserts
+		assert.NoError(t, err)
+		ghClient.AssertExpectations(t)
+	})
+}
+
+func TestResolveGitHubToken(t *testing.T) {
+	t.Run("configured token wins", func(t *testing.T) {
+		t.Setenv(piperGithub.GitHubTokenEnv, "actions-token")
+		token, err := resolveGitHubToken("configured-token")
+		assert.NoError(t, err)
+		assert.Equal(t, "configured-token", token)
+	})
+	t.Run("GITHUB_TOKEN is the last resort", func(t *testing.T) {
+		t.Setenv(piperGithub.GitHubTokenEnv, "actions-token")
+		token, err := resolveGitHubToken("")
+		assert.NoError(t, err)
+		assert.Equal(t, "actions-token", token)
+	})
+	t.Run("error without any token", func(t *testing.T) {
+		t.Setenv(piperGithub.GitHubTokenEnv, "")
+		token, err := resolveGitHubToken("")
+		assert.ErrorIs(t, err, errNoGitHubToken)
+		assert.Empty(t, token)
+	})
+}
+
+func TestIsExcluded(t *testing.T) {
 	l1 := "label1"
 	l2 := "label2"
 
@@ -403,5 +674,4 @@ func TestIsExcluded(t *testing.T) {
 	for k, v := range tt {
 		assert.Equal(t, v.expected, isExcluded(v.issue, v.excludeLabels), fmt.Sprintf("Run %v failed", k))
 	}
-
 }

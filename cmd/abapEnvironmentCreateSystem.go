@@ -3,31 +3,28 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"os"
 
 	"github.com/SAP/jenkins-library/pkg/abaputils"
-	"github.com/SAP/jenkins-library/pkg/cloudfoundry"
 	"github.com/SAP/jenkins-library/pkg/command"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/ghodss/yaml"
-	"github.com/google/uuid"
+
+	"uuid"
 )
 
 func abapEnvironmentCreateSystem(config abapEnvironmentCreateSystemOptions, telemetryData *telemetry.CustomData) {
 
-	cf := cloudfoundry.CFUtils{Exec: &command.Command{}}
+	c := &command.Command{}
 	u := &googleUUID{}
 
 	// error situations should stop execution through log.Entry().Fatal() call which leads to an os.Exit(1) in the end
-	err := runAbapEnvironmentCreateSystem(&config, telemetryData, cf, u)
+	err := runAbapEnvironmentCreateSystem(&config, telemetryData, c, u)
 	if err != nil {
 		log.Entry().WithError(err).Fatal("step execution failed")
 	}
 }
 
-func runAbapEnvironmentCreateSystem(config *abapEnvironmentCreateSystemOptions, telemetryData *telemetry.CustomData, cf cloudfoundry.CFUtils, u uuidGenerator) error {
+func runAbapEnvironmentCreateSystem(config *abapEnvironmentCreateSystemOptions, telemetryData *telemetry.CustomData, c command.ExecRunner, u uuidGenerator) error {
 
 	if config.ServiceManifest != "" {
 		// if the manifest file is provided, it is directly passed through to cloudFoundryCreateService
@@ -39,42 +36,38 @@ func runAbapEnvironmentCreateSystem(config *abapEnvironmentCreateSystemOptions, 
 			Password:        config.Password,
 			ServiceManifest: config.ServiceManifest,
 		}
-		return runCloudFoundryCreateService(&createServiceConfig, telemetryData, cf)
+		return runCloudFoundryCreateService(&createServiceConfig, telemetryData, c)
 	}
-	// if no manifest file is provided, it is created with the provided config values
-	manifestYAML, err := generateManifestYAML(config)
 
-	// writing the yaml into a temporary file
-	path, _ := os.Getwd()
-	path = path + "/generated_service_manifest-" + u.getUUID() + ".yml"
-	log.Entry().Debugf("Path: %s", path)
-	err = ioutil.WriteFile(path, manifestYAML, 0644)
+	cfConfig, err := generateServiceParameterString(config)
 	if err != nil {
-		return fmt.Errorf("%s: %w", "Could not generate manifest file for the cloud foundry cli", err)
+		log.Entry().Fatalf("Could not generate parameter string")
 	}
-
-	defer os.Remove(path)
-
 	// Calling cloudFoundryCreateService with the respective parameters
 	createServiceConfig := cloudFoundryCreateServiceOptions{
-		CfAPIEndpoint:   config.CfAPIEndpoint,
-		CfOrg:           config.CfOrg,
-		CfSpace:         config.CfSpace,
-		Username:        config.Username,
-		Password:        config.Password,
-		ServiceManifest: path,
+		CfAPIEndpoint:         config.CfAPIEndpoint,
+		CfOrg:                 config.CfOrg,
+		CfSpace:               config.CfSpace,
+		Username:              config.Username,
+		Password:              config.Password,
+		CfService:             config.CfService,
+		CfServicePlan:         config.CfServicePlan,
+		CfServiceInstanceName: config.CfServiceInstance,
+		CfCreateServiceConfig: cfConfig,
+		CfAsync:               false,
 	}
-	return runCloudFoundryCreateService(&createServiceConfig, telemetryData, cf)
+	return runCloudFoundryCreateService(&createServiceConfig, telemetryData, c)
 }
 
-func generateManifestYAML(config *abapEnvironmentCreateSystemOptions) ([]byte, error) {
+func generateServiceParameterString(config *abapEnvironmentCreateSystemOptions) (string, error) {
 	addonProduct := ""
 	addonVersion := ""
 	parentSaaSAppName := ""
 	if config.AddonDescriptorFileName != "" && config.IncludeAddon {
 		descriptor, err := abaputils.ReadAddonDescriptor(config.AddonDescriptorFileName)
 		if err != nil {
-			return nil, fmt.Errorf("Cloud not read addonProduct and addonVersion from %s: %w", config.AddonDescriptorFileName, err)
+			log.SetErrorCategory(log.ErrorConfiguration)
+			return "", fmt.Errorf("Cloud not read addonProduct and addonVersion from %s: %w", config.AddonDescriptorFileName, err)
 		}
 		addonProduct = descriptor.AddonProduct
 		addonVersion = descriptor.AddonVersionYAML
@@ -97,37 +90,11 @@ func generateManifestYAML(config *abapEnvironmentCreateSystemOptions) ([]byte, e
 	serviceParametersString := string(serviceParameters)
 	log.Entry().Debugf("Service Parameters: %s", serviceParametersString)
 	if err != nil {
-		return nil, fmt.Errorf("Could not generate parameter string for the cloud foundry cli: %w", err)
+		log.SetErrorCategory(log.ErrorConfiguration)
+		return "", fmt.Errorf("Could not generate parameter string for the cloud foundry cli: %w", err)
 	}
 
-	/*
-		Generating the temporary manifest yaml file
-	*/
-	service := Service{
-		Name:       config.CfServiceInstance,
-		Broker:     config.CfService,
-		Plan:       config.CfServicePlan,
-		Parameters: serviceParametersString,
-	}
-
-	serviceManifest := serviceManifest{CreateServices: []Service{service}}
-	errorMessage := "Could not generate manifest for the cloud foundry cli"
-
-	// converting the golang structure to json
-	manifestJSON, err := json.Marshal(serviceManifest)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", errorMessage, err)
-	}
-
-	// converting the json to yaml
-	manifestYAML, err := yaml.JSONToYAML(manifestJSON)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", errorMessage, err)
-	}
-
-	log.Entry().Debug(string(manifestYAML))
-
-	return manifestYAML, nil
+	return serviceParametersString, nil
 }
 
 type abapSystemParameters struct {

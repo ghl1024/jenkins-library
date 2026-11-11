@@ -1,10 +1,14 @@
+//go:build unit
+// +build unit
+
 package cmd
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/SAP/jenkins-library/pkg/mock"
-	"github.com/pkg/errors"
+
 	"github.com/stretchr/testify/assert"
 )
 

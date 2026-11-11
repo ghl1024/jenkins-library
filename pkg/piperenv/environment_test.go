@@ -1,7 +1,9 @@
+//go:build unit
+// +build unit
+
 package piperenv
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -33,11 +35,7 @@ func TestSetResourceParameter(t *testing.T) {
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
 			// init
-			dir, tempDirErr := ioutil.TempDir("", "")
-			require.NoError(t, tempDirErr)
-			require.DirExists(t, dir, "Failed to create temporary directory")
-			// clean up tmp dir
-			defer os.RemoveAll(dir)
+			dir := t.TempDir()
 			targetFile := filepath.Join(dir, testCase.args.resourceName, testCase.args.paramName)
 			// test
 			err := SetResourceParameter(dir, testCase.args.resourceName, testCase.args.paramName, testCase.args.value)
@@ -51,7 +49,7 @@ func TestSetResourceParameter(t *testing.T) {
 				targetFile += ".json"
 			}
 			assert.FileExists(t, targetFile)
-			v, err = ioutil.ReadFile(targetFile)
+			v, err = os.ReadFile(targetFile)
 			require.NoError(t, err)
 			assert.Equal(t, testCase.want, string(v))
 		})
@@ -73,11 +71,6 @@ func TestGetResourceParameter(t *testing.T) {
 	}
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			// init
-			dir, tempDirErr := ioutil.TempDir("", "")
-			defer os.RemoveAll(dir) // clean up
-			require.NoError(t, tempDirErr)
-			require.DirExists(t, dir, "Failed to create temporary directory")
 			// test
 			result := GetResourceParameter(testCase.args.path, testCase.args.resourceName, testCase.args.paramName)
 			// assert
@@ -87,28 +80,16 @@ func TestGetResourceParameter(t *testing.T) {
 }
 
 func TestSetParameter(t *testing.T) {
-	dir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal("Failed to create temporary directory")
-	}
+	dir := t.TempDir()
 
-	// clean up tmp dir
-	defer os.RemoveAll(dir)
-
-	err = SetParameter(dir, "testParam", "testVal")
+	err := SetParameter(dir, "testParam", "testVal")
 
 	assert.NoError(t, err, "Error occurred but none expected")
 	assert.Equal(t, "testVal", GetParameter(dir, "testParam"))
 }
 
 func TestReadFromDisk(t *testing.T) {
-	dir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal("Failed to create temporary directory")
-	}
-
-	// clean up tmp dir
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	assert.Equal(t, "", GetParameter(dir, "testParamNotExistingYet"))
 }

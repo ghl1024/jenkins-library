@@ -3,19 +3,19 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/SAP/jenkins-library/pkg/command"
-	"github.com/SAP/jenkins-library/pkg/log"
-	"github.com/SAP/jenkins-library/pkg/piperutils"
-	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/pkg/errors"
 	"io"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"text/template"
+
+	"github.com/SAP/jenkins-library/pkg/command"
+	"github.com/SAP/jenkins-library/pkg/log"
+	"github.com/SAP/jenkins-library/pkg/piperutils"
+	"github.com/SAP/jenkins-library/pkg/telemetry"
 )
 
 // DeployMode ...
@@ -40,7 +40,7 @@ func ValueOfMode(str string) (DeployMode, error) {
 	case "BG_DEPLOY":
 		return BGDeploy, nil
 	default:
-		return NoDeploy, errors.New(fmt.Sprintf("Unknown DeployMode: '%s'", str))
+		return NoDeploy, fmt.Errorf("Unknown DeployMode: '%s'", str)
 	}
 }
 
@@ -80,7 +80,7 @@ func ValueOfAction(str string) (Action, error) {
 		return Retry, nil
 
 	default:
-		return None, errors.New(fmt.Sprintf("Unknown Action: '%s'", str))
+		return None, fmt.Errorf("Unknown Action: '%s'", str)
 	}
 }
 
@@ -126,7 +126,7 @@ func runXsDeploy(XsDeployOptions xsDeployOptions, piperEnvironment *xsDeployComm
 
 	mode, err := ValueOfMode(XsDeployOptions.Mode)
 	if err != nil {
-		return errors.Wrapf(err, "Extracting mode failed: '%s'", XsDeployOptions.Mode)
+		return fmt.Errorf("Extracting mode failed: '%s': %w", XsDeployOptions.Mode, err)
 	}
 
 	if mode == NoDeploy {
@@ -136,11 +136,11 @@ func runXsDeploy(XsDeployOptions xsDeployOptions, piperEnvironment *xsDeployComm
 
 	action, err := ValueOfAction(XsDeployOptions.Action)
 	if err != nil {
-		return errors.Wrapf(err, "Extracting action failed: '%s'", XsDeployOptions.Action)
+		return fmt.Errorf("Extracting action failed: '%s': %w", XsDeployOptions.Action, err)
 	}
 
 	if mode == Deploy && action != None {
-		return errors.New(fmt.Sprintf("Cannot perform action '%s' in mode '%s'. Only action '%s' is allowed.", action, mode, None))
+		return fmt.Errorf("Cannot perform action '%s' in mode '%s'. Only action '%s' is allowed.", action, mode, None)
 	}
 
 	log.Entry().Debugf("Mode: '%s', Action: '%s'", mode, action)
@@ -155,12 +155,12 @@ func runXsDeploy(XsDeployOptions xsDeployOptions, piperEnvironment *xsDeployComm
 			return e
 		}
 		if action == None && !exists {
-			return errors.New(fmt.Sprintf("Deployable '%s' does not exist", XsDeployOptions.MtaPath))
+			return fmt.Errorf("Deployable '%s' does not exist", XsDeployOptions.MtaPath)
 		}
 	}
 
 	if action != None && len(XsDeployOptions.OperationID) == 0 {
-		return errors.New(fmt.Sprintf("OperationID was not provided. This is required for action '%s'.", action))
+		return fmt.Errorf("OperationID was not provided. This is required for action '%s'.", action)
 	}
 
 	prOut, pwOut := io.Pipe()
@@ -177,7 +177,9 @@ func runXsDeploy(XsDeployOptions xsDeployOptions, piperEnvironment *xsDeployComm
 	go func() {
 		buf := new(bytes.Buffer)
 		r := io.TeeReader(prOut, os.Stderr)
-		io.Copy(buf, r)
+		if _, err := io.Copy(buf, r); err != nil {
+			log.Entry().Warningf("failed to copy buffer")
+		}
 		o = buf.String()
 		wg.Done()
 	}()
@@ -185,7 +187,9 @@ func runXsDeploy(XsDeployOptions xsDeployOptions, piperEnvironment *xsDeployComm
 	go func() {
 		buf := new(bytes.Buffer)
 		r := io.TeeReader(prErr, os.Stderr)
-		io.Copy(buf, r)
+		if _, err := io.Copy(buf, r); err != nil {
+			log.Entry().Warningf("failed to copy buffer")
+		}
 		e = buf.String()
 		wg.Done()
 	}()
@@ -298,9 +302,9 @@ func printStatus(XsDeployOptions xsDeployOptions, stdout io.Writer) error {
 func handleLog(logDir string) error {
 
 	if _, e := os.Stat(logDir); !os.IsNotExist(e) {
-		log.Entry().Warningf(fmt.Sprintf("Here are the logs (%s):", logDir))
+		log.Entry().Warningf("Here are the logs (%s):", logDir)
 
-		logFiles, e := ioutil.ReadDir(logDir)
+		logFiles, e := os.ReadDir(logDir)
 
 		if e != nil {
 			return e
@@ -423,7 +427,7 @@ func complete(mode DeployMode, action Action, operationID string, s command.Shel
 	return nil
 }
 
-func executeCmd(templateID string, commandPattern string, properties interface{}, s command.ShellRunner) error {
+func executeCmd(templateID string, commandPattern string, properties any, s command.ShellRunner) error {
 
 	tmpl, e := template.New(templateID).Parse(commandPattern)
 	if e != nil {
@@ -431,7 +435,9 @@ func executeCmd(templateID string, commandPattern string, properties interface{}
 	}
 
 	var script bytes.Buffer
-	tmpl.Execute(&script, properties)
+	if err := tmpl.Execute(&script, properties); err != nil {
+		return err
+	}
 	if e := s.RunShell("/bin/bash", script.String()); e != nil {
 		return e
 	}
@@ -440,10 +446,10 @@ func executeCmd(templateID string, commandPattern string, properties interface{}
 }
 
 func copyFileFromHomeToPwd(xsSessionFile string, fileUtils piperutils.FileUtils) error {
-	src, dest := fmt.Sprintf("%s/%s", os.Getenv("HOME"), xsSessionFile), fmt.Sprintf("%s", xsSessionFile)
+	src, dest := fmt.Sprintf("%s/%s", os.Getenv("HOME"), xsSessionFile), xsSessionFile
 	log.Entry().Debugf("Copying xs session file from home directory ('%s') to workspace ('%s')", src, dest)
 	if _, err := fileUtils.Copy(src, dest); err != nil {
-		return errors.Wrapf(err, "Cannot copy xssession file from home directory ('%s') to workspace ('%s')", src, dest)
+		return fmt.Errorf("Cannot copy xssession file from home directory ('%s') to workspace ('%s'): %w", src, dest, err)
 	}
 	log.Entry().Debugf("xs session file copied from home directory ('%s') to workspace ('%s')", src, dest)
 	return nil
@@ -458,26 +464,26 @@ func copyFileFromPwdToHome(xsSessionFile string, fileUtils piperutils.FileUtils)
 	// affects also other builds.
 	//
 
-	src, dest := fmt.Sprintf("%s", xsSessionFile), fmt.Sprintf("%s/%s", os.Getenv("HOME"), xsSessionFile)
+	src, dest := xsSessionFile, fmt.Sprintf("%s/%s", os.Getenv("HOME"), xsSessionFile)
 	log.Entry().Debugf("Copying xs session file from workspace ('%s') to home directory ('%s')", src, dest)
 	if _, err := fileUtils.Copy(src, dest); err != nil {
-		return errors.Wrapf(err, "Cannot copy xssession file from workspace ('%s') to home directory ('%s')", src, dest)
+		return fmt.Errorf("Cannot copy xssession file from workspace ('%s') to home directory ('%s'): %w", src, dest, err)
 	}
 	log.Entry().Debugf("xs session file copied from workspace ('%s') to home directory ('%s')", src, dest)
 	return nil
 }
 
-//GetAction ...
+// GetAction ...
 func (a Action) GetAction() (string, error) {
 	switch a {
 	case Resume, Abort, Retry:
 		return strings.ToLower(a.String()), nil
 	}
-	return "", errors.New(fmt.Sprintf("Invalid deploy mode: '%s'.", a))
+	return "", fmt.Errorf("Invalid deploy mode: '%s'.", a)
 
 }
 
-//GetDeployCommand ...
+// GetDeployCommand ...
 func (m DeployMode) GetDeployCommand() (string, error) {
 
 	switch m {
@@ -486,5 +492,5 @@ func (m DeployMode) GetDeployCommand() (string, error) {
 	case BGDeploy:
 		return "bg-deploy", nil
 	}
-	return "", errors.New(fmt.Sprintf("Invalid deploy mode: '%s'.", m))
+	return "", fmt.Errorf("Invalid deploy mode: '%s'.", m)
 }

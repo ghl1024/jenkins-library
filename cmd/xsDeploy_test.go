@@ -1,19 +1,24 @@
+//go:build unit
+// +build unit
+
 package cmd
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/SAP/jenkins-library/pkg/mock"
-	"github.com/stretchr/testify/assert"
 	"io"
-	"io/ioutil"
-	"os"
 	"sync"
 	"testing"
+
+	"github.com/SAP/jenkins-library/pkg/log"
+	"github.com/SAP/jenkins-library/pkg/mock"
+
+	"github.com/stretchr/testify/assert"
 )
 
 type FileUtilsMock struct {
+	*mock.FilesMock
 	copiedFiles []string
 }
 
@@ -24,30 +29,6 @@ func (f *FileUtilsMock) FileExists(path string) (bool, error) {
 func (f *FileUtilsMock) Copy(src, dest string) (int64, error) {
 	f.copiedFiles = append(f.copiedFiles, fmt.Sprintf("%s->%s", src, dest))
 	return 0, nil
-}
-
-func (f *FileUtilsMock) FileRead(path string) ([]byte, error) {
-	return []byte{}, nil
-}
-
-func (f *FileUtilsMock) FileWrite(path string, content []byte, perm os.FileMode) error {
-	return nil
-}
-
-func (f *FileUtilsMock) MkdirAll(path string, perm os.FileMode) error {
-	return nil
-}
-
-func (f *FileUtilsMock) Chmod(path string, mode os.FileMode) error {
-	return fmt.Errorf("not implemented. func is only present in order to fullfil the interface contract. Needs to be ajusted in case it gets used.")
-}
-
-func (f *FileUtilsMock) Abs(path string) (string, error) {
-	return "", fmt.Errorf("not implemented. func is only present in order to fullfil the interface contract. Needs to be ajusted in case it gets used.")
-}
-
-func (f *FileUtilsMock) Glob(pattern string) (matches []string, err error) {
-	return nil, fmt.Errorf("not implemented. func is only present in order to fullfil the interface contract. Needs to be ajusted in case it gets used.")
 }
 
 func TestDeploy(t *testing.T) {
@@ -96,7 +77,9 @@ func TestDeploy(t *testing.T) {
 
 		go func() {
 			buf := new(bytes.Buffer)
-			io.Copy(buf, rStdout)
+			if _, err := io.Copy(buf, rStdout); err != nil {
+				log.Entry().Warning("failed to copy buffer")
+			}
 			stdout = buf.String()
 			wg.Done()
 		}()
@@ -152,7 +135,7 @@ func TestDeploy(t *testing.T) {
 		// this file is not denoted in the file exists mock
 		myXsDeployOptions.MtaPath = "doesNotExist"
 
-		e := runXsDeploy(myXsDeployOptions, &cpeOut, &s, &fileUtilsMock, fRemove, ioutil.Discard)
+		e := runXsDeploy(myXsDeployOptions, &cpeOut, &s, &fileUtilsMock, fRemove, io.Discard)
 		assert.EqualError(t, e, "Deployable 'doesNotExist' does not exist")
 	})
 
@@ -169,7 +152,7 @@ func TestDeploy(t *testing.T) {
 			myXsDeployOptions.Action = "NONE"
 		}()
 
-		e := runXsDeploy(myXsDeployOptions, &cpeOut, &s, &fileUtilsMock, fRemove, ioutil.Discard)
+		e := runXsDeploy(myXsDeployOptions, &cpeOut, &s, &fileUtilsMock, fRemove, io.Discard)
 		assert.EqualError(t, e, "Cannot perform action 'RETRY' in mode 'DEPLOY'. Only action 'NONE' is allowed.")
 	})
 
@@ -184,7 +167,7 @@ func TestDeploy(t *testing.T) {
 
 		s.ShouldFailOnCommand = map[string]error{"#!/bin/bash\nxs login -a https://example.org:12345 -u me -p 'secretPassword' -o myOrg -s mySpace --skip-ssl-validation\n": errors.New("Error from underlying process")}
 
-		e := runXsDeploy(myXsDeployOptions, &cpeOut, &s, &fileUtilsMock, fRemove, ioutil.Discard)
+		e := runXsDeploy(myXsDeployOptions, &cpeOut, &s, &fileUtilsMock, fRemove, io.Discard)
 		assert.EqualError(t, e, "Error from underlying process")
 	})
 
@@ -208,7 +191,7 @@ func TestDeploy(t *testing.T) {
 
 		myXsDeployOptions.Mode = "BG_DEPLOY"
 
-		e := runXsDeploy(myXsDeployOptions, &cpeOut, &s, &fileUtilsMock, fRemove, ioutil.Discard)
+		e := runXsDeploy(myXsDeployOptions, &cpeOut, &s, &fileUtilsMock, fRemove, io.Discard)
 
 		if assert.NoError(t, e) {
 			if assert.Len(t, s.Calls, 2) { // There are two entries --> no logout in this case.
@@ -237,7 +220,7 @@ func TestDeploy(t *testing.T) {
 
 		myXsDeployOptions.Mode = "BG_DEPLOY"
 
-		e := runXsDeploy(myXsDeployOptions, &cpeOut, &s, &fileUtilsMock, fRemove, ioutil.Discard)
+		e := runXsDeploy(myXsDeployOptions, &cpeOut, &s, &fileUtilsMock, fRemove, io.Discard)
 		assert.EqualError(t, e, "No operationID found")
 	})
 
@@ -262,7 +245,7 @@ func TestDeploy(t *testing.T) {
 		myXsDeployOptions.Action = "ABORT"
 		myXsDeployOptions.OperationID = "12345"
 
-		e := runXsDeploy(myXsDeployOptions, &cpeOut, &s, &fileUtilsMock, fRemove, ioutil.Discard)
+		e := runXsDeploy(myXsDeployOptions, &cpeOut, &s, &fileUtilsMock, fRemove, io.Discard)
 
 		if assert.NoError(t, e) {
 			if assert.Len(t, s.Calls, 2) { // There is no login --> we have two calls
@@ -292,7 +275,7 @@ func TestDeploy(t *testing.T) {
 		myXsDeployOptions.Mode = "BG_DEPLOY"
 		myXsDeployOptions.Action = "ABORT"
 
-		e := runXsDeploy(myXsDeployOptions, &cpeOut, &s, &fileUtilsMock, fRemove, ioutil.Discard)
+		e := runXsDeploy(myXsDeployOptions, &cpeOut, &s, &fileUtilsMock, fRemove, io.Discard)
 		assert.EqualError(t, e, "OperationID was not provided. This is required for action 'ABORT'.")
 	})
 }

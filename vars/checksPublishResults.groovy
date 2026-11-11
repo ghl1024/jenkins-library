@@ -93,29 +93,36 @@ void call(Map parameters = [:]) {
             error "[ERROR] Configuration of the aggregation view is no longer possible. Migrate any thresholds defined here to tool specific quality gates. (piper-lib/${STEP_NAME})"
         }
 
-        new Utils().pushToSWA([
-            step: STEP_NAME,
-            stepParamKey1: 'scriptMissing',
-            stepParam1: parameters?.script == null
-        ], configuration)
-
         // JAVA
-        report(pmdParser(createToolOptions(configuration.pmd)), configuration.pmd, configuration.archive)
-        report(cpd(createToolOptions(configuration.cpd)), configuration.cpd, configuration.archive)
-        report(findBugs(createToolOptions(configuration.findbugs, [useRankAsPriority: true])), configuration.findbugs, configuration.archive)
-        report(checkStyle(createToolOptions(configuration.checkstyle)), configuration.checkstyle, configuration.archive)
+        if(configuration.pmd.active) {
+          report(pmdParser(createToolOptions(configuration.pmd)), configuration.pmd, configuration.archive)
+        }
+        if(configuration.cpd.active) {
+          report(cpd(createToolOptions(configuration.cpd)), configuration.cpd, configuration.archive)
+        }
+        if(configuration.findbugs.active) {
+          report(findBugs(createToolOptions(configuration.findbugs, [useRankAsPriority: true])), configuration.findbugs, configuration.archive)
+        }
+        if(configuration.checkstyle.active) {
+          report(checkStyle(createToolOptions(configuration.checkstyle)), configuration.checkstyle, configuration.archive)
+        }
         // JAVA SCRIPT
-        report(esLint(createToolOptions(configuration.eslint)), configuration.eslint, configuration.archive)
+        if(configuration.eslint.active) {
+          report(esLint(createToolOptions(configuration.eslint)), configuration.eslint, configuration.archive)
+        }
         // PYTHON
-        report(pyLint(createToolOptions(configuration.pylint)), configuration.pylint, configuration.archive)
+        if(configuration.pylint.active) {
+          report(pyLint(createToolOptions(configuration.pylint)), configuration.pylint, configuration.archive)
+        }
         // GENERAL
-        report(taskScanner(createToolOptions(configuration.tasks, [
-            includePattern: configuration.tasks.get('pattern'),
-            highTags: configuration.tasks.get('high'),
-            normalTags: configuration.tasks.get('normal'),
-            lowTags: configuration.tasks.get('low'),
-        ]).minus([pattern: configuration.tasks.get('pattern')])), configuration.tasks, configuration.archive)
-
+        if(configuration.tasks.active) {
+          report(taskScanner(createToolOptions(configuration.tasks, [
+              includePattern: configuration.tasks.get('pattern'),
+              highTags: configuration.tasks.get('high'),
+              normalTags: configuration.tasks.get('normal'),
+              lowTags: configuration.tasks.get('low'),
+          ]).minus([pattern: configuration.tasks.get('pattern')])), configuration.tasks, configuration.archive)
+        }
         if (configuration.failOnError && 'FAILURE' == script.currentBuild?.result){
             script.currentBuild.result = 'FAILURE'
             error "[${STEP_NAME}] Some checks failed!"
@@ -124,14 +131,17 @@ void call(Map parameters = [:]) {
 }
 
 def report(tool, settings, doArchive){
-    if (settings.active) {
-        def options = createOptions(settings).plus([tools: [tool]])
-        echo "recordIssues OPTIONS: ${options}"
+    def options = createOptions(settings).plus([tools: [tool]])
+    echo "recordIssues OPTIONS: ${options}"
+    try {
         // publish
         recordIssues(options)
-        // archive check results
-        archiveResults(doArchive && settings.get('archive'), settings.get('pattern'), true)
+    } catch (e) {
+        echo "recordIssues has failed. Possibly due to an outdated version of the warnings-ng plugin."
+        e.printStackTrace()
     }
+    // archive check results
+    archiveResults(doArchive && settings.get('archive'), settings.get('pattern'), true)
 }
 
 def archiveResults(archive, pattern, allowEmpty){
@@ -144,7 +154,7 @@ def archiveResults(archive, pattern, allowEmpty){
 @NonCPS
 def createOptions(settings){
     Map result = [:]
-    result.put('blameDisabled', true)
+    result.put('skipBlames', true)
     result.put('enabledForFailure', true)
     result.put('aggregatingResults', false)
 

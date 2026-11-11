@@ -44,12 +44,15 @@ class NexusUploadTest extends BasePiperTest {
             return closure()
         })
         credentialsRule.withCredentials('idOfCxCredential', "admin", "admin123")
+        shellCallRule.setReturnValue('[ -x ./piper ]', 1)
         shellCallRule.setReturnValue(
             './piper getConfig --contextConfig --stepMetadata \'.pipeline/tmp/metadata/nexusUpload.yaml\'',
             '{"credentialsId": "idOfCxCredential", "verbose": false}'
         )
 
         helper.registerAllowedMethod('fileExists', [String.class], {return true})
+        helper.registerAllowedMethod("writePipelineEnv", [Map.class], {m -> return })
+        helper.registerAllowedMethod("readPipelineEnv", [Map.class], {m -> return })
         helper.registerAllowedMethod('findFiles', [Map.class], {return null})
     }
 
@@ -65,6 +68,6 @@ class NexusUploadTest extends BasePiperTest {
         assertThat(writeFileRule.files['.pipeline/tmp/metadata/nexusUpload.yaml'], containsString('name: nexusUpload'))
         assertThat(withEnvArgs[0], allOf(startsWith('PIPER_parametersJSON'),
             containsString('"testParam":"This is test content"')))
-        assertThat(shellCallRule.shell[1], is('./piper nexusUpload'))
+        assertThat(shellCallRule.shell[2], is('./piper nexusUpload'))
     }
 }

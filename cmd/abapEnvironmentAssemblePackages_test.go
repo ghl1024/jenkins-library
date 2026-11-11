@@ -1,3 +1,6 @@
+//go:build unit
+// +build unit
+
 package cmd
 
 import (
@@ -7,6 +10,8 @@ import (
 	abapbuild "github.com/SAP/jenkins-library/pkg/abap/build"
 	"github.com/SAP/jenkins-library/pkg/abaputils"
 	piperhttp "github.com/SAP/jenkins-library/pkg/http"
+	"github.com/SAP/jenkins-library/pkg/mock"
+
 	"github.com/stretchr/testify/assert"
 )
 
@@ -60,13 +65,15 @@ func TestStartingInvalidInput(t *testing.T) {
 		conn := new(abapbuild.Connector)
 		conn.Client = client
 		conn.Header = make(map[string][]string)
-		var repos []abaputils.Repository
-		repo := abaputils.Repository{
-			Name:   "RepoA",
-			Status: "P",
+		aD := abaputils.AddonDescriptor{
+			Repositories: []abaputils.Repository{
+				{
+					Name:   "RepoA",
+					Status: "P",
+				},
+			},
 		}
-		repos = append(repos, repo)
-		builds, err := executeBuilds(repos, *conn, time.Duration(0*time.Second), time.Duration(1*time.Millisecond))
+		builds, err := executeBuilds(&aD, *conn, time.Duration(0*time.Second), time.Duration(1*time.Millisecond), "")
 		assert.NoError(t, err)
 		assert.Equal(t, 1, len(builds))
 		assert.Equal(t, abapbuild.Failed, builds[0].build.RunState)
@@ -83,27 +90,27 @@ func TestStep(t *testing.T) {
 	cpe := &abapEnvironmentAssemblePackagesCommonPipelineEnvironment{}
 
 	t.Run("abapEnvironmentAssemblePackages: nothing to do", func(t *testing.T) {
-
 		config := &abapEnvironmentAssemblePackagesOptions{
 			AddonDescriptor:             cpeAbapAddonDescriptorPackageLocked,
 			MaxRuntimeInMinutes:         1,
 			PollIntervalsInMilliseconds: 1,
 		}
 
-		err := runAbapEnvironmentAssemblePackages(config, nil, autils, &client, cpe)
+		err := runAbapEnvironmentAssemblePackages(config, autils, &mock.FilesMock{}, &client, cpe)
 		assert.NoError(t, err)
+		assert.NotContains(t, cpe.abap.addonDescriptor, `"InBuildScope"`)
 	})
 	t.Run("abapEnvironmentAssemblePackages: build", func(t *testing.T) {
-
 		config := &abapEnvironmentAssemblePackagesOptions{
 			AddonDescriptor:             cpeAbapAddonDescriptorPackageReserved,
 			MaxRuntimeInMinutes:         1,
 			PollIntervalsInMilliseconds: 1,
 		}
 
-		err := runAbapEnvironmentAssemblePackages(config, nil, autils, &client, cpe)
+		err := runAbapEnvironmentAssemblePackages(config, autils, &mock.FilesMock{}, &client, cpe)
 		assert.NoError(t, err)
 		assert.Contains(t, cpe.abap.addonDescriptor, `SAPK-001AAINITAPC1.SAR`)
+		assert.Contains(t, cpe.abap.addonDescriptor, `"InBuildScope":true`)
 	})
 }
 

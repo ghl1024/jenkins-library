@@ -12,7 +12,6 @@ import (
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/piperutils"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/pkg/errors"
 )
 
 type newmanExecuteUtils interface {
@@ -68,7 +67,7 @@ func runNewmanExecute(config *newmanExecuteOptions, utils newmanExecuteUtils) er
 	collectionList, err := utils.Glob(config.NewmanCollection)
 	if err != nil {
 		log.SetErrorCategory(log.ErrorConfiguration)
-		return errors.Wrapf(err, "Could not execute global search for '%v'", config.NewmanCollection)
+		return fmt.Errorf("Could not execute global search for '%v': %w", config.NewmanCollection, err)
 	}
 
 	if collectionList == nil {
@@ -91,7 +90,6 @@ func runNewmanExecute(config *newmanExecuteOptions, utils newmanExecuteUtils) er
 	options := resolveOptions(config)
 
 	for _, collection := range collectionList {
-		runOptions := []string{}
 		runOptions, err := resolveTemplate(config, collection)
 		if err != nil {
 			return err
@@ -109,7 +107,7 @@ func runNewmanExecute(config *newmanExecuteOptions, utils newmanExecuteUtils) er
 		newmanPath := filepath.Join(utils.Getenv("HOME"), "/.npm-global/bin/newman")
 		err = utils.RunExecutable(newmanPath, runOptions...)
 		if err != nil {
-			return errors.Wrap(err, "The execution of the newman tests failed, see the log for details.")
+			return fmt.Errorf("The execution of the newman tests failed, see the log for details.: %w", err)
 		}
 	}
 	return nil
@@ -119,12 +117,12 @@ func logVersions(utils newmanExecuteUtils) error {
 	err := utils.RunExecutable("node", "--version")
 	if err != nil {
 		log.SetErrorCategory(log.ErrorInfrastructure)
-		return errors.Wrap(err, "error logging node version")
+		return fmt.Errorf("error logging node version: %w", err)
 	}
 	err = utils.RunExecutable("npm", "--version")
 	if err != nil {
 		log.SetErrorCategory(log.ErrorInfrastructure)
-		return errors.Wrap(err, "error logging npm version")
+		return fmt.Errorf("error logging npm version: %w", err)
 	}
 	return nil
 }
@@ -135,7 +133,7 @@ func installNewman(newmanInstallCommand string, utils newmanExecuteUtils) error 
 	err := utils.RunExecutable(installCommandTokens[0], installCommandTokens[1:]...)
 	if err != nil {
 		log.SetErrorCategory(log.ErrorConfiguration)
-		return errors.Wrap(err, "error installing newman")
+		return fmt.Errorf("error installing newman: %w", err)
 	}
 	return nil
 }
@@ -158,16 +156,20 @@ func resolveTemplate(config *newmanExecuteOptions, collection string) ([]string,
 	collectionDisplayName := defineCollectionDisplayName(collection)
 
 	type TemplateConfig struct {
-		Config                interface{}
+		Config                any
 		CollectionDisplayName string
 		NewmanCollection      string
 	}
 
 	for _, runOption := range config.RunOptions {
-		templ, err := template.New("template").Parse(runOption)
+		templ, err := template.New("template").Funcs(template.FuncMap{
+			"getenv": func(varName string) string {
+				return os.Getenv(varName)
+			},
+		}).Parse(runOption)
 		if err != nil {
 			log.SetErrorCategory(log.ErrorConfiguration)
-			return nil, errors.Wrap(err, "could not parse newman command template")
+			return nil, fmt.Errorf("could not parse newman command template: %w", err)
 		}
 		buf := new(bytes.Buffer)
 		err = templ.Execute(buf, TemplateConfig{
@@ -177,7 +179,7 @@ func resolveTemplate(config *newmanExecuteOptions, collection string) ([]string,
 		})
 		if err != nil {
 			log.SetErrorCategory(log.ErrorConfiguration)
-			return nil, errors.Wrap(err, "error on executing template")
+			return nil, fmt.Errorf("error on executing template: %w", err)
 		}
 		cmd = append(cmd, buf.String())
 	}

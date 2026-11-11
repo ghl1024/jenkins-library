@@ -6,27 +6,72 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/SAP/jenkins-library/pkg/config"
+	"github.com/SAP/jenkins-library/pkg/eventing"
+	"github.com/SAP/jenkins-library/pkg/gcs"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/piperenv"
+	"github.com/SAP/jenkins-library/pkg/piperutils"
+	"github.com/SAP/jenkins-library/pkg/splunk"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
+	"github.com/SAP/jenkins-library/pkg/validation"
+
 	"github.com/spf13/cobra"
 )
 
 type testStepOptions struct {
 	Param0 string `json:"param0,omitempty"`
-	Param1 string `json:"param1,omitempty"`
-	Param2 string `json:"param2,omitempty"`
+	Param1 string `json:"param1,omitempty" validate:"possible-values=value1 value2 value3"`
+	Param2 string `json:"param2,omitempty" validate:"required_if=Param1 value1"`
+	Param3 string `json:"param3,omitempty" validate:"possible-values=value1 value2 value3,required_if=Param1 value1 Param2 value2"`
+	Param4 string `json:"param4,omitempty" validate:"required_with=Param1"`
 }
 
+type testStepReports struct {
+}
+
+func (p *testStepReports) persist(stepConfig testStepOptions, gcpJsonKeyFilePath string, gcsBucketId string, gcsFolderPath string, gcsSubFolder string) {
+	if gcsBucketId == "" {
+		log.Entry().Info("persisting reports to GCS is disabled, because gcsBucketId is empty")
+		return
+	}
+	log.Entry().Info("Uploading reports to Google Cloud Storage...")
+	content := []gcs.ReportOutputParam{
+		{FilePattern: "test-report_*.json", ParamRef: "", StepResultType: ""},
+		{FilePattern: "report1", ParamRef: "", StepResultType: "general"},
+	}
+
+	gcsClient, err := gcs.NewClient(gcpJsonKeyFilePath, "")
+	if err != nil {
+		log.Entry().Errorf("creation of GCS client failed: %v", err)
+		return
+	}
+	defer gcsClient.Close()
+	structVal := reflect.ValueOf(&stepConfig).Elem()
+	inputParameters := map[string]string{}
+	for i := 0; i < structVal.NumField(); i++ {
+		field := structVal.Type().Field(i)
+		if field.Type.String() == "string" {
+			paramName := strings.Split(field.Tag.Get("json"), ",")
+			paramValue, _ := structVal.Field(i).Interface().(string)
+			inputParameters[paramName[0]] = paramValue
+		}
+	}
+	if err := gcs.PersistReportsToGCS(gcsClient, content, inputParameters, gcsFolderPath, gcsBucketId, gcsSubFolder, piperutils.Glob, os.Stat); err != nil {
+		log.Entry().Errorf("failed to persist reports: %v", err)
+	}
+}
 
 type testStepCommonPipelineEnvironment struct {
 	artifactVersion string
-	git struct {
-		commitID string
-		branch string
+	git             struct {
+		commitID     string
+		headCommitID string
+		branch       string
 	}
 	custom struct {
 		customList []string
@@ -34,13 +79,14 @@ type testStepCommonPipelineEnvironment struct {
 }
 
 func (p *testStepCommonPipelineEnvironment) persist(path, resourceName string) {
-	content := []struct{
+	content := []struct {
 		category string
-		name string
-		value interface{}
+		name     string
+		value    any
 	}{
 		{category: "", name: "artifactVersion", value: p.artifactVersion},
 		{category: "git", name: "commitId", value: p.git.commitID},
+		{category: "git", name: "headCommitId", value: p.git.headCommitID},
 		{category: "git", name: "branch", value: p.git.branch},
 		{category: "custom", name: "customList", value: p.custom.customList},
 	}
@@ -54,7 +100,7 @@ func (p *testStepCommonPipelineEnvironment) persist(path, resourceName string) {
 		}
 	}
 	if errCount > 0 {
-		log.Entry().Fatal("failed to persist Piper environment")
+		log.Entry().Error("failed to persist Piper environment")
 	}
 }
 
@@ -70,14 +116,14 @@ type testStepInfluxTest struct {
 }
 
 func (i *testStepInfluxTest) persist(path, resourceName string) {
-	measurementContent := []struct{
+	measurementContent := []struct {
 		measurement string
 		valType     string
 		name        string
-		value       interface{}
+		value       any
 	}{
-		{valType: config.InfluxField, measurement: "m1" , name: "f1", value: i.m1.fields.f1},
-		{valType: config.InfluxTag, measurement: "m1" , name: "t1", value: i.m1.tags.t1},
+		{valType: config.InfluxField, measurement: "m1", name: "f1", value: i.m1.fields.f1},
+		{valType: config.InfluxTag, measurement: "m1", name: "t1", value: i.m1.tags.t1},
 	}
 
 	errCount := 0
@@ -89,10 +135,9 @@ func (i *testStepInfluxTest) persist(path, resourceName string) {
 		}
 	}
 	if errCount > 0 {
-		log.Entry().Fatal("failed to persist Influx environment")
+		log.Entry().Error("failed to persist Influx environment")
 	}
 }
-
 
 // TestStepCommand Test description
 func TestStepCommand() *cobra.Command {
@@ -101,51 +146,132 @@ func TestStepCommand() *cobra.Command {
 	metadata := testStepMetadata()
 	var stepConfig testStepOptions
 	var startTime time.Time
+	var reports testStepReports
 	var commonPipelineEnvironment testStepCommonPipelineEnvironment
 	var influxTest testStepInfluxTest
+	var logCollector *log.CollectorHook
+	var splunkClient *splunk.Splunk
+	telemetryClient := &telemetry.Telemetry{}
 
 	var createTestStepCmd = &cobra.Command{
-		Use:   STEP_NAME,
-		Short: "Test description",
-		Long: `Long Test description`,
+		Use:     STEP_NAME,
+		Aliases: []string{"testStepOldName"},
+		Short:   "Test description",
+		Long:    `Long Test description`,
 		PreRunE: func(cmd *cobra.Command, _ []string) error {
 			startTime = time.Now()
 			log.SetStepName(STEP_NAME)
 			log.SetVerbose(GeneralConfig.Verbose)
 
-			path, _ := os.Getwd()
+			GeneralConfig.GitHubAccessTokens = ResolveAccessTokens(GeneralConfig.GitHubTokens)
+
+			path, err := os.Getwd()
+			if err != nil {
+				return err
+			}
 			fatalHook := &log.FatalHook{CorrelationID: GeneralConfig.CorrelationID, Path: path}
 			log.RegisterHook(fatalHook)
 
-			err := PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
+			err = PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
 			if err != nil {
 				log.SetErrorCategory(log.ErrorConfiguration)
 				return err
 			}
+
+			// Set step error patterns for improved error detection
+			stepErrors := make([]log.StepError, len(metadata.Metadata.Errors))
+			for i, err := range metadata.Metadata.Errors {
+				stepErrors[i] = log.StepError{
+					Pattern:  err.Pattern,
+					Message:  err.Message,
+					Category: err.Category,
+				}
+			}
+			log.SetStepErrors(stepErrors)
 
 			if len(GeneralConfig.HookConfig.SentryConfig.Dsn) > 0 {
 				sentryHook := log.NewSentryHook(GeneralConfig.HookConfig.SentryConfig.Dsn, GeneralConfig.CorrelationID)
 				log.RegisterHook(&sentryHook)
 			}
 
+			if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 || len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+				splunkClient = &splunk.Splunk{}
+				logCollector = &log.CollectorHook{CorrelationID: GeneralConfig.CorrelationID}
+				log.RegisterHook(logCollector)
+			}
+
+			if err = log.RegisterANSHookIfConfigured(GeneralConfig.CorrelationID); err != nil {
+				log.Entry().WithError(err).Warn("failed to set up SAP Alert Notification Service log hook")
+			}
+
+			validation, err := validation.New(validation.WithJSONNamesForStructFields(), validation.WithPredefinedErrorMessages())
+			if err != nil {
+				return err
+			}
+			if err = validation.ValidateStruct(stepConfig); err != nil {
+				log.SetErrorCategory(log.ErrorConfiguration)
+				return err
+			}
+
 			return nil
 		},
 		Run: func(_ *cobra.Command, _ []string) {
-			telemetryData := telemetry.CustomData{}
-			telemetryData.ErrorCode = "1"
+			vaultClient := config.GlobalVaultClient()
+			var oidcTokenProvider func(string) (string, error)
+			if vaultClient != nil {
+				defer vaultClient.MustRevokeToken()
+				oidcTokenProvider = vaultClient.GetOIDCTokenByValidation
+			}
+
+			stepTelemetryData := telemetry.CustomData{
+				ErrorCode: "1",
+			}
 			handler := func() {
-				config.RemoveVaultSecretFiles()
+				reports.persist(stepConfig, GeneralConfig.GCPJsonKeyFilePath, GeneralConfig.GCSBucketId, GeneralConfig.GCSFolderPath, GeneralConfig.GCSSubFolder)
 				commonPipelineEnvironment.persist(GeneralConfig.EnvRootPath, "commonPipelineEnvironment")
 				influxTest.persist(GeneralConfig.EnvRootPath, "influxTest")
-				telemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
-				telemetryData.ErrorCategory = log.GetErrorCategory().String()
-				telemetry.Send(&telemetryData)
+				config.RemoveVaultSecretFiles()
+				stepTelemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
+				stepTelemetryData.ErrorCategory = log.GetErrorCategory().String()
+				stepTelemetryData.PiperCommitHash = GitCommit
+				telemetryClient.SetData(&stepTelemetryData)
+				telemetryClient.LogStepTelemetryData()
+				if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.Dsn,
+						GeneralConfig.HookConfig.SplunkConfig.Token,
+						GeneralConfig.HookConfig.SplunkConfig.Index,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblToken,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblIndex,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.GCPPubSubConfig.ProjectNumber) > 0 {
+					if err := eventing.PublishTaskRunFinishedEvent(
+						oidcTokenProvider,
+						&GeneralConfig,
+						eventing.EventContext{
+							StepName:   STEP_NAME,
+							StageName:  telemetryClient.GetData().StageName,
+							ErrorCode:  stepTelemetryData.ErrorCode,
+							PipelineID: telemetryClient.GetBuildURL(),
+						},
+					); err != nil {
+						log.Entry().WithError(err).Warn("failed to publish GCP Pub/Sub event")
+					}
+				}
 			}
 			log.DeferExitHandler(handler)
 			defer handler()
-			telemetry.Initialize(GeneralConfig.NoTelemetry, STEP_NAME)
-			testStep(stepConfig, &telemetryData, &commonPipelineEnvironment, &influxTest)
-			telemetryData.ErrorCode = "0"
+			telemetryClient.Initialize(STEP_NAME)
+			testStep(stepConfig, &stepTelemetryData, &commonPipelineEnvironment, &influxTest)
+			stepTelemetryData.ErrorCode = "0"
 			log.Entry().Info("SUCCESS")
 		},
 	}
@@ -157,70 +283,102 @@ func TestStepCommand() *cobra.Command {
 func addTestStepFlags(cmd *cobra.Command, stepConfig *testStepOptions) {
 	cmd.Flags().StringVar(&stepConfig.Param0, "param0", `val0`, "param0 description")
 	cmd.Flags().StringVar(&stepConfig.Param1, "param1", os.Getenv("PIPER_param1"), "param1 description")
-	cmd.Flags().StringVar(&stepConfig.Param2, "param2", os.Getenv("PIPER_param2"), "param1 description")
+	cmd.Flags().StringVar(&stepConfig.Param2, "param2", os.Getenv("PIPER_param2"), "param2 description")
+	cmd.Flags().StringVar(&stepConfig.Param3, "param3", os.Getenv("PIPER_param3"), "param3 description")
+	cmd.Flags().StringVar(&stepConfig.Param4, "param4", os.Getenv("PIPER_param4"), "param4 description")
 
 	cmd.MarkFlagRequired("param0")
-	cmd.MarkFlagRequired("param2")
+	cmd.Flags().MarkDeprecated("param1", "use param3 instead")
 }
 
 // retrieve step metadata
 func testStepMetadata() config.StepData {
 	var theMetaData = config.StepData{
 		Metadata: config.StepMetadata{
-			Name:    "testStep",
-			Aliases: []config.Alias{{Name: "testStepAlias", Deprecated: true},},
+			Name:        "testStep",
+			Aliases:     []config.Alias{{Name: "testStepAlias", Deprecated: true}},
 			Description: "Test description",
 		},
 		Spec: config.StepSpec{
 			Inputs: config.StepInputs{
 				Resources: []config.StepResources{
-					{Name: "stashName",Type: "stash",
-					},
+					{Name: "stashName", Type: "stash"},
 				},
 				Parameters: []config.StepParameters{
 					{
-						Name:      "param0",
+						Name:        "param0",
 						ResourceRef: []config.ResourceReference{},
-						Scope:     []string{"GENERAL","PARAMETERS",},
-						Type:      "string",
-						Mandatory: true,
-						Aliases:   []config.Alias{},
+						Scope:       []string{"GENERAL", "PARAMETERS"},
+						Type:        "string",
+						Mandatory:   true,
+						Aliases:     []config.Alias{{Name: "oldparam0"}},
+						Default:     `val0`,
 					},
 					{
-						Name:      "param1",
-						ResourceRef: []config.ResourceReference{},
-						Scope:     []string{"PARAMETERS",},
-						Type:      "string",
-						Mandatory: false,
-						Aliases:   []config.Alias{},
+						Name:               "param1",
+						ResourceRef:        []config.ResourceReference{},
+						Scope:              []string{"PARAMETERS"},
+						Type:               "string",
+						Mandatory:          false,
+						Aliases:            []config.Alias{{Name: "oldparam1", Deprecated: true}},
+						Default:            os.Getenv("PIPER_param1"),
+						DeprecationMessage: "use param3 instead",
 					},
 					{
-						Name:      "param2",
+						Name:        "param2",
 						ResourceRef: []config.ResourceReference{},
-						Scope:     []string{"PARAMETERS",},
-						Type:      "string",
-						Mandatory: true,
-						Aliases:   []config.Alias{},
+						Scope:       []string{"PARAMETERS"},
+						Type:        "string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_param2"),
+					},
+					{
+						Name:        "param3",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS"},
+						Type:        "string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_param3"),
+					},
+					{
+						Name:        "param4",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS"},
+						Type:        "string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_param4"),
 					},
 				},
 			},
 			Outputs: config.StepOutputs{
 				Resources: []config.StepResources{
 					{
+						Name: "reports",
+						Type: "reports",
+						Parameters: []map[string]any{
+							{"filePattern": "test-report_*.json", "subFolder": "sonarExecuteScan"},
+							{"filePattern": "report1", "type": "general"},
+						},
+					},
+					{
 						Name: "commonPipelineEnvironment",
 						Type: "piperEnvironment",
-						Parameters: []map[string]interface{}{
-							{"Name": "artifactVersion"},
-							{"Name": "git/commitId"},
-							{"Name": "git/branch"},
-							{"Name": "custom/customList"},
+						Parameters: []map[string]any{
+							{"name": "artifactVersion"},
+							{"name": "git/commitId"},
+							{"name": "git/headCommitId"},
+							{"name": "git/branch"},
+							{"name": "custom/customList", "type": "[]string"},
 						},
 					},
 					{
 						Name: "influxTest",
 						Type: "influx",
-						Parameters: []map[string]interface{}{
-							{"Name": "m1"},{"fields": []map[string]string{ {"name": "f1"}, } },{"tags": []map[string]string{ {"name": "t1"}, } },
+						Parameters: []map[string]any{
+							{"name": "m1", "fields": []map[string]string{{"name": "f1"}}, "tags": []map[string]string{{"name": "t1"}}},
 						},
 					},
 				},

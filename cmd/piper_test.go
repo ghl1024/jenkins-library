@@ -1,23 +1,34 @@
+//go:build unit
+
 package cmd
 
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/SAP/jenkins-library/pkg/log"
-
 	"github.com/SAP/jenkins-library/pkg/config"
+	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/mock"
-	"github.com/ghodss/yaml"
+	"github.com/SAP/jenkins-library/pkg/orchestrator"
+
 	"github.com/spf13/cobra"
 	flag "github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v3"
 )
+
+func resetEnv(e []string) {
+	for _, val := range e {
+		tmp := strings.Split(val, "=")
+		os.Setenv(tmp[0], tmp[1])
+	}
+}
 
 func TestAddRootFlags(t *testing.T) {
 	var testRootCmd = &cobra.Command{Use: "test", Short: "This is just a test"}
@@ -49,15 +60,16 @@ func TestAdoptStageNameFromParametersJSON(t *testing.T) {
 	for _, test := range tt {
 		t.Run(test.name, func(t *testing.T) {
 			// init
+			defer resetEnv(os.Environ())
+			os.Clearenv()
+			orchestrator.ResetConfigProvider()
+
+			//mock Jenkins env
+			os.Setenv("JENKINS_HOME", "anything")
+			require.NotEmpty(t, os.Getenv("JENKINS_HOME"))
+			os.Setenv("STAGE_NAME", test.stageNameEnv)
+
 			GeneralConfig.StageName = test.stageNameArg
-
-			resetValue := os.Getenv(stageNameEnvKey)
-			defer func() { _ = os.Setenv(stageNameEnvKey, resetValue) }()
-
-			err := os.Setenv(stageNameEnvKey, test.stageNameEnv)
-			if err != nil {
-				t.Fatalf("could not set env var %s", stageNameEnvKey)
-			}
 
 			if test.stageNameJSON != "" {
 				GeneralConfig.ParametersJSON = fmt.Sprintf("{\"stageName\":\"%s\"}", test.stageNameJSON)
@@ -152,20 +164,30 @@ func TestPrepareConfig(t *testing.T) {
 func TestRetrieveHookConfig(t *testing.T) {
 	tt := []struct {
 		hookJSON           []byte
-		expectedHookConfig HookConfiguration
+		expectedHookConfig config.HookConfiguration
 	}{
-		{hookJSON: []byte(""), expectedHookConfig: HookConfiguration{}},
-		{hookJSON: []byte(`{"sentry":{"dsn":"https://my.sentry.dsn"}}`), expectedHookConfig: HookConfiguration{SentryConfig: SentryConfiguration{Dsn: "https://my.sentry.dsn"}}},
+		{hookJSON: []byte(""), expectedHookConfig: config.HookConfiguration{}},
+		{hookJSON: []byte(`{"sentry":{"dsn":"https://my.sentry.dsn"}}`), expectedHookConfig: config.HookConfiguration{SentryConfig: config.SentryConfiguration{Dsn: "https://my.sentry.dsn"}}},
+		{hookJSON: []byte(`{"sentry":{"dsn":"https://my.sentry.dsn"}, "splunk":{"dsn":"https://my.splunk.dsn", "token": "mytoken", "index": "myindex", "sendLogs": true}}`),
+			expectedHookConfig: config.HookConfiguration{SentryConfig: config.SentryConfiguration{Dsn: "https://my.sentry.dsn"},
+				SplunkConfig: config.SplunkConfiguration{
+					Dsn:      "https://my.splunk.dsn",
+					Token:    "mytoken",
+					Index:    "myindex",
+					SendLogs: true,
+				},
+			},
+		},
 	}
 
 	for _, test := range tt {
-		var target HookConfiguration
-		var hookJSONRaw json.RawMessage
+		var target config.HookConfiguration
+		var hookJSONinterface map[string]interface{}
 		if len(test.hookJSON) > 0 {
-			err := json.Unmarshal(test.hookJSON, &hookJSONRaw)
+			err := json.Unmarshal(test.hookJSON, &hookJSONinterface)
 			assert.NoError(t, err)
 		}
-		retrieveHookConfig(&hookJSONRaw, &target)
+		retrieveHookConfig(hookJSONinterface, &target)
 		assert.Equal(t, test.expectedHookConfig, target)
 	}
 }
@@ -186,18 +208,18 @@ func TestGetProjectConfigFile(t *testing.T) {
 
 	for run, test := range tt {
 		t.Run(fmt.Sprintf("Run %v", run), func(t *testing.T) {
-			dir, err := ioutil.TempDir("", "")
-			defer os.RemoveAll(dir) // clean up
-			assert.NoError(t, err)
+			dir := t.TempDir()
 
 			if len(test.filesAvailable) > 0 {
 				configFolder := filepath.Join(dir, filepath.Dir(test.filesAvailable[0]))
-				err = os.MkdirAll(configFolder, 0700)
+				err := os.MkdirAll(configFolder, 0700)
 				assert.NoError(t, err)
 			}
 
 			for _, file := range test.filesAvailable {
-				ioutil.WriteFile(filepath.Join(dir, file), []byte("general:"), 0700)
+				if err := os.WriteFile(filepath.Join(dir, file), []byte("general:"), 0700); err != nil {
+					t.Fail()
+				}
 			}
 
 			assert.Equal(t, filepath.Join(dir, test.expected), getProjectConfigFile(filepath.Join(dir, test.filename)))
@@ -327,7 +349,7 @@ bar: 42
 		stepConfig["foo"] = "entry"
 
 		// Test
-		stepConfig = checkTypes(stepConfig, options)
+		_ = checkTypes(stepConfig, options)
 
 		// Assert
 		assert.True(t, hasFailed, "Expected checkTypes() to exit via logging framework")
@@ -475,5 +497,64 @@ bar: 42
 		assert.Equal(t, "", options.Foo)
 		assert.Contains(t, logBuffer.String(), "The value may be ignored as a result")
 		assert.False(t, hasFailed, "Expected checkTypes() NOT to exit via logging framework")
+	})
+}
+
+func TestResolveAccessTokens(t *testing.T) {
+	tt := []struct {
+		description      string
+		tokenList        []string
+		expectedTokenMap map[string]string
+	}{
+		{description: "empty tokens", tokenList: []string{}, expectedTokenMap: map[string]string{}},
+		{description: "invalid token", tokenList: []string{"onlyToken"}, expectedTokenMap: map[string]string{}},
+		{description: "one token", tokenList: []string{"github.com:token1"}, expectedTokenMap: map[string]string{"github.com": "token1"}},
+		{description: "more tokens", tokenList: []string{"github.com:token1", "github.corp:token2"}, expectedTokenMap: map[string]string{"github.com": "token1", "github.corp": "token2"}},
+	}
+
+	for _, test := range tt {
+		assert.Equal(t, test.expectedTokenMap, ResolveAccessTokens(test.tokenList), test.description)
+	}
+}
+
+func TestAccessTokensFromEnvJSON(t *testing.T) {
+	tt := []struct {
+		description       string
+		inputJSON         string
+		expectedTokenList []string
+	}{
+		{description: "empty ENV", inputJSON: "", expectedTokenList: []string{}},
+		{description: "invalid JSON", inputJSON: "{", expectedTokenList: []string{}},
+		{description: "empty JSON 1", inputJSON: "{}", expectedTokenList: []string{}},
+		{description: "empty JSON 2", inputJSON: "[]]", expectedTokenList: []string{}},
+		{description: "invalid JSON format", inputJSON: `{"test":"test"}`, expectedTokenList: []string{}},
+		{description: "one token", inputJSON: `["github.com:token1"]`, expectedTokenList: []string{"github.com:token1"}},
+		{description: "more tokens", inputJSON: `["github.com:token1","github.corp:token2"]`, expectedTokenList: []string{"github.com:token1", "github.corp:token2"}},
+	}
+
+	for _, test := range tt {
+		assert.Equal(t, test.expectedTokenList, AccessTokensFromEnvJSON(test.inputJSON), test.description)
+	}
+}
+
+func TestHelmBuildCobraAlias(t *testing.T) {
+	t.Run("helmExecute resolves as cobra alias for helmBuild", func(t *testing.T) {
+		cmd := HelmBuildCommand()
+		assert.Equal(t, "helmBuild", cmd.Use)
+		assert.Contains(t, cmd.Aliases, "helmExecute")
+	})
+
+	t.Run("helmBuild registered in rootCmd", func(t *testing.T) {
+		// Verify the root command can resolve both helmBuild and helmExecute
+		root := &cobra.Command{Use: "piper"}
+		root.AddCommand(HelmBuildCommand())
+
+		found, _, err := root.Find([]string{"helmBuild"})
+		assert.NoError(t, err)
+		assert.Equal(t, "helmBuild", found.Use)
+
+		found, _, err = root.Find([]string{"helmExecute"})
+		assert.NoError(t, err)
+		assert.Equal(t, "helmBuild", found.Use)
 	})
 }

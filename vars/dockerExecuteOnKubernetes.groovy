@@ -35,6 +35,7 @@ import hudson.AbortException
         'inheritFrom',
         'additionalPodProperties',
         'resources',
+        'annotations',
     /**
      * Set this to 'false' to bypass a docker image pull.
      * Useful during development process. Allows testing of images which are available in the local registry only.
@@ -58,7 +59,10 @@ import hudson.AbortException
      * as key and the corresponding value as value. The value can also be
      * a nested structure.
      * The properties will be added to the pod spec inside node `spec` at the
-     * same level like e.g. `containers`.
+     * same level like e.g. `containers`
+     * for eg., additionalPodProperties: [
+     *               imagePullSecrets: ['secret-name']
+     *        ]
      * This property provides some kind of an expert mode. Any property
      * which is not handled otherwise by the step can be set. It is not
      * possible to overwrite e.g. the `containers` property or to
@@ -72,6 +76,10 @@ import hudson.AbortException
      * really know what you are doing.
      */
     'additionalPodProperties',
+    /**
+    * Adds annotations in the metadata section of the PodSpec
+    */
+    'annotations',
     /**
      * Allows to specify start command for container created with dockerImage parameter to overwrite Piper default (`/usr/bin/tail -f /dev/null`).
      */
@@ -191,6 +199,22 @@ import hudson.AbortException
      * to the step call takes precedence.
      */
     'resources',
+    /**
+     * The path to which a volume should be mounted to. This volume will be available at the same
+     * mount path in each container of the provided containerMap. The volume is of type emptyDir
+     * and has the name 'volume'. With the additionalPodProperties parameter one can for example
+     * use this volume in an initContainer.
+     */
+    'containerMountPath',
+     /**
+     * The docker image to run as initContainer.
+     */
+    'initContainerImage',
+    /**
+     * Command executed inside the init container shell. Please enter command without providing any "sh -c" prefix. For example for an echo message, simply enter: echo `HelloWorld`
+     */
+    'initContainerCommand',
+
 ])
 @Field Set PARAMETER_KEYS = STEP_CONFIG_KEYS.minus([
     'stashIncludes',
@@ -230,12 +254,6 @@ void call(Map parameters = [:], body) {
             .mixin(parameters, PARAMETER_KEYS)
             .addIfEmpty('uniqueId', UUID.randomUUID().toString())
             .use()
-
-        utils.pushToSWA([
-            step         : STEP_NAME,
-            stepParamKey1: 'scriptMissing',
-            stepParam1   : parameters?.script == null
-        ], config)
 
         if (!config.containerMap && config.dockerImage) {
             config.containerName = 'container-exec'
@@ -284,8 +302,10 @@ void executeOnPod(Map config, utils, Closure body, Script script) {
     try {
         SidecarUtils sidecarUtils = new SidecarUtils(script)
         def stashContent = config.stashContent
+        boolean defaultStashCreated = false
         if (config.containerName && stashContent.isEmpty()) {
-            stashContent = [stashWorkspace(config, 'workspace')]
+            stashContent = [stashWorkspace(config, utils, 'workspace')]
+            defaultStashCreated = true
         }
         podTemplate(getOptions(config)) {
             node(config.uniqueId) {
@@ -301,11 +321,19 @@ void executeOnPod(Map config, utils, Closure body, Script script) {
                     container(containerParams) {
                         try {
                             utils.unstashAll(stashContent)
-                            echo "invalidate stash workspace-${config.uniqueId}"
-                            stash name: "workspace-${config.uniqueId}", excludes: '**/*', allowEmpty: true
-                            body()
+                            if (config.verbose) {
+                                lsDir('Directory content before body execution')
+                            }
+                            if (defaultStashCreated) {
+                                invalidateStash(config, 'workspace', utils)
+                            }
+                            def result = body()
+                            if (config.verbose) {
+                                lsDir('Directory content after body execution')
+                            }
+                            return result
                         } finally {
-                            stashWorkspace(config, 'container', true, true)
+                            stashWorkspace(config, utils, 'container', true, true)
                         }
                     }
                 } else {
@@ -315,29 +343,47 @@ void executeOnPod(Map config, utils, Closure body, Script script) {
         }
     } finally {
         if (config.containerName)
-            unstashWorkspace(config, 'container')
+            unstashWorkspace(config, utils, 'container')
     }
 }
 
+private void lsDir(String message) {
+  echo "[DEBUG] Begin of ${message}"
+  // some images might not contain the find command. In that case the build must not be aborted.
+  catchError (message: 'Cannot list directory content', buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+    // no -ls option since this is not available for some images
+    sh  'find . -mindepth 1 -maxdepth 2'
+  }
+  echo "[DEBUG] End of ${message}"
+}
+
 private String generatePodSpec(Map config) {
-    def containers = getContainerList(config)
     def podSpec = [
         apiVersion: "v1",
         kind      : "Pod",
         metadata  : [
-            lables: config.uniqueId
+            lables: config.uniqueId, // Should be fixed !
+            annotations: [:]
         ],
         spec      : [:]
     ]
+    podSpec.metadata.annotations = getAnnotations(config)
     podSpec.spec += getAdditionalPodProperties(config)
+    podSpec.spec.initContainers = getInitContainerList(config)
     podSpec.spec.containers = getContainerList(config)
     podSpec.spec.securityContext = getSecurityContext(config)
+
+    if (config.containerMountPath) {
+        podSpec.spec.volumes = [[
+                                    name    : "volume",
+                                    emptyDir: [:]
+                                ]]
+    }
 
     return new JsonUtils().groovyObjectToPrettyJsonString(podSpec)
 }
 
-
-private String stashWorkspace(config, prefix, boolean chown = false, boolean stashBack = false) {
+private String stashWorkspace(config, utils, prefix, boolean chown = false, boolean stashBack = false) {
     def stashName = "${prefix}-${config.uniqueId}"
     try {
         if (chown) {
@@ -350,6 +396,11 @@ chown -R ${runAsUser}:${fsGroup} ."""
 
         def includes, excludes
 
+        if (config.verbose) {
+            echo "stashIncludes config: ${config.stashIncludes}"
+            echo "stashExcludes config: ${config.stashExcludes}"
+        }
+
         if (stashBack) {
             includes = config.stashIncludes.stashBack ?: config.stashIncludes.workspace
             excludes = config.stashExcludes.stashBack ?: config.stashExcludes.workspace
@@ -358,13 +409,19 @@ chown -R ${runAsUser}:${fsGroup} ."""
             excludes = config.stashExcludes.workspace
         }
 
-        stash(
+        if (config.verbose) {
+            echo "stash effective (includes): ${includes}"
+            echo "stash effective (excludes): ${excludes}"
+        }
+
+        utils.stash(
             name: stashName,
             includes: includes,
             excludes: excludes,
             // 'true' by default due to negative side-effects, but can be overwritten via parameters
             // (as done by artifactPrepareVersion to preserve the .git folder)
             useDefaultExcludes: !config.stashNoDefaultExcludes,
+            allowEmpty: true
         )
         return stashName
     } catch (AbortException | IOException e) {
@@ -374,6 +431,10 @@ chown -R ${runAsUser}:${fsGroup} ."""
         throw e
     }
     return null
+}
+
+private Map getAnnotations(Map config){
+  return config.annotations ?: config.jenkinsKubernetes.annotations ?: [:]
 }
 
 private Map getAdditionalPodProperties(Map config) {
@@ -390,17 +451,47 @@ private Map getSecurityContext(Map config) {
     return config.securityContext ?: config.jenkinsKubernetes.securityContext ?: [:]
 }
 
-private void unstashWorkspace(config, prefix) {
+private void unstashWorkspace(config, utils, prefix) {
     try {
-        unstash "${prefix}-${config.uniqueId}"
-        echo "invalidate stash ${prefix}-${config.uniqueId}"
-        stash name: "${prefix}-${config.uniqueId}", excludes: '**/*', allowEmpty: true
+        utils.unstash "${prefix}-${config.uniqueId}"
     } catch (AbortException | IOException e) {
-        echo "${e.getMessage()}"
+        echo "${e.getMessage()}\n${e.getCause()}"
     } catch (Throwable e) {
         echo "Unstash workspace failed with throwable ${e.getMessage()}"
         throw e
+    } finally {
+        invalidateStash(config, prefix, utils)
     }
+}
+
+private List getInitContainerList(config){
+    def initContainerSpecList = []
+    if (config.initContainerImage && config.containerMountPath) {
+        // regex [\W_] matches any non-word character equivalent to [^a-zA-Z0-9_]
+        def initContainerName = config.initContainerImage.toLowerCase().replaceAll(/[\W_]/,"-" )
+        def initContainerSpec = [
+            name           : initContainerName,
+            image          : config.initContainerImage
+            ]
+        if (config.containerMountPath) {
+            initContainerSpec.volumeMounts = [[name: "volume", mountPath: config.containerMountPath]]
+        }
+        if (config.initContainerCommand == null) {
+            initContainerSpec['command'] = [
+                '/usr/bin/tail',
+                '-f',
+                '/dev/null'
+            ]
+        } else {
+            initContainerSpec['command'] = [
+                'sh',
+                '-c',
+                config.initContainerCommand
+            ]
+        }
+        initContainerSpecList.push(initContainerSpec)
+    }
+    return initContainerSpecList
 }
 
 private List getContainerList(config) {
@@ -433,6 +524,9 @@ private List getContainerList(config) {
             imagePullPolicy: pullImage ? "Always" : "IfNotPresent",
             env            : getContainerEnvs(config, imageName, config.dockerEnvVars, config.dockerWorkspace)
         ]
+        if (config.containerMountPath) {
+            containerSpec.volumeMounts = [[name: "volume", mountPath: config.containerMountPath]]
+        }
 
         def configuredCommand = config.containerCommands?.get(imageName)
         def shell = config.containerShell ?: '/bin/sh'
@@ -481,10 +575,12 @@ private List getContainerList(config) {
             env            : getContainerEnvs(config, config.sidecarImage, config.sidecarEnvVars, config.sidecarWorkspace),
             command        : []
         ]
-
         def resources = getResources(sideCarContainerName, config)
-        if(resources) {
+        if (resources) {
             containerSpec.resources = resources
+        }
+        if (config.containerMountPath) {
+            containerSpec.volumeMounts = [[name: "volume", mountPath: config.containerMountPath]]
         }
         result.push(containerSpec)
     }
@@ -541,4 +637,10 @@ private List getContainerEnvs(config, imageName, defaultEnvVars, defaultConfig) 
     }
 
     return containerEnv
+}
+
+private void invalidateStash(def config, String prefix, def utils) {
+    String name = "${prefix}-${config.uniqueId}"
+    echo "invalidate stash ${name}"
+    utils.stash name: name, excludes: '**/*', allowEmpty: true
 }

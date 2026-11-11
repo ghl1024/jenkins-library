@@ -3,16 +3,17 @@ package maven
 import (
 	"bytes"
 	"fmt"
-	"github.com/SAP/jenkins-library/pkg/command"
-	piperhttp "github.com/SAP/jenkins-library/pkg/http"
-	"github.com/SAP/jenkins-library/pkg/piperutils"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
+	"github.com/SAP/jenkins-library/pkg/command"
+	piperhttp "github.com/SAP/jenkins-library/pkg/http"
 	"github.com/SAP/jenkins-library/pkg/log"
+	"github.com/SAP/jenkins-library/pkg/piperutils"
 )
 
 // ExecuteOptions are used by Execute() to construct the Maven command line.
@@ -48,6 +49,8 @@ type Utils interface {
 	FileExists(filename string) (bool, error)
 	Copy(src, dest string) (int64, error)
 	MkdirAll(path string, perm os.FileMode) error
+	FileWrite(path string, content []byte, perm os.FileMode) error
+	FileRead(path string) ([]byte, error)
 }
 
 type utilsBundle struct {
@@ -117,6 +120,30 @@ func Evaluate(options *EvaluateOptions, expression string, utils Utils) (string,
 		return "", fmt.Errorf("expression '%s' in file '%s' could not be resolved", expression, options.PomPath)
 	}
 	return value, nil
+}
+
+func InstallModuleWithReactor(moduleName string, options *EvaluateOptions, utils Utils) error {
+	var defines = options.Defines
+
+	if !slices.Contains(defines, "-DskipTests") {
+		defines = append(defines, "-DskipTests")
+	}
+
+	mavenOptionsInstall := ExecuteOptions{
+		Goals:               []string{"install"},
+		Flags:               []string{"-pl", moduleName, "-am"},
+		Defines:             defines,
+		M2Path:              options.M2Path,
+		ProjectSettingsFile: options.ProjectSettingsFile,
+		GlobalSettingsFile:  options.GlobalSettingsFile,
+	}
+
+	_, err := Execute(&mavenOptionsInstall, utils)
+	if err != nil {
+		return fmt.Errorf("failed to install maven artifacts: %w", err)
+	}
+
+	return nil
 }
 
 // InstallFile installs a maven artifact and its pom into the local maven repository.

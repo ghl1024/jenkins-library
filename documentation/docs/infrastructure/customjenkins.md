@@ -1,9 +1,5 @@
 # Custom Jenkins Setup
 
-Although we recommend using the Cx Server, you can also run project "Piper" on your own Jenkins installation. In this case, however, you have to care for some settings the Cx Server gives you for free. Also, the support of non-Cx Server installations is challenging.
-
-This section describes the adjustments that might be necessary.
-
 ## Requirements
 
 * You have installed Java Runtime Environment 8.
@@ -28,31 +24,17 @@ docker run ...  -v /var/run/docker.sock:/var/run/docker.sock ...
 
 Project "Piper" requires a set of plugins installed on your Jenkins server. This set may evolve in the future. Make sure that all plugins of the appropriate versions are installed.
 
-The Cx server repository contains an [up-to-date list][devops-cxs-plugins] of the required plugins. To ease the installation, download the list with the following command and use the [Jenkins client][jenkins-doc-client]:
-
-```
-curl -o plugins.txt https://raw.githubusercontent.com/SAP/devops-docker-cx-server/master/jenkins-master/plugins.txt
-```
-
-On the Jenkins server, run the following command with a user that has administration rights:
-
-```
-cat plugins.txt | awk '{system("java " "-jar jenkins-cli.jar -s http://localhost:8080 -auth ${ADM_USER}:${ADM_PASSWD} install-plugin " $1)}'
-```
-
 ## Shared Library
 
 Shared libraries extending the Jenkins pipeline are defined within the Jenkins system configuration. A library is defined by a link to its source repository and an appropriate version identifier. To add the project "Piper"s library, execute the following steps:
 
 1. Open the Jenkins UI under `http://<jenkins-server-address>:<http-port>`, login with administration privileges, and choose **Manage Jenkins > Configure System**.
-   <p align="center">
-   ![Configure System](../images/JenkinsHomeMenuManageConfig.png "Configure System")
-   </p>
+
+    ![Configure System](../images/JenkinsHomeMenuManageConfig.png "Configure System")
 
 1. Scroll down to section **Global Pipeline Libraries** and choose the **Add** button. A new library is created.
-   <p align="center">
-   ![Add Library](../images/JenkinsConfigSystemLibrary-Add.png "Add Library")
-   </p>
+
+    ![Add Library](../images/JenkinsConfigSystemLibrary-Add.png "Add Library")
 
 1. For **Library Name**, enter `piper-lib-os`.
 
@@ -63,9 +45,8 @@ Shared libraries extending the Jenkins pipeline are defined within the Jenkins s
 1. For **Source Code Management**, choose **Git**.
 
 1. For **Project Repository**, enter the GitHub URL of the project Piper shared library `https://github.com/SAP/jenkins-library`.
-   <p align="center">
-   ![Library Setup](../images/JenkinsConfigSystemLibrary-Edit.png "Library Setup")
-   </p>
+
+    ![Library Setup](../images/JenkinsConfigSystemLibrary-Edit.png "Library Setup")
 
 1. Save your changes.
 
@@ -107,10 +88,5 @@ If you face such a [user permission issue][piper-issue-781], choose between the 
 [docker-install]: https://docs.docker.com/install
 [dockerhub-node]: https://hub.docker.com/_/node/
 [docker-getstarted]: https://docs.docker.com/get-started/
-[jenkins-doc-client]: https://jenkins.io/doc/book/managing/cli/
 [jenkins-docker-image]: https://github.com/jenkinsci/docker/
-[piper-library-pages]: https://sap.github.io/jenkins-library
 [piper-issue-781]: https://github.com/SAP/jenkins-library/issues/781
-
-[devops-docker-images]: https://github.com/SAP/devops-docker-images
-[devops-cxs-plugins]: https://github.com/SAP/devops-docker-cx-server/blob/master/jenkins-master/plugins.txt

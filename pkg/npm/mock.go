@@ -1,4 +1,4 @@
-// +build !release
+//go:build !release
 
 package npm
 
@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/SAP/jenkins-library/pkg/mock"
+	"github.com/SAP/jenkins-library/pkg/versioning"
 )
 
 // NpmMockUtilsBundle for mocking
@@ -118,5 +119,10 @@ func (n *NpmExecutorMock) SetNpmRegistries() error {
 
 // CreateBOM mock implementation
 func (n *NpmExecutorMock) CreateBOM(packageJSONFiles []string) error {
+	return nil
+}
+
+// CreateBOM mock implementation
+func (n *NpmExecutorMock) PublishAllPackages(packageJSONFiles []string, registry, username, password, publishTag string, packBeforePublish bool, buildCoordinates *[]versioning.Coordinates) error {
 	return nil
 }

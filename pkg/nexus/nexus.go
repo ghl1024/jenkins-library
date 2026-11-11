@@ -3,8 +3,10 @@ package nexus
 import (
 	"errors"
 	"fmt"
-	"github.com/SAP/jenkins-library/pkg/log"
+	"slices"
 	"strings"
+
+	"github.com/SAP/jenkins-library/pkg/log"
 )
 
 // ArtifactDescription describes a single artifact that can be uploaded to a Nexus repository manager.
@@ -69,8 +71,8 @@ func getBaseURL(nexusURL, nexusVersion, repository string) (string, error) {
 	nexusURL = strings.ToLower(nexusURL)
 	var protocols = []string{"http://", "https://"}
 	for _, protocol := range protocols {
-		if strings.HasPrefix(nexusURL, protocol) {
-			nexusURL = strings.TrimPrefix(nexusURL, protocol)
+		if after, ok := strings.CutPrefix(nexusURL, protocol); ok {
+			nexusURL = after
 			break
 		}
 	}
@@ -199,12 +201,7 @@ func validateArtifact(artifact ArtifactDescription) error {
 }
 
 func (nexusUpload *Upload) containsArtifact(artifact ArtifactDescription) bool {
-	for _, n := range nexusUpload.artifacts {
-		if artifact == n {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(nexusUpload.artifacts, artifact)
 }
 
 // GetArtifacts returns a copy of the artifact descriptions array stored in the Upload.

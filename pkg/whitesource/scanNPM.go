@@ -3,15 +3,16 @@ package whitesource
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/SAP/jenkins-library/pkg/log"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/SAP/jenkins-library/pkg/log"
 )
 
 const whiteSourceConfig = "whitesource.config.json"
 
-func setValueAndLogChange(config map[string]interface{}, key string, value interface{}) {
+func setValueAndLogChange(config map[string]any, key string, value any) {
 	oldValue, exists := config[key]
 	if exists && oldValue != value {
 		log.Entry().Infof("overwriting '%s' in %s: %v -> %v", key, whiteSourceConfig, oldValue, value)
@@ -19,7 +20,7 @@ func setValueAndLogChange(config map[string]interface{}, key string, value inter
 	config[key] = value
 }
 
-func setValueOmitIfPresent(config map[string]interface{}, key, omitIfPresent string, value interface{}) {
+func setValueOmitIfPresent(config map[string]any, key, omitIfPresent string, value any) {
 	_, exists := config[omitIfPresent]
 	if exists {
 		return
@@ -30,7 +31,7 @@ func setValueOmitIfPresent(config map[string]interface{}, key, omitIfPresent str
 // writeWhitesourceConfigJSON creates or merges the file whitesource.config.json in the current
 // directory from the given NPMScanOptions.
 func (s *Scan) writeWhitesourceConfigJSON(config *ScanOptions, utils Utils, devDep, ignoreLsErrors bool) error {
-	var npmConfig = make(map[string]interface{})
+	var npmConfig = make(map[string]any)
 
 	exists, _ := utils.FileExists(whiteSourceConfig)
 	if exists {
@@ -64,6 +65,7 @@ func (s *Scan) writeWhitesourceConfigJSON(config *ScanOptions, utils Utils, devD
 		setValueAndLogChange(npmConfig, "projectName", config.ProjectName)
 	}
 	setValueAndLogChange(npmConfig, "devDep", devDep)
+	setValueAndLogChange(npmConfig, "includeDevDependencies", config.NpmIncludeDevDependencies)
 	setValueAndLogChange(npmConfig, "ignoreNpmLsErrors", ignoreLsErrors)
 
 	jsonBuffer, err := json.Marshal(npmConfig)
@@ -80,6 +82,8 @@ func (s *Scan) writeWhitesourceConfigJSON(config *ScanOptions, utils Utils, devD
 
 // ExecuteNpmScan iterates over all found npm modules and performs a scan in each one.
 func (s *Scan) ExecuteNpmScan(config *ScanOptions, utils Utils) error {
+	s.AgentName = "WhiteSource NPM Plugin"
+	s.AgentVersion = "unknown"
 	modules, err := utils.FindPackageJSONFiles(config)
 	if err != nil {
 		return fmt.Errorf("failed to find package.json files with excludes: %w", err)
@@ -146,8 +150,11 @@ func getNpmProjectName(modulePath string, utils Utils) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("could not read %s: %w", modulePath, err)
 	}
-	var packageJSON = make(map[string]interface{})
+	var packageJSON = make(map[string]any)
 	err = json.Unmarshal(fileContents, &packageJSON)
+	if err != nil {
+		return "", fmt.Errorf("failed to unmarshall the file '%s': %w", modulePath, err)
+	}
 
 	projectNameEntry, exists := packageJSON["name"]
 	if !exists {
@@ -172,7 +179,7 @@ func getNpmProjectName(modulePath string, utils Utils) (string, error) {
 // is used for whitesourceExecuteScan due to a different docker image being used compared to the build stage.
 func reinstallNodeModulesIfLsFails(config *ScanOptions, utils Utils) error {
 	// No need to have output from "npm ls" in the log
-	utils.Stdout(ioutil.Discard)
+	utils.Stdout(io.Discard)
 	defer utils.Stdout(log.Writer())
 
 	err := utils.RunExecutable("npm", "ls")

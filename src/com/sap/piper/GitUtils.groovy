@@ -4,6 +4,20 @@ boolean insideWorkTree() {
     return sh(returnStatus: true, script: 'git rev-parse --is-inside-work-tree 1>/dev/null 2>&1') == 0
 }
 
+boolean isMergeCommit() throws MissingPropertyException{
+    for (def extension : scm.getExtensions()) {
+        if(extension instanceof jenkins.plugins.git.MergeWithGitSCMExtension){
+            return true;
+        }
+    }
+
+    return false;
+}
+
+String getMergeCommitSha() throws MissingPropertyException{
+    return pullRequest.mergeCommitSha
+}
+
 boolean isWorkTreeDirty() {
 
     if(!insideWorkTree()) error 'Method \'isWorkTreeClean\' called outside a git work tree.'
@@ -76,7 +90,7 @@ static String handleTestRepository(Script steps, Map config){
     // checkout test repository
     steps.git options
     // stash test content
-    steps.stash stashName
+    steps.stash stashName //TODO: should use new Utils().stash
     // return stash name
     return stashName
 }

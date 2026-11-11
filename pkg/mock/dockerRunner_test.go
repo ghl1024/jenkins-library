@@ -1,11 +1,15 @@
+//go:build unit
+// +build unit
+
 package mock
 
 import (
 	"errors"
 	"fmt"
-	"github.com/stretchr/testify/assert"
 	"os"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestDockerExecRunnerAddExecConfig(t *testing.T) {

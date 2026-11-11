@@ -1,67 +1,87 @@
+//go:build integration
 // +build integration
-// can be execute with go test -tags=integration ./integration/...
+
+// can be executed with
+// go test -v -tags integration -run TestMavenIntegration ./integration/...
 
 package main
 
 import (
 	"testing"
+
+	"github.com/SAP/jenkins-library/pkg/piperutils"
 )
 
-func TestMavenBuildCloudSdkSpringProject(t *testing.T) {
-	container := givenThisContainer(t, IntegrationTestDockerExecRunnerBundle{
-		Image:   "maven:3-openjdk-8-slim",
-		User:    "1000",
-		TestDir: []string{"testdata", "TestMavenIntegration", "cloud-sdk-spring-archetype"},
-		Mounts:  map[string]string{},
-		Setup:   []string{},
+const DOCKER_IMAGE_MAVEN = "maven:3-openjdk-8-slim"
+
+func TestMavenIntegrationBuildCloudSdkSpringProject(t *testing.T) {
+	t.Parallel()
+	assert := NewContainerAssert(t)
+
+	container := StartPiperContainer(t, ContainerConfig{
+		Image:    DOCKER_IMAGE_MAVEN,
+		TestData: "TestMavenIntegration/cloud-sdk-spring-archetype",
+		WorkDir:  "/cloud-sdk-spring-archetype",
 	})
 
-	err := container.whenRunningPiperCommand("mavenBuild", "")
-	if err != nil {
-		t.Fatalf("Calling piper command failed %s", err)
-	}
+	output := RunPiper(t, container, "/cloud-sdk-spring-archetype", "mavenBuild")
+	assert.Contains(output, "BUILD SUCCESS")
 
-	container.assertHasOutput(t, "BUILD SUCCESS")
-	container.assertHasFile(t, "/project/application/target/cloud-sdk-spring-archetype-application.jar")
-	container.assertHasFile(t, "/tmp/.m2/repository")
+	assert.FileExists(container,
+		"/cloud-sdk-spring-archetype/application/target/cloud-sdk-spring-archetype-application.jar",
+		"/tmp/.m2/repository",
+	)
 
-	err = container.whenRunningPiperCommand("mavenExecuteIntegration", "")
-	if err != nil {
-		t.Fatalf("Calling piper command failed %s", err)
-	}
+	output = RunPiper(t, container, "/cloud-sdk-spring-archetype", "mavenExecuteIntegration")
+	assert.Contains(output, "INFO mydemo.HelloWorldControllerTest - Starting HelloWorldControllerTest")
+	assert.Contains(output, "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0")
 
-	container.assertHasOutput(t, "INFO mydemo.HelloWorldControllerTest - Starting HelloWorldControllerTest")
-	container.assertHasOutput(t, "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0")
-
-	container.assertHasFile(t, "/project/integration-tests/target/coverage-reports/jacoco.exec")
+	assert.FileExists(container, "/cloud-sdk-spring-archetype/integration-tests/target/coverage-reports/jacoco.exec")
 }
 
-func TestMavenBuildCloudSdkTomeeProject(t *testing.T) {
-	container := givenThisContainer(t, IntegrationTestDockerExecRunnerBundle{
-		Image:   "maven:3-openjdk-8-slim",
-		User:    "1000",
-		TestDir: []string{"testdata", "TestMavenIntegration", "cloud-sdk-tomee-archetype"},
-		Mounts:  map[string]string{},
-		Setup:   []string{},
+func TestMavenIntegrationBuildCloudSdkTomeeProject(t *testing.T) {
+	t.Parallel()
+	assert := NewContainerAssert(t)
+
+	container := StartPiperContainer(t, ContainerConfig{
+		Image:    DOCKER_IMAGE_MAVEN,
+		TestData: "TestMavenIntegration/cloud-sdk-tomee-archetype",
+		WorkDir:  "/cloud-sdk-tomee-archetype",
 	})
 
-	err := container.whenRunningPiperCommand("mavenBuild", "")
-	if err != nil {
-		t.Fatalf("Calling piper command failed %s", err)
-	}
+	output := RunPiper(t, container, "/cloud-sdk-tomee-archetype", "mavenBuild")
+	assert.Contains(output, "BUILD SUCCESS")
 
-	container.assertHasOutput(t, "BUILD SUCCESS")
-	container.assertHasFile(t, "/project/application/target/cloud-sdk-tomee-archetype-application-classes.jar")
-	container.assertHasFile(t, "/project/application/target/cloud-sdk-tomee-archetype-application.war")
-	container.assertHasFile(t, "/tmp/.m2/repository")
+	assert.FileExists(container,
+		"/cloud-sdk-tomee-archetype/application/target/cloud-sdk-tomee-archetype-application-classes.jar",
+		"/cloud-sdk-tomee-archetype/application/target/cloud-sdk-tomee-archetype-application.war",
+		"/tmp/.m2/repository",
+	)
 
-	err = container.whenRunningPiperCommand("mavenExecuteIntegration", "")
-	if err != nil {
-		t.Fatalf("Calling piper command failed %s", err)
-	}
+	output = RunPiper(t, container, "/cloud-sdk-tomee-archetype", "mavenExecuteIntegration")
+	assert.Contains(output, "(prepare-agent) @ cloud-sdk-tomee-archetype-integration-tests")
+	assert.Contains(output, "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0")
 
-	container.assertHasOutput(t, "(prepare-agent) @ cloud-sdk-tomee-archetype-integration-tests")
-	container.assertHasOutput(t, "Tests run: 1, Failures: 0, Errors: 0, Skipped: 0")
+	assert.FileExists(container, "/cloud-sdk-tomee-archetype/integration-tests/target/coverage-reports/jacoco.exec")
+}
 
-	container.assertHasFile(t, "/project/integration-tests/target/coverage-reports/jacoco.exec")
+func TestMavenIntegrationBuildWithBOMValidation(t *testing.T) {
+	t.Parallel()
+	assert := NewContainerAssert(t)
+
+	container := StartPiperContainer(t, ContainerConfig{
+		Image:    DOCKER_IMAGE_MAVEN,
+		TestData: "TestMavenIntegration/cloud-sdk-spring-archetype",
+		WorkDir:  "/cloud-sdk-spring-archetype",
+	})
+
+	output := RunPiper(t, container, "/cloud-sdk-spring-archetype", "mavenBuild")
+	assert.Contains(output, "BUILD SUCCESS")
+
+	assert.FileExists(container, "/cloud-sdk-spring-archetype/target/bom-maven.xml")
+
+	// Read BOM content and validate
+	bomContent := ReadFile(t, container, "/cloud-sdk-spring-archetype/target/bom-maven.xml")
+	err := piperutils.ValidateBOM(bomContent)
+	assert.NoError(err, "BOM validation should pass for Maven project")
 }

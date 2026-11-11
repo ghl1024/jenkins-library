@@ -71,35 +71,6 @@ class NpmExecuteEndToEndTestsTest extends BasePiperTest {
     }
 
     @Test
-    void noAppUrl() {
-        thrown.expect(hudson.AbortException)
-        thrown.expectMessage('[npmExecuteEndToEndTests] The execution failed, since no appUrls are defined. Please provide appUrls as a list of maps.')
-
-        stepRule.step.npmExecuteEndToEndTests(
-            script: nullScript,
-            stageName: "myStage",
-            runScript: "ci-e2e"
-        )
-    }
-
-    @Test
-    void noRunScript() {
-        def appUrl = [url: "http://my-url.com"]
-
-        nullScript.commonPipelineEnvironment.configuration = [stages: [myStage:[
-            appUrls: [appUrl]
-        ]]]
-
-        thrown.expect(hudson.AbortException)
-        thrown.expectMessage('[npmExecuteEndToEndTests] No runScript was defined.')
-
-        stepRule.step.npmExecuteEndToEndTests(
-            script: nullScript,
-            stageName: "myStage"
-        )
-    }
-
-    @Test
     void appUrlsNoList() {
         def appUrl = "http://my-url.com"
 
@@ -112,8 +83,7 @@ class NpmExecuteEndToEndTestsTest extends BasePiperTest {
 
         stepRule.step.npmExecuteEndToEndTests(
             script: nullScript,
-            stageName: "myStage",
-            runScript: "ci-e2e"
+            stageName: "myStage"
         )
     }
 
@@ -130,8 +100,7 @@ class NpmExecuteEndToEndTestsTest extends BasePiperTest {
 
         stepRule.step.npmExecuteEndToEndTests(
             script: nullScript,
-            stageName: "myStage",
-            runScript: "ci-e2e"
+            stageName: "myStage"
         )
     }
 
@@ -148,8 +117,7 @@ class NpmExecuteEndToEndTestsTest extends BasePiperTest {
 
         stepRule.step.npmExecuteEndToEndTests(
             script: nullScript,
-            stageName: "myStage",
-            runScript: "ci-e2e"
+            stageName: "myStage"
         )
     }
 
@@ -163,8 +131,7 @@ class NpmExecuteEndToEndTestsTest extends BasePiperTest {
 
         stepRule.step.npmExecuteEndToEndTests(
             script: nullScript,
-            stageName: "myStage",
-            runScript: "ci-e2e"
+            stageName: "myStage"
         )
 
         assertFalse(executedInParallel)
@@ -173,6 +140,162 @@ class NpmExecuteEndToEndTestsTest extends BasePiperTest {
         assert npmExecuteScriptsRule.hasParameter('virtualFrameBuffer', true)
         assert npmExecuteScriptsRule.hasParameter('runScripts', ["ci-e2e"])
         assert npmExecuteScriptsRule.hasParameter('scriptOptions', ["--launchUrl=${appUrl.url}"])
+    }
+
+    @Test
+    void baseUrl() {
+
+        nullScript.commonPipelineEnvironment.configuration = [
+                stages: [
+                        myStage: [
+                            baseUrl: "http://my-url.com"
+                        ]
+                ]
+        ]
+
+        stepRule.step.npmExecuteEndToEndTests(
+                script: nullScript,
+                stageName: "myStage"
+        )
+
+        assertFalse(executedInParallel)
+        assert npmExecuteScriptsRule.hasParameter('script', nullScript)
+        assert npmExecuteScriptsRule.hasParameter('parameters', [dockerOptions: ['--shm-size 512MB']])
+        assert npmExecuteScriptsRule.hasParameter('virtualFrameBuffer', true)
+        assert npmExecuteScriptsRule.hasParameter('runScripts', ["ci-e2e"])
+        assert npmExecuteScriptsRule.hasParameter('scriptOptions', ["--baseUrl=http://my-url.com"])
+    }
+
+    @Test
+    void oneAppUrl__whenWdi5IsTrue__wdi5CredentialIsProvided() {
+        def appUrl = [url: "http://my-url.com", credentialId: "testCred"]
+
+        nullScript.commonPipelineEnvironment.configuration = [stages: [myStage:[
+            appUrls: [appUrl],
+            wdi5: true
+        ]]]
+
+        stepRule.step.npmExecuteEndToEndTests(
+            script: nullScript,
+            stageName: "myStage"
+        )
+
+        assertFalse(executedInParallel)
+        assert npmExecuteScriptsRule.hasParameter('script', nullScript)
+        assert npmExecuteScriptsRule.hasParameter('parameters', [dockerOptions: ['--shm-size 512MB']])
+        assert npmExecuteScriptsRule.hasParameter('virtualFrameBuffer', true)
+        assert npmExecuteScriptsRule.hasParameter('runScripts', ["ci-e2e"])
+        assert npmExecuteScriptsRule.hasParameter('scriptOptions', ["--launchUrl=${appUrl.url}"])
+        assert binding.hasVariable('e2e_username')
+        assert binding.hasVariable('e2e_password')
+        assert binding.hasVariable('wdi5_username')
+        assert binding.hasVariable('wdi5_password')
+    }
+
+    @Test
+    void oneAppUrl__whenWdi5IsNotSet__noWdi5CredentialIsProvided() {
+        def appUrl = [url: "http://my-url.com", credentialId: "testCred"]
+
+        nullScript.commonPipelineEnvironment.configuration = [stages: [myStage:[
+            appUrls: [appUrl]
+        ]]]
+
+        stepRule.step.npmExecuteEndToEndTests(
+            script: nullScript,
+            stageName: "myStage"
+        )
+
+        assertFalse(executedInParallel)
+        assert npmExecuteScriptsRule.hasParameter('script', nullScript)
+        assert npmExecuteScriptsRule.hasParameter('parameters', [dockerOptions: ['--shm-size 512MB']])
+        assert npmExecuteScriptsRule.hasParameter('virtualFrameBuffer', true)
+        assert npmExecuteScriptsRule.hasParameter('runScripts', ["ci-e2e"])
+        assert npmExecuteScriptsRule.hasParameter('scriptOptions', ["--launchUrl=${appUrl.url}"])
+        assert binding.hasVariable('e2e_username')
+        assert binding.hasVariable('e2e_password')
+        assertFalse binding.hasVariable('wdi5_username')
+        assertFalse binding.hasVariable('wdi5_password')
+    }
+
+    @Test
+    void whenWdi5IsTrue__wdi5CredentialIsProvided() {
+
+        nullScript.commonPipelineEnvironment.configuration = [
+                stages: [
+                        myStage: [
+                            wdi5: true,
+                            credentialsId: "testCred"
+                        ]
+                ]
+        ]
+
+        stepRule.step.npmExecuteEndToEndTests(
+                script: nullScript,
+                stageName: "myStage"
+        )
+
+        assertFalse(executedInParallel)
+        assert npmExecuteScriptsRule.hasParameter('script', nullScript)
+        assert npmExecuteScriptsRule.hasParameter('parameters', [dockerOptions: ['--shm-size 512MB']])
+        assert npmExecuteScriptsRule.hasParameter('virtualFrameBuffer', true)
+        assert npmExecuteScriptsRule.hasParameter('runScripts', ["ci-e2e"])
+        assert binding.hasVariable('e2e_username')
+        assert binding.hasVariable('e2e_password')
+        assert binding.hasVariable('wdi5_username')
+        assert binding.hasVariable('wdi5_password')
+
+    }
+
+    @Test
+    void whenWdi5IsNotSet__noWdi5CredentialIsProvided() {
+
+        nullScript.commonPipelineEnvironment.configuration = [
+                stages: [
+                        myStage: [
+                            credentialsId: "testCred"
+                        ]
+                ]
+        ]
+
+        stepRule.step.npmExecuteEndToEndTests(
+                script: nullScript,
+                stageName: "myStage"
+        )
+
+        assertFalse(executedInParallel)
+        assert npmExecuteScriptsRule.hasParameter('script', nullScript)
+        assert npmExecuteScriptsRule.hasParameter('parameters', [dockerOptions: ['--shm-size 512MB']])
+        assert npmExecuteScriptsRule.hasParameter('virtualFrameBuffer', true)
+        assert npmExecuteScriptsRule.hasParameter('runScripts', ["ci-e2e"])
+        assert binding.hasVariable('e2e_username')
+        assert binding.hasVariable('e2e_password')
+        assertFalse binding.hasVariable('wdi5_username')
+        assertFalse binding.hasVariable('wdi5_password')
+
+    }
+
+    @Test
+    void chooseScript() {
+
+        nullScript.commonPipelineEnvironment.configuration = [
+                stages: [
+                        myStage: [
+                                runScript: "wdio"
+                        ]
+                ]
+        ]
+
+        stepRule.step.npmExecuteEndToEndTests(
+                script: nullScript,
+                stageName: "myStage"
+        )
+
+        assertFalse(executedInParallel)
+        assert npmExecuteScriptsRule.hasParameter('script', nullScript)
+        assert npmExecuteScriptsRule.hasParameter('parameters', [dockerOptions: ['--shm-size 512MB']])
+        assert npmExecuteScriptsRule.hasParameter('virtualFrameBuffer', true)
+        assert npmExecuteScriptsRule.hasParameter('runScripts', ["wdio"])
+        assert npmExecuteScriptsRule.hasParameter('scriptOptions', [])
     }
 
     @Test
@@ -185,8 +308,7 @@ class NpmExecuteEndToEndTestsTest extends BasePiperTest {
 
         stepRule.step.npmExecuteEndToEndTests(
             script: nullScript,
-            stageName: "myStage",
-            runScript: "ci-e2e"
+            stageName: "myStage"
         )
 
         assert npmExecuteScriptsRule.hasParameter('script', nullScript)
@@ -207,8 +329,7 @@ class NpmExecuteEndToEndTestsTest extends BasePiperTest {
 
         stepRule.step.npmExecuteEndToEndTests(
             script: nullScript,
-            stageName: "myStage",
-            runScript: "ci-e2e"
+            stageName: "myStage"
         )
 
         assert npmExecuteScriptsRule.hasParameter('script', nullScript)
@@ -231,7 +352,6 @@ class NpmExecuteEndToEndTestsTest extends BasePiperTest {
             script: nullScript,
             stageName: "myStage",
             buildDescriptorExcludeList: ["path/to/package.json"],
-            runScript: "ci-e2e"
         )
 
         assert npmExecuteScriptsRule.hasParameter('script', nullScript)
@@ -255,8 +375,7 @@ class NpmExecuteEndToEndTestsTest extends BasePiperTest {
 
         stepRule.step.npmExecuteEndToEndTests(
             script: nullScript,
-            stageName: "myStage",
-            runScript: "ci-e2e"
+            stageName: "myStage"
         )
 
         assertTrue(executedInParallel)
@@ -265,9 +384,31 @@ class NpmExecuteEndToEndTestsTest extends BasePiperTest {
     }
 
     @Test
-    void parallelE2eTestOnKubernetes() {
+    void parallelE2eTestOnKubernetes_setWith_POD_NAME_EnvVariable() {
         def appUrl = [url: "http://my-url.com", credentialId: 'testCred']
         binding.variables.env.POD_NAME = "name"
+
+        nullScript.commonPipelineEnvironment.configuration = [
+            general: [parallelExecution: true],
+            stages: [
+                myStage:[
+                    appUrls: [appUrl]
+                ]]]
+
+        stepRule.step.npmExecuteEndToEndTests(
+            script: nullScript,
+            stageName: "myStage"
+        )
+
+        assertTrue(executedInParallel)
+        assertFalse(executedOnNode)
+        assertTrue(executedOnKubernetes)
+    }
+
+    @Test
+    void parallelE2eTestOnKubernetes_setWith_ON_K8S_EnvVariable() {
+        def appUrl = [url: "http://my-url.com", credentialId: 'testCred']
+        binding.variables.env.ON_K8S = "true"
 
         nullScript.commonPipelineEnvironment.configuration = [
             general: [parallelExecution: true],

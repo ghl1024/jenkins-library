@@ -5,22 +5,70 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/SAP/jenkins-library/pkg/config"
+	"github.com/SAP/jenkins-library/pkg/eventing"
+	"github.com/SAP/jenkins-library/pkg/gcs"
 	"github.com/SAP/jenkins-library/pkg/log"
+	"github.com/SAP/jenkins-library/pkg/piperutils"
+	"github.com/SAP/jenkins-library/pkg/splunk"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
+	"github.com/SAP/jenkins-library/pkg/validation"
+
 	"github.com/spf13/cobra"
 )
 
 type mavenExecuteIntegrationOptions struct {
 	Retry                       int    `json:"retry,omitempty"`
 	ForkCount                   string `json:"forkCount,omitempty"`
+	Goal                        string `json:"goal,omitempty"`
 	InstallArtifacts            bool   `json:"installArtifacts,omitempty"`
+	InstallWithReactor          bool   `json:"installWithReactor,omitempty"`
+	PomPath                     string `json:"pomPath,omitempty"`
 	ProjectSettingsFile         string `json:"projectSettingsFile,omitempty"`
 	GlobalSettingsFile          string `json:"globalSettingsFile,omitempty"`
 	M2Path                      string `json:"m2Path,omitempty"`
 	LogSuccessfulMavenTransfers bool   `json:"logSuccessfulMavenTransfers,omitempty"`
+}
+
+type mavenExecuteIntegrationReports struct {
+}
+
+func (p *mavenExecuteIntegrationReports) persist(stepConfig mavenExecuteIntegrationOptions, gcpJsonKeyFilePath string, gcsBucketId string, gcsFolderPath string, gcsSubFolder string) {
+	if gcsBucketId == "" {
+		log.Entry().Info("persisting reports to GCS is disabled, because gcsBucketId is empty")
+		return
+	}
+	log.Entry().Info("Uploading reports to Google Cloud Storage...")
+	content := []gcs.ReportOutputParam{
+		{FilePattern: "**/requirement.mapping", ParamRef: "", StepResultType: "requirement-mapping"},
+		{FilePattern: "**/TEST-*.xml", ParamRef: "", StepResultType: "junit"},
+		{FilePattern: "**/integration-test/*.xml", ParamRef: "", StepResultType: "integration-test"},
+		{FilePattern: "**/jacoco.xml", ParamRef: "", StepResultType: "jacoco-coverage"},
+	}
+
+	gcsClient, err := gcs.NewClient(gcpJsonKeyFilePath, "")
+	if err != nil {
+		log.Entry().Errorf("creation of GCS client failed: %v", err)
+		return
+	}
+	defer gcsClient.Close()
+	structVal := reflect.ValueOf(&stepConfig).Elem()
+	inputParameters := map[string]string{}
+	for i := 0; i < structVal.NumField(); i++ {
+		field := structVal.Type().Field(i)
+		if field.Type.String() == "string" {
+			paramName := strings.Split(field.Tag.Get("json"), ",")
+			paramValue, _ := structVal.Field(i).Interface().(string)
+			inputParameters[paramName[0]] = paramValue
+		}
+	}
+	if err := gcs.PersistReportsToGCS(gcsClient, content, inputParameters, gcsFolderPath, gcsBucketId, gcsSubFolder, piperutils.Glob, os.Stat); err != nil {
+		log.Entry().Errorf("failed to persist reports: %v", err)
+	}
 }
 
 // MavenExecuteIntegrationCommand This step will execute backend integration tests via the Jacoco Maven-plugin.
@@ -30,48 +78,130 @@ func MavenExecuteIntegrationCommand() *cobra.Command {
 	metadata := mavenExecuteIntegrationMetadata()
 	var stepConfig mavenExecuteIntegrationOptions
 	var startTime time.Time
+	var reports mavenExecuteIntegrationReports
+	var logCollector *log.CollectorHook
+	var splunkClient *splunk.Splunk
+	telemetryClient := &telemetry.Telemetry{}
 
 	var createMavenExecuteIntegrationCmd = &cobra.Command{
 		Use:   STEP_NAME,
 		Short: "This step will execute backend integration tests via the Jacoco Maven-plugin.",
-		Long: `If the project contains a Maven module named "integration-tests", this step will execute
-the integration tests via the Jacoco Maven-plugin.`,
+		Long: `If the project contains a Maven module for integration tests, this step will execute
+the integration tests via the Jacoco Maven-plugin.
+By default the module is expected at ` + "`" + `integration-tests/pom.xml` + "`" + `. Use the ` + "`" + `pomPath` + "`" + `
+parameter to point to a different location.`,
 		PreRunE: func(cmd *cobra.Command, _ []string) error {
 			startTime = time.Now()
 			log.SetStepName(STEP_NAME)
 			log.SetVerbose(GeneralConfig.Verbose)
 
-			path, _ := os.Getwd()
+			GeneralConfig.GitHubAccessTokens = ResolveAccessTokens(GeneralConfig.GitHubTokens)
+
+			path, err := os.Getwd()
+			if err != nil {
+				return err
+			}
 			fatalHook := &log.FatalHook{CorrelationID: GeneralConfig.CorrelationID, Path: path}
 			log.RegisterHook(fatalHook)
 
-			err := PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
+			err = PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
 			if err != nil {
 				log.SetErrorCategory(log.ErrorConfiguration)
 				return err
 			}
+
+			// Set step error patterns for improved error detection
+			stepErrors := make([]log.StepError, len(metadata.Metadata.Errors))
+			for i, err := range metadata.Metadata.Errors {
+				stepErrors[i] = log.StepError{
+					Pattern:  err.Pattern,
+					Message:  err.Message,
+					Category: err.Category,
+				}
+			}
+			log.SetStepErrors(stepErrors)
 
 			if len(GeneralConfig.HookConfig.SentryConfig.Dsn) > 0 {
 				sentryHook := log.NewSentryHook(GeneralConfig.HookConfig.SentryConfig.Dsn, GeneralConfig.CorrelationID)
 				log.RegisterHook(&sentryHook)
 			}
 
+			if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 || len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+				splunkClient = &splunk.Splunk{}
+				logCollector = &log.CollectorHook{CorrelationID: GeneralConfig.CorrelationID}
+				log.RegisterHook(logCollector)
+			}
+
+			if err = log.RegisterANSHookIfConfigured(GeneralConfig.CorrelationID); err != nil {
+				log.Entry().WithError(err).Warn("failed to set up SAP Alert Notification Service log hook")
+			}
+
+			validation, err := validation.New(validation.WithJSONNamesForStructFields(), validation.WithPredefinedErrorMessages())
+			if err != nil {
+				return err
+			}
+			if err = validation.ValidateStruct(stepConfig); err != nil {
+				log.SetErrorCategory(log.ErrorConfiguration)
+				return err
+			}
+
 			return nil
 		},
 		Run: func(_ *cobra.Command, _ []string) {
-			telemetryData := telemetry.CustomData{}
-			telemetryData.ErrorCode = "1"
+			vaultClient := config.GlobalVaultClient()
+			var oidcTokenProvider func(string) (string, error)
+			if vaultClient != nil {
+				defer vaultClient.MustRevokeToken()
+				oidcTokenProvider = vaultClient.GetOIDCTokenByValidation
+			}
+
+			stepTelemetryData := telemetry.CustomData{
+				ErrorCode: "1",
+			}
 			handler := func() {
+				reports.persist(stepConfig, GeneralConfig.GCPJsonKeyFilePath, GeneralConfig.GCSBucketId, GeneralConfig.GCSFolderPath, GeneralConfig.GCSSubFolder)
 				config.RemoveVaultSecretFiles()
-				telemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
-				telemetryData.ErrorCategory = log.GetErrorCategory().String()
-				telemetry.Send(&telemetryData)
+				stepTelemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
+				stepTelemetryData.ErrorCategory = log.GetErrorCategory().String()
+				stepTelemetryData.PiperCommitHash = GitCommit
+				telemetryClient.SetData(&stepTelemetryData)
+				telemetryClient.LogStepTelemetryData()
+				if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.Dsn,
+						GeneralConfig.HookConfig.SplunkConfig.Token,
+						GeneralConfig.HookConfig.SplunkConfig.Index,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblToken,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblIndex,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.GCPPubSubConfig.ProjectNumber) > 0 {
+					if err := eventing.PublishTaskRunFinishedEvent(
+						oidcTokenProvider,
+						&GeneralConfig,
+						eventing.EventContext{
+							StepName:   STEP_NAME,
+							StageName:  telemetryClient.GetData().StageName,
+							ErrorCode:  stepTelemetryData.ErrorCode,
+							PipelineID: telemetryClient.GetBuildURL(),
+						},
+					); err != nil {
+						log.Entry().WithError(err).Warn("failed to publish GCP Pub/Sub event")
+					}
+				}
 			}
 			log.DeferExitHandler(handler)
 			defer handler()
-			telemetry.Initialize(GeneralConfig.NoTelemetry, STEP_NAME)
-			mavenExecuteIntegration(stepConfig, &telemetryData)
-			telemetryData.ErrorCode = "0"
+			telemetryClient.Initialize(STEP_NAME)
+			mavenExecuteIntegration(stepConfig, &stepTelemetryData)
+			stepTelemetryData.ErrorCode = "0"
 			log.Entry().Info("SUCCESS")
 		},
 	}
@@ -83,7 +213,10 @@ the integration tests via the Jacoco Maven-plugin.`,
 func addMavenExecuteIntegrationFlags(cmd *cobra.Command, stepConfig *mavenExecuteIntegrationOptions) {
 	cmd.Flags().IntVar(&stepConfig.Retry, "retry", 1, "The number of times that integration tests will be retried before failing the step. Note: This will consume more time for the step execution.")
 	cmd.Flags().StringVar(&stepConfig.ForkCount, "forkCount", `1C`, "The number of JVM processes that are spawned to run the tests in parallel in case of using a maven based project structure. For more details visit the Surefire documentation at https://maven.apache.org/surefire/maven-surefire-plugin/test-mojo.html#forkCount.")
-	cmd.Flags().BoolVar(&stepConfig.InstallArtifacts, "installArtifacts", true, "If enabled, it will install all artifacts to the local maven repository to make them available before running the tests. This is required if the integration test module has dependencies to other modules in the repository and they were not installed before.")
+	cmd.Flags().StringVar(&stepConfig.Goal, "goal", `test`, "The name of the Maven goal to execute.")
+	cmd.Flags().BoolVar(&stepConfig.InstallArtifacts, "installArtifacts", true, "If enabled, it will install all artifacts from all modules to the local maven repository. This is required if the `integration-tests` module has dependencies on other modules in the same repository which have not yet been installed. Artifacts are installed using the `install:install-file` goal which expects the artifacts to be already available. If you'd like to build the artifacts on the spot, you might want to use `installWithReactor instead. Mutually exclusive with `installWithReactor`.")
+	cmd.Flags().BoolVar(&stepConfig.InstallWithReactor, "installWithReactor", false, "If enabled, it will use the Maven reactor to build and install the `integration-tests` module and all of its dependencies. Artifacts are installed using the `install` goal which builds the artifacts on the spot if required. If you already have the artifacts available, you might want to use `installArtifacts` instead. Mutually exclusive with `installArtifacts`.")
+	cmd.Flags().StringVar(&stepConfig.PomPath, "pomPath", `integration-tests/pom.xml`, "Path to the pom.xml of the integration-test Maven module. If not set, defaults to `integration-tests/pom.xml`. Override this if your integration-test module lives under a different directory or file name.\n")
 	cmd.Flags().StringVar(&stepConfig.ProjectSettingsFile, "projectSettingsFile", os.Getenv("PIPER_projectSettingsFile"), "Path to the mvn settings file that should be used as project settings file.")
 	cmd.Flags().StringVar(&stepConfig.GlobalSettingsFile, "globalSettingsFile", os.Getenv("PIPER_globalSettingsFile"), "Path to the mvn settings file that should be used as global settings file.")
 	cmd.Flags().StringVar(&stepConfig.M2Path, "m2Path", os.Getenv("PIPER_m2Path"), "Path to the location of the local repository that should be used.")
@@ -109,6 +242,7 @@ func mavenExecuteIntegrationMetadata() config.StepData {
 						Type:        "int",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     1,
 					},
 					{
 						Name:        "forkCount",
@@ -117,6 +251,16 @@ func mavenExecuteIntegrationMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `1C`,
+					},
+					{
+						Name:        "goal",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"STEPS", "STAGES", "PARAMETERS"},
+						Type:        "string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     `test`,
 					},
 					{
 						Name:        "installArtifacts",
@@ -125,6 +269,25 @@ func mavenExecuteIntegrationMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     true,
+					},
+					{
+						Name:        "installWithReactor",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"GENERAL", "STEPS", "STAGES", "PARAMETERS"},
+						Type:        "bool",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     false,
+					},
+					{
+						Name:        "pomPath",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STEPS", "STAGES"},
+						Type:        "string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     `integration-tests/pom.xml`,
 					},
 					{
 						Name:        "projectSettingsFile",
@@ -133,6 +296,7 @@ func mavenExecuteIntegrationMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "maven/projectSettingsFile"}},
+						Default:     os.Getenv("PIPER_projectSettingsFile"),
 					},
 					{
 						Name:        "globalSettingsFile",
@@ -141,6 +305,7 @@ func mavenExecuteIntegrationMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "maven/globalSettingsFile"}},
+						Default:     os.Getenv("PIPER_globalSettingsFile"),
 					},
 					{
 						Name:        "m2Path",
@@ -149,6 +314,7 @@ func mavenExecuteIntegrationMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "maven/m2Path"}},
+						Default:     os.Getenv("PIPER_m2Path"),
 					},
 					{
 						Name:        "logSuccessfulMavenTransfers",
@@ -157,14 +323,29 @@ func mavenExecuteIntegrationMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "maven/logSuccessfulMavenTransfers"}},
+						Default:     false,
 					},
 				},
 			},
 			Containers: []config.Container{
-				{Name: "mvn", Image: "maven:3.6-jdk-8"},
+				{Name: "mvn", Image: "docker.io/maven:3.6-jdk-8"},
 			},
 			Sidecars: []config.Container{
 				{},
+			},
+			Outputs: config.StepOutputs{
+				Resources: []config.StepResources{
+					{
+						Name: "reports",
+						Type: "reports",
+						Parameters: []map[string]any{
+							{"filePattern": "**/requirement.mapping", "type": "requirement-mapping"},
+							{"filePattern": "**/TEST-*.xml", "type": "junit"},
+							{"filePattern": "**/integration-test/*.xml", "type": "integration-test"},
+							{"filePattern": "**/jacoco.xml", "type": "jacoco-coverage"},
+						},
+					},
+				},
 			},
 		},
 	}

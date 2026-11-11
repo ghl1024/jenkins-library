@@ -1,15 +1,16 @@
 package cmd
 
 import (
-	"io/ioutil"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 
-	"github.com/Jeffail/gabs/v2"
 	piperhttp "github.com/SAP/jenkins-library/pkg/http"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/pkg/errors"
+
+	"github.com/Jeffail/gabs/v2"
 )
 
 func gctsCloneRepository(config gctsCloneRepositoryOptions, telemetryData *telemetry.CustomData) {
@@ -30,7 +31,7 @@ func cloneRepository(config *gctsCloneRepositoryOptions, telemetryData *telemetr
 
 	cookieJar, cookieErr := cookiejar.New(nil)
 	if cookieErr != nil {
-		return errors.Wrap(cookieErr, "creating a cookie jar failed")
+		return fmt.Errorf("creating a cookie jar failed: %w", cookieErr)
 	}
 	clientOptions := piperhttp.ClientOptions{
 		CookieJar: cookieJar,
@@ -47,6 +48,12 @@ func cloneRepository(config *gctsCloneRepositoryOptions, telemetryData *telemetr
 		"/sap/bc/cts_abapvcs/repository/" + config.Repository +
 		"/clone?sap-client=" + config.Client
 
+	url, urlErr := addQueryToURL(url, config.QueryParameters)
+
+	if urlErr != nil {
+
+		return urlErr
+	}
 	resp, httpErr := httpClient.SendRequest("POST", url, nil, header, nil)
 
 	defer func() {
@@ -56,19 +63,19 @@ func cloneRepository(config *gctsCloneRepositoryOptions, telemetryData *telemetr
 	}()
 
 	if resp == nil {
-		return errors.Errorf("did not retrieve a HTTP response: %v", httpErr)
+		return fmt.Errorf("did not retrieve a HTTP response: %v", httpErr)
 	}
 
-	bodyText, readErr := ioutil.ReadAll(resp.Body)
+	bodyText, readErr := io.ReadAll(resp.Body)
 
 	if readErr != nil {
-		return errors.Wrap(readErr, "HTTP response body could not be read")
+		return fmt.Errorf("HTTP response body could not be read: %w", readErr)
 	}
 
 	response, parsingErr := gabs.ParseJSON([]byte(bodyText))
 
 	if parsingErr != nil {
-		return errors.Wrapf(parsingErr, "HTTP response body could not be parsed as JSON: %v", string(bodyText))
+		return fmt.Errorf("HTTP response body could not be parsed as JSON: %v: %w", string(bodyText), parsingErr)
 	}
 
 	if httpErr != nil {
@@ -81,11 +88,11 @@ func cloneRepository(config *gctsCloneRepositoryOptions, telemetryData *telemetr
 			} else if exception, ok := response.Path("errorLog.1.code").Data().(string); ok && exception == "GCTS.CLIENT.3302" {
 				log.Entry().Errorf("%v", response.Path("errorLog.1.message").Data().(string))
 				log.Entry().Error("possible reason: the remote repository is set to 'private'. you need to provide the local ABAP server repository with authentication credentials to the remote Git repository in order to clone it.")
-				return errors.Wrap(httpErr, "cloning the repository failed")
+				return fmt.Errorf("cloning the repository failed: %w", httpErr)
 			}
 		}
 		log.Entry().Errorf("a HTTP error occurred! Response body: %v", response)
-		return errors.Wrap(httpErr, "cloning the repository failed")
+		return fmt.Errorf("cloning the repository failed: %w", httpErr)
 	}
 
 	log.Entry().

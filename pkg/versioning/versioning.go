@@ -2,19 +2,24 @@ package versioning
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"path/filepath"
 
-	"github.com/SAP/jenkins-library/pkg/piperutils"
-
 	"github.com/SAP/jenkins-library/pkg/maven"
+	"github.com/SAP/jenkins-library/pkg/piperutils"
 )
 
 // Coordinates to address the artifact coordinates like groupId, artifactId, version and packaging
 type Coordinates struct {
-	GroupID    string
-	ArtifactID string
-	Version    string
-	Packaging  string
+	GroupID    string `json:"groupId"`
+	ArtifactID string `json:"artifactId"`
+	Version    string `json:"version"`
+	Packaging  string `json:"packaging"`
+	BuildPath  string `json:"buildPath"`
+	URL        string `json:"url"`
+	PURL       string `json:"purl"`
 }
 
 // Artifact defines the versioning operations for various build tools
@@ -27,19 +32,33 @@ type Artifact interface {
 
 // Options define build tool specific settings in order to properly retrieve e.g. the version / coordinates of an artifact
 type Options struct {
-	ProjectSettingsFile string
-	DockerImage         string
-	GlobalSettingsFile  string
-	M2Path              string
-	VersionSource       string
-	VersionSection      string
-	VersionField        string
-	VersioningScheme    string
+	ProjectSettingsFile     string
+	DockerImage             string
+	GlobalSettingsFile      string
+	M2Path                  string
+	Defines                 []string
+	VersionSource           string
+	VersionSection          string
+	VersionField            string
+	VersioningScheme        string
+	HelmUpdateAppVersion    bool
+	CAPVersioningPreference string
 }
 
 // Utils defines the versioning operations for various build tools
 type Utils interface {
-	maven.Utils
+	Stdout(out io.Writer)
+	Stderr(err io.Writer)
+	RunExecutable(e string, p ...string) error
+
+	DownloadFile(url, filename string, header http.Header, cookies []*http.Cookie) error
+	Glob(pattern string) (matches []string, err error)
+	FileExists(filename string) (bool, error)
+	Copy(src, dest string) (int64, error)
+	MkdirAll(path string, perm os.FileMode) error
+	FileWrite(path string, content []byte, perm os.FileMode) error
+	FileRead(path string) ([]byte, error)
+	FileRemove(path string) error
 }
 
 type mvnRunner struct{}
@@ -59,6 +78,12 @@ func GetArtifact(buildTool, buildDescriptorFilePath string, opts *Options, utils
 	if fileExists == nil {
 		fileExists = piperutils.FileExists
 	}
+
+	// CAPVersioningPreference can only be 'maven' or 'npm'. Verification done on artifactPrepareVersion.yaml level
+	if buildTool == "CAP" {
+		buildTool = opts.CAPVersioningPreference
+	}
+
 	switch buildTool {
 	case "custom":
 		var err error
@@ -89,11 +114,12 @@ func GetArtifact(buildTool, buildDescriptorFilePath string, opts *Options, utils
 		artifact = &Gradle{
 			path:         buildDescriptorFilePath,
 			versionField: opts.VersionField,
+			utils:        utils,
 		}
 	case "golang":
 		if len(buildDescriptorFilePath) == 0 {
 			var err error
-			buildDescriptorFilePath, err = searchDescriptor([]string{"VERSION", "version.txt", "go.mod"}, fileExists)
+			buildDescriptorFilePath, err = searchDescriptor([]string{"go.mod", "VERSION", "version.txt"}, fileExists)
 			if err != nil {
 				return artifact, err
 			}
@@ -102,9 +128,14 @@ func GetArtifact(buildTool, buildDescriptorFilePath string, opts *Options, utils
 		switch buildDescriptorFilePath {
 		case "go.mod":
 			artifact = &GoMod{path: buildDescriptorFilePath, fileExists: fileExists}
-			break
 		default:
 			artifact = &Versionfile{path: buildDescriptorFilePath}
+		}
+	case "helm":
+		artifact = &HelmChart{
+			path:             buildDescriptorFilePath,
+			utils:            utils,
+			updateAppVersion: opts.HelmUpdateAppVersion,
 		}
 	case "maven":
 		if len(buildDescriptorFilePath) == 0 {
@@ -118,6 +149,7 @@ func GetArtifact(buildTool, buildDescriptorFilePath string, opts *Options, utils
 				ProjectSettingsFile: opts.ProjectSettingsFile,
 				GlobalSettingsFile:  opts.GlobalSettingsFile,
 				M2Path:              opts.M2Path,
+				Defines:             opts.Defines,
 			},
 		}
 	case "mta":
@@ -137,17 +169,30 @@ func GetArtifact(buildTool, buildDescriptorFilePath string, opts *Options, utils
 			path:         buildDescriptorFilePath,
 			versionField: "version",
 		}
+	case "rust":
+		if len(buildDescriptorFilePath) == 0 {
+			buildDescriptorFilePath = CargoBuildDescriptor
+		}
+		artifact = &Cargo{path: buildDescriptorFilePath}
 	case "pip":
 		if len(buildDescriptorFilePath) == 0 {
 			var err error
-			buildDescriptorFilePath, err = searchDescriptor([]string{"setup.py", "version.txt", "VERSION"}, fileExists)
+			buildDescriptorFilePath, err = searchDescriptor([]string{TomlBuildDescriptor, "setup.py", "version.txt", "VERSION"}, fileExists)
 			if err != nil {
 				return artifact, err
 			}
 		}
-		artifact = &Pip{
-			path:       buildDescriptorFilePath,
-			fileExists: fileExists,
+		switch buildDescriptorFilePath {
+		case TomlBuildDescriptor:
+			artifact = &Toml{
+				path:       buildDescriptorFilePath,
+				fileExists: fileExists,
+			}
+		default:
+			artifact = &Pip{
+				path:       buildDescriptorFilePath,
+				fileExists: fileExists,
+			}
 		}
 	case "sbt":
 		if len(buildDescriptorFilePath) == 0 {

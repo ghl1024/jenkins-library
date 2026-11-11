@@ -5,13 +5,11 @@ import (
 	"fmt"
 	"strings"
 
+	piperGithub "github.com/SAP/jenkins-library/pkg/github"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/google/go-github/v32/github"
 
-	"github.com/pkg/errors"
-
-	piperGithub "github.com/SAP/jenkins-library/pkg/github"
+	"github.com/google/go-github/v68/github"
 )
 
 type gitHubBranchProtectionRepositoriesService interface {
@@ -19,7 +17,8 @@ type gitHubBranchProtectionRepositoriesService interface {
 }
 
 func githubCheckBranchProtection(config githubCheckBranchProtectionOptions, telemetryData *telemetry.CustomData) {
-	ctx, client, err := piperGithub.NewClient(config.Token, config.APIURL, "")
+	// TODO provide parameter for trusted certs
+	ctx, client, err := piperGithub.NewClientBuilder(config.Token, config.APIURL).Build()
 	if err != nil {
 		log.Entry().WithError(err).Fatal("Failed to get GitHub client")
 	}
@@ -33,15 +32,15 @@ func githubCheckBranchProtection(config githubCheckBranchProtectionOptions, tele
 func runGithubCheckBranchProtection(ctx context.Context, config *githubCheckBranchProtectionOptions, telemetryData *telemetry.CustomData, ghRepositoriesService gitHubBranchProtectionRepositoriesService) error {
 	ghProtection, _, err := ghRepositoriesService.GetBranchProtection(ctx, config.Owner, config.Repository, config.Branch)
 	if err != nil {
-		return errors.Wrap(err, "failed to read branch protection information")
+		return fmt.Errorf("failed to read branch protection information: %w", err)
 	}
 
 	// validate required status checks
 	for _, check := range config.RequiredChecks {
 		var found bool
 		foundContexts := []string{}
-		if requiredStatusChecks := ghProtection.GetRequiredStatusChecks(); requiredStatusChecks != nil {
-			foundContexts = requiredStatusChecks.Contexts
+		if requiredStatusChecks := ghProtection.GetRequiredStatusChecks(); requiredStatusChecks != nil && requiredStatusChecks.Contexts != nil {
+			foundContexts = *requiredStatusChecks.Contexts
 		}
 		for _, context := range foundContexts {
 			if check == context {

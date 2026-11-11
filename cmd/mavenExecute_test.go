@@ -1,17 +1,20 @@
+//go:build unit
+// +build unit
+
 package cmd
 
 import (
 	"errors"
-	"github.com/SAP/jenkins-library/pkg/mock"
-	"github.com/stretchr/testify/assert"
 	"net/http"
 	"testing"
+
+	"github.com/SAP/jenkins-library/pkg/mock"
+
+	"github.com/stretchr/testify/assert"
 )
 
 type mavenMockUtils struct {
-	shouldFail     bool
-	requestedUrls  []string
-	requestedFiles []string
+	shouldFail bool
 	*mock.FilesMock
 	*mock.ExecMockRunner
 }

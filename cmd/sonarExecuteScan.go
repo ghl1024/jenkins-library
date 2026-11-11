@@ -1,7 +1,13 @@
 package cmd
 
 import (
-	"io/ioutil"
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -10,17 +16,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bmatcuk/doublestar"
-	"github.com/pkg/errors"
-
 	"github.com/SAP/jenkins-library/pkg/command"
 	piperhttp "github.com/SAP/jenkins-library/pkg/http"
+	keytool "github.com/SAP/jenkins-library/pkg/java"
 	"github.com/SAP/jenkins-library/pkg/log"
-	FileUtils "github.com/SAP/jenkins-library/pkg/piperutils"
-	SliceUtils "github.com/SAP/jenkins-library/pkg/piperutils"
-	StepResults "github.com/SAP/jenkins-library/pkg/piperutils"
+	"github.com/SAP/jenkins-library/pkg/orchestrator"
+	"github.com/SAP/jenkins-library/pkg/piperutils"
 	SonarUtils "github.com/SAP/jenkins-library/pkg/sonar"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
+	"github.com/SAP/jenkins-library/pkg/versioning"
 )
 
 type sonarSettings struct {
@@ -42,19 +46,28 @@ var (
 	sonar sonarSettings
 
 	execLookPath    = exec.LookPath
-	fileUtilsExists = FileUtils.FileExists
-	fileUtilsUnzip  = FileUtils.Unzip
+	fileUtilsExists = piperutils.FileExists
+	fileUtilsUnzip  = piperutils.Unzip
 	osRename        = os.Rename
 	osStat          = os.Stat
-	doublestarGlob  = doublestar.Glob
+	doublestarGlob  = piperutils.Glob
 )
 
+const MAX_RETRIES = 4
+const BACKOFF_SECONDS = 40
+
+var NETWORK_ISSUES = []string{
+	"java.net.SocketException",
+	"failed with HTTP 403 Forbidden",
+	"failed with HTTP 404 Not Found",
+	"failed with HTTP 503 Service Unavailable",
+}
+
 const (
-	coverageReportPaths = "sonar.coverage.jacoco.xmlReportPaths="
-	javaBinaries        = "sonar.java.binaries="
-	javaLibraries       = "sonar.java.libraries="
-	coverageExclusions  = "sonar.coverage.exclusions="
-	pomXMLPattern       = "**/pom.xml"
+	javaBinaries       = "sonar.java.binaries="
+	javaLibraries      = "sonar.java.libraries="
+	coverageExclusions = "sonar.coverage.exclusions="
+	pomXMLPattern      = "**/pom.xml"
 )
 
 func sonarExecuteScan(config sonarExecuteScanOptions, _ *telemetry.CustomData, influx *sonarExecuteScanInflux) {
@@ -82,8 +95,23 @@ func sonarExecuteScan(config sonarExecuteScanOptions, _ *telemetry.CustomData, i
 	downloadClient.SetOptions(piperhttp.ClientOptions{TransportTimeout: 20 * time.Second})
 	// client for talking to the SonarQube API
 	apiClient := &piperhttp.Client{}
-	//TODO: implement certificate handling
-	apiClient.SetOptions(piperhttp.ClientOptions{TransportSkipVerification: true})
+	proxy := config.Proxy
+	if proxy != "" {
+		transportProxy, err := url.Parse(proxy)
+		if err != nil {
+			log.Entry().WithError(err).Fatalf("Failed to parse proxy string %v into a URL structure", proxy)
+		}
+		host, port, err := net.SplitHostPort(transportProxy.Host)
+		if err != nil {
+			log.Entry().WithError(err).Fatalf("Failed to retrieve host and port from the proxy URL")
+		}
+		// provide proxy setting for Java based Sonar scanner
+		javaToolOptions := fmt.Sprintf("-Dhttp.proxyHost=%v -Dhttp.proxyPort=%v", host, port)
+		os.Setenv("JAVA_TOOL_OPTIONS", javaToolOptions)
+
+		apiClient.SetOptions(piperhttp.ClientOptions{TransportProxy: transportProxy})
+		log.Entry().Infof("HTTP client instructed to use %v proxy", proxy)
+	}
 
 	sonar = sonarSettings{
 		workingDir:  "./",
@@ -93,7 +121,8 @@ func sonarExecuteScan(config sonarExecuteScanOptions, _ *telemetry.CustomData, i
 	}
 
 	influx.step_data.fields.sonar = false
-	if err := runSonar(config, downloadClient, &runner, apiClient, influx); err != nil {
+	fileUtils := piperutils.Files{}
+	if err := runSonar(config, downloadClient, &runner, apiClient, &fileUtils, influx); err != nil {
 		if log.GetErrorCategory() == log.ErrorUndefined && runner.GetExitCode() == 2 {
 			// see https://github.com/SonarSource/sonar-scanner-cli/blob/adb67d645c3bcb9b46f29dea06ba082ebec9ba7a/src/main/java/org/sonarsource/scanner/cli/Exit.java#L25
 			log.SetErrorCategory(log.ErrorConfiguration)
@@ -103,7 +132,10 @@ func sonarExecuteScan(config sonarExecuteScanOptions, _ *telemetry.CustomData, i
 	influx.step_data.fields.sonar = true
 }
 
-func runSonar(config sonarExecuteScanOptions, client piperhttp.Downloader, runner command.ExecRunner, apiClient SonarUtils.Sender, influx *sonarExecuteScanInflux) error {
+func runSonar(config sonarExecuteScanOptions, client piperhttp.Downloader, runner command.ExecRunner, apiClient SonarUtils.Sender, utils piperutils.FileUtils, influx *sonarExecuteScanInflux) error {
+	// Set config based on orchestrator-specific environment variables
+	detectParametersFromCI(&config)
+
 	if len(config.ServerURL) > 0 {
 		sonar.addEnvironment("SONAR_HOST_URL=" + config.ServerURL)
 	}
@@ -122,9 +154,17 @@ func runSonar(config sonarExecuteScanOptions, client piperhttp.Downloader, runne
 	if len(config.Organization) > 0 {
 		sonar.addOption("sonar.organization=" + config.Organization)
 	}
-	if len(config.ProjectVersion) > 0 {
-		// handleArtifactVersion is reused from cmd/protecodeExecuteScan.go
-		sonar.addOption("sonar.projectVersion=" + handleArtifactVersion(config.ProjectVersion))
+	if len(config.Version) > 0 {
+		version := config.CustomScanVersion
+		if len(version) > 0 {
+			log.Entry().Infof("Using custom version: %v", version)
+		} else {
+			version = versioning.ApplyVersioningModel(config.VersioningModel, config.Version)
+		}
+		sonar.addOption("sonar.projectVersion=" + version)
+	}
+	if GeneralConfig.Verbose {
+		sonar.addOption("sonar.verbose=true")
 	}
 	if len(config.ProjectKey) > 0 {
 		sonar.addOption("sonar.projectKey=" + config.ProjectKey)
@@ -137,6 +177,9 @@ func runSonar(config sonarExecuteScanOptions, client piperhttp.Downloader, runne
 	}
 	if config.InferJavaBinaries && !isInOptions(config, javaBinaries) {
 		addJavaBinaries()
+	}
+	if config.WaitForQualityGate {
+		sonar.addOption("sonar.qualitygate.wait=true")
 	}
 	if err := handlePullRequest(config); err != nil {
 		log.SetErrorCategory(log.ErrorConfiguration)
@@ -155,7 +198,7 @@ func runSonar(config sonarExecuteScanOptions, client piperhttp.Downloader, runne
 		sonar.options = append(sonar.options, config.Options...)
 	}
 
-	sonar.options = SliceUtils.PrefixIfNeeded(SliceUtils.Trim(sonar.options), "-D")
+	sonar.options = piperutils.PrefixIfNeeded(piperutils.Trim(sonar.options), "-D")
 
 	log.Entry().
 		WithField("command", sonar.binary).
@@ -164,9 +207,22 @@ func runSonar(config sonarExecuteScanOptions, client piperhttp.Downloader, runne
 		Debug("Executing sonar scan command")
 	// execute scan
 	runner.SetEnv(sonar.environment)
-	err := runner.RunExecutable(sonar.binary, sonar.options...)
-	if err != nil {
-		return err
+
+	for i := range MAX_RETRIES {
+		var stderrBuf bytes.Buffer
+		runner.Stderr(io.MultiWriter(log.Writer(), &stderrBuf))
+
+		err := runner.RunExecutable(sonar.binary, sonar.options...)
+		if err == nil {
+			break
+		}
+		if i != MAX_RETRIES-1 && isNetworkIssue(stderrBuf.String()) {
+			sleepTime := time.Duration(math.Pow(2, float64(i))*BACKOFF_SECONDS) * time.Second
+			log.Entry().Infof("Delaying for %v before next retry...", sleepTime)
+			time.Sleep(sleepTime)
+		} else {
+			return err
+		}
 	}
 
 	// as PRs are handled locally for legacy SonarQube systems, no measurements will be fetched.
@@ -175,68 +231,108 @@ func runSonar(config sonarExecuteScanOptions, client piperhttp.Downloader, runne
 	}
 
 	// load task results
-	taskReport, err := SonarUtils.ReadTaskReport(sonar.workingDir)
+	workspaceForReport := sonar.workingDir
+	if baseDir := SonarUtils.GetProperty(sonar.workingDir, "sonar.projectBaseDir"); len(baseDir) > 0 {
+		workspaceForReport = filepath.Join(sonar.workingDir, baseDir)
+	}
+	taskReport, err := SonarUtils.ReadTaskReport(workspaceForReport)
 	if err != nil {
 		log.Entry().WithError(err).Warning("no scan report found")
 		return nil
 	}
+
+	var serverUrl string
+
+	if len(config.Proxy) > 0 {
+		serverUrl = config.ServerURL
+	} else {
+		serverUrl = taskReport.ServerURL
+	}
+	// write reports JSON
+	reports := []piperutils.Path{
+		{
+			Target:    "sonarscan.json",
+			Mandatory: false,
+		},
+	}
 	// write links JSON
-	links := []StepResults.Path{
+	links := []piperutils.Path{
 		{
 			Target: taskReport.DashboardURL,
 			Name:   "Sonar Web UI",
 		},
 	}
-	StepResults.PersistReportsAndLinks("sonarExecuteScan", sonar.workingDir, nil, links)
+	piperutils.PersistReportsAndLinks("sonarExecuteScan", sonar.workingDir, utils, reports, links)
 
 	if len(config.Token) == 0 {
 		log.Entry().Warn("no measurements are fetched due to missing credentials")
 		return nil
 	}
-	taskService := SonarUtils.NewTaskService(taskReport.ServerURL, config.Token, taskReport.TaskID, apiClient)
+	taskService := SonarUtils.NewTaskService(serverUrl, config.Token, taskReport.TaskID, apiClient)
 	// wait for analysis task to complete
 	err = taskService.WaitForTask()
 	if err != nil {
 		return err
 	}
 	// fetch number of issues by severity
-	issueService := SonarUtils.NewIssuesService(taskReport.ServerURL, config.Token, taskReport.ProjectKey, config.Organization, config.BranchName, config.ChangeID, apiClient)
-	influx.sonarqube_data.fields.blocker_issues, err = issueService.GetNumberOfBlockerIssues()
+	issueService := SonarUtils.NewIssuesService(serverUrl, config.Token, taskReport.ProjectKey, config.Organization, config.BranchName, config.ChangeID, apiClient)
+	var categories = make([]SonarUtils.Severity, 0)
+	influx.sonarqube_data.fields.blocker_issues, err = issueService.GetNumberOfBlockerIssues(&categories)
 	if err != nil {
 		return err
 	}
-	influx.sonarqube_data.fields.critical_issues, err = issueService.GetNumberOfCriticalIssues()
+	influx.sonarqube_data.fields.critical_issues, err = issueService.GetNumberOfCriticalIssues(&categories)
 	if err != nil {
 		return err
 	}
-	influx.sonarqube_data.fields.major_issues, err = issueService.GetNumberOfMajorIssues()
+	influx.sonarqube_data.fields.major_issues, err = issueService.GetNumberOfMajorIssues(&categories)
 	if err != nil {
 		return err
 	}
-	influx.sonarqube_data.fields.minor_issues, err = issueService.GetNumberOfMinorIssues()
+	influx.sonarqube_data.fields.minor_issues, err = issueService.GetNumberOfMinorIssues(&categories)
 	if err != nil {
 		return err
 	}
-	influx.sonarqube_data.fields.info_issues, err = issueService.GetNumberOfInfoIssues()
+	influx.sonarqube_data.fields.info_issues, err = issueService.GetNumberOfInfoIssues(&categories)
 	if err != nil {
 		return err
 	}
-	log.Entry().Debugf("Influx values: %v", influx.sonarqube_data.fields)
-	err = SonarUtils.WriteReport(SonarUtils.ReportData{
+
+	reportData := SonarUtils.ReportData{
 		ServerURL:    taskReport.ServerURL,
 		ProjectKey:   taskReport.ProjectKey,
 		TaskID:       taskReport.TaskID,
 		ChangeID:     config.ChangeID,
 		BranchName:   config.BranchName,
 		Organization: config.Organization,
+		Errors:       categories[:],
 		NumberOfIssues: SonarUtils.Issues{
 			Blocker:  influx.sonarqube_data.fields.blocker_issues,
 			Critical: influx.sonarqube_data.fields.critical_issues,
 			Major:    influx.sonarqube_data.fields.major_issues,
 			Minor:    influx.sonarqube_data.fields.minor_issues,
 			Info:     influx.sonarqube_data.fields.info_issues,
-		},
-	}, sonar.workingDir, ioutil.WriteFile)
+		}}
+
+	componentService := SonarUtils.NewMeasuresComponentService(serverUrl, config.Token, taskReport.ProjectKey, config.Organization, config.BranchName, config.ChangeID, apiClient)
+	cov, err := componentService.GetCoverage()
+	if err != nil {
+		log.Entry().Warnf("failed to retrieve sonar coverage data: %v", err)
+	} else {
+		reportData.Coverage = cov
+	}
+
+	loc, err := componentService.GetLinesOfCode()
+	if err != nil {
+		log.Entry().Warnf("failed to retrieve sonar lines of code data: %v", err)
+	} else {
+		reportData.LinesOfCode = loc
+	}
+
+	log.Entry().Debugf("Influx values: %v", influx.sonarqube_data.fields)
+
+	err = SonarUtils.WriteReport(reportData, sonar.workingDir, os.WriteFile)
+
 	if err != nil {
 		return err
 	}
@@ -246,7 +342,7 @@ func runSonar(config sonarExecuteScanOptions, client piperhttp.Downloader, runne
 // isInOptions returns true, if the given property is already provided in config.Options.
 func isInOptions(config sonarExecuteScanOptions, property string) bool {
 	property = strings.TrimSuffix(property, "=")
-	return SliceUtils.ContainsStringPart(config.Options, property)
+	return piperutils.ContainsStringPart(config.Options, property)
 }
 
 func addJavaBinaries() {
@@ -295,17 +391,12 @@ func handlePullRequest(config sonarExecuteScanOptions) error {
 		} else {
 			// see https://sonarcloud.io/documentation/analysis/pull-request/
 			provider := strings.ToLower(config.PullRequestProvider)
-			if provider == "github" {
-				if len(config.Owner) > 0 && len(config.Repository) > 0 {
-					sonar.addOption("sonar.pullrequest.github.repository=" + config.Owner + "/" + config.Repository)
-				}
-			} else {
+			if provider != "github" {
 				return errors.New("Pull-Request provider '" + provider + "' is not supported!")
 			}
 			sonar.addOption("sonar.pullrequest.key=" + config.ChangeID)
 			sonar.addOption("sonar.pullrequest.base=" + config.ChangeTarget)
 			sonar.addOption("sonar.pullrequest.branch=" + config.ChangeBranch)
-			sonar.addOption("sonar.pullrequest.provider=" + provider)
 		}
 	} else if len(config.BranchName) > 0 {
 		sonar.addOption("sonar.branch.name=" + config.BranchName)
@@ -324,19 +415,19 @@ func loadSonarScanner(url string, client piperhttp.Downloader) error {
 		defer os.RemoveAll(tmpFolder) // clean up
 		archive := filepath.Join(tmpFolder, path.Base(url))
 		if err := client.DownloadFile(url, archive, nil, nil); err != nil {
-			return errors.Wrap(err, "Download of sonar-scanner failed")
+			return fmt.Errorf("Download of sonar-scanner failed: %w", err)
 		}
 		// unzip sonar-scanner-cli
 		log.Entry().WithField("source", archive).WithField("target", tmpFolder).Debug("Extracting sonar-scanner")
 		if _, err := fileUtilsUnzip(archive, tmpFolder); err != nil {
-			return errors.Wrap(err, "Extraction of sonar-scanner failed")
+			return fmt.Errorf("Extraction of sonar-scanner failed: %w", err)
 		}
 		// move sonar-scanner-cli to .sonar-scanner/
 		toolPath := ".sonar-scanner"
 		foldername := strings.ReplaceAll(strings.ReplaceAll(archive, ".zip", ""), "cli-", "")
 		log.Entry().WithField("source", foldername).WithField("target", toolPath).Debug("Moving sonar-scanner")
 		if err := osRename(foldername, toolPath); err != nil {
-			return errors.Wrap(err, "Moving of sonar-scanner failed")
+			return fmt.Errorf("Moving of sonar-scanner failed: %w", err)
 		}
 		// update binary path
 		sonar.binary = filepath.Join(getWorkingDir(), toolPath, "bin", sonar.binary)
@@ -345,45 +436,54 @@ func loadSonarScanner(url string, client piperhttp.Downloader) error {
 	return nil
 }
 
-func loadCertificates(certificateList []string, client piperhttp.Downloader, runner command.ExecRunner) error {
-	trustStoreFile := filepath.Join(getWorkingDir(), ".certificates", "cacerts")
+func addSonarScannerOpts(opts string) {
+	tmpOpts := os.Getenv("SONAR_SCANNER_OPTS")
+	if len(tmpOpts) > 0 {
+		log.Entry().Debug("SONAR_SCANNER_OPTS already set. Appending to existing value: " + tmpOpts)
+		sonar.addEnvironment("SONAR_SCANNER_OPTS=" + tmpOpts + " " + opts)
+	} else {
+		sonar.addEnvironment("SONAR_SCANNER_OPTS=" + opts)
+	}
+}
 
-	if exists, _ := fileUtilsExists(trustStoreFile); exists {
+func loadCertificates(certificateList []string, client piperhttp.Downloader, runner command.ExecRunner) error {
+	truststorePath := filepath.Join(getWorkingDir(), ".certificates")
+	truststoreFile := filepath.Join(truststorePath, "cacerts")
+
+	if exists, _ := fileUtilsExists(truststoreFile); exists {
 		// use local existing trust store
-		sonar.addEnvironment("SONAR_SCANNER_OPTS=-Djavax.net.ssl.trustStore=" + trustStoreFile + " -Djavax.net.ssl.trustStorePassword=changeit")
-		log.Entry().WithField("trust store", trustStoreFile).Info("Using local trust store")
-	} else
-	//TODO: certificate loading is deactivated due to the missing JAVA keytool
-	// see https://github.com/SAP/jenkins-library/issues/1072
-	if os.Getenv("PIPER_SONAR_LOAD_CERTIFICATES") == "true" && len(certificateList) > 0 {
-		// use local created trust store with downloaded certificates
-		keytoolOptions := []string{
-			"-import",
-			"-noprompt",
-			"-storepass", "changeit",
-			"-keystore", trustStoreFile,
-		}
+		addSonarScannerOpts(keytool.GetMavenOpts(truststoreFile))
+		log.Entry().WithField("trust store", truststoreFile).Info("Using local trust store")
+	} else if len(certificateList) > 0 {
+		// create download temp dir
 		tmpFolder := getTempDir()
 		defer os.RemoveAll(tmpFolder) // clean up
-
+		if err := os.MkdirAll(truststorePath, 0777); err != nil {
+			log.Entry().Warningf("failed to create directory %v: %v", truststorePath, err)
+		}
+		// copying existing truststore
+		defaultTruststorePath := keytool.GetDefaultTruststorePath()
+		if exists, _ := fileUtilsExists(defaultTruststorePath); exists {
+			if err := keytool.ImportTruststore(runner, truststoreFile, defaultTruststorePath); err != nil {
+				return fmt.Errorf("Copying existing keystore failed: %w", err)
+			}
+		}
+		// use local created trust store with downloaded certificates
 		for _, certificate := range certificateList {
-			filename := path.Base(certificate) // decode?
-			target := filepath.Join(tmpFolder, filename)
-
+			target := filepath.Join(tmpFolder, path.Base(certificate))
 			log.Entry().WithField("source", certificate).WithField("target", target).Info("Downloading TLS certificate")
 			// download certificate
 			if err := client.DownloadFile(certificate, target, nil, nil); err != nil {
-				return errors.Wrapf(err, "Download of TLS certificate failed")
+				return fmt.Errorf("Download of TLS certificate failed: %w", err)
 			}
-			options := append(keytoolOptions, "-file", target)
-			options = append(options, "-alias", filename)
 			// add certificate to keystore
-			if err := runner.RunExecutable("keytool", options...); err != nil {
-				return errors.Wrap(err, "Adding certificate to keystore failed")
+			if err := keytool.ImportCert(runner, truststoreFile, target); err != nil {
+				log.Entry().Warnf("Adding certificate to keystore failed")
+				// return errors.Wrap(err, "Adding certificate to keystore failed")
 			}
 		}
-		sonar.addEnvironment("SONAR_SCANNER_OPTS=-Djavax.net.ssl.trustStore=" + trustStoreFile + " -Djavax.net.ssl.trustStorePassword=changeit")
-		log.Entry().WithField("trust store", trustStoreFile).Info("Using local trust store")
+		addSonarScannerOpts(keytool.GetMavenOpts(truststoreFile))
+		log.Entry().WithField("trust store", truststoreFile).Info("Using local trust store")
 	} else {
 		log.Entry().Debug("Download of TLS certificates skipped")
 	}
@@ -399,9 +499,45 @@ func getWorkingDir() string {
 }
 
 func getTempDir() string {
-	tmpFolder, err := ioutil.TempDir(".", "temp-")
+	tmpFolder, err := os.MkdirTemp(".", "temp-")
 	if err != nil {
 		log.Entry().WithError(err).WithField("path", tmpFolder).Debug("Creating temp directory failed")
 	}
 	return tmpFolder
+}
+
+// Fetches parameters from environment variables and updates the options accordingly (only if not already set)
+func detectParametersFromCI(options *sonarExecuteScanOptions) {
+	provider := orchestrator.GetOrchestratorConfigProvider(nil)
+
+	if provider.IsPullRequest() {
+		config := provider.PullRequestConfig()
+		if len(options.ChangeBranch) == 0 {
+			log.Entry().Info("Inferring parameter changeBranch from environment: " + config.Branch)
+			options.ChangeBranch = config.Branch
+		}
+		if len(options.ChangeTarget) == 0 {
+			log.Entry().Info("Inferring parameter changeTarget from environment: " + config.Base)
+			options.ChangeTarget = config.Base
+		}
+		if len(options.ChangeID) == 0 {
+			log.Entry().Info("Inferring parameter changeId from environment: " + config.Key)
+			options.ChangeID = config.Key
+		}
+	} else {
+		branch := provider.Branch()
+		if options.InferBranchName && len(options.BranchName) == 0 {
+			log.Entry().Info("Inferring parameter branchName from environment: " + branch)
+			options.BranchName = branch
+		}
+	}
+}
+
+func isNetworkIssue(stderr string) bool {
+	for _, pattern := range NETWORK_ISSUES {
+		if strings.Contains(stderr, pattern) {
+			return true
+		}
+	}
+	return false
 }

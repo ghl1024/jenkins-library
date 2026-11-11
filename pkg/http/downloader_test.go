@@ -1,7 +1,9 @@
+//go:build unit
+// +build unit
+
 package http
 
 import (
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/SAP/jenkins-library/pkg/log"
+
 	"github.com/stretchr/testify/assert"
 )
 
@@ -24,20 +27,15 @@ func TestDownloadRequest(t *testing.T) {
 		logger: log.Entry().WithField("package", "SAP/jenkins-library/pkg/http"),
 	}
 
-	workingDir, err := ioutil.TempDir("", "test detailed results")
-	if err != nil {
-		t.Fatal("Failed to create temporary directory")
-	}
-	// clean up tmp dir
-	defer os.RemoveAll(workingDir)
+	workingDir := t.TempDir()
 	targetFile := filepath.Join(workingDir, "abc/123/abc.xml")
 
 	// function under test
-	err = client.DownloadFile(server.URL, targetFile, nil, nil)
+	err := client.DownloadFile(server.URL, targetFile, nil, nil)
 	// asserts
 	assert.NoError(t, err, "Error occurred but none expected")
 	assert.FileExists(t, targetFile, "File not found")
-	bytes, err := ioutil.ReadFile(targetFile)
+	bytes, err := os.ReadFile(targetFile)
 	assert.NoError(t, err, "Error occurred but none expected")
 	assert.Equal(t, "my fancy file content", string(bytes))
 }

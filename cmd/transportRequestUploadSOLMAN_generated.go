@@ -9,25 +9,25 @@ import (
 	"time"
 
 	"github.com/SAP/jenkins-library/pkg/config"
+	"github.com/SAP/jenkins-library/pkg/eventing"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/piperenv"
+	"github.com/SAP/jenkins-library/pkg/splunk"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
+	"github.com/SAP/jenkins-library/pkg/validation"
+
 	"github.com/spf13/cobra"
 )
 
 type transportRequestUploadSOLMANOptions struct {
-	Endpoint              string   `json:"endpoint,omitempty"`
-	Username              string   `json:"username,omitempty"`
-	Password              string   `json:"password,omitempty"`
-	ApplicationID         string   `json:"applicationId,omitempty"`
-	ChangeDocumentID      string   `json:"changeDocumentId,omitempty"`
-	TransportRequestID    string   `json:"transportRequestId,omitempty"`
-	FilePath              string   `json:"filePath,omitempty"`
-	CmClientOpts          []string `json:"cmClientOpts,omitempty"`
-	GitFrom               string   `json:"gitFrom,omitempty"`
-	GitTo                 string   `json:"gitTo,omitempty"`
-	ChangeDocumentLabel   string   `json:"changeDocumentLabel,omitempty"`
-	TransportRequestLabel string   `json:"transportRequestLabel,omitempty"`
+	Endpoint           string   `json:"endpoint,omitempty"`
+	Username           string   `json:"username,omitempty"`
+	Password           string   `json:"password,omitempty"`
+	ApplicationID      string   `json:"applicationId,omitempty"`
+	ChangeDocumentID   string   `json:"changeDocumentId,omitempty"`
+	TransportRequestID string   `json:"transportRequestId,omitempty"`
+	FilePath           string   `json:"filePath,omitempty"`
+	CmClientOpts       []string `json:"cmClientOpts,omitempty"`
 }
 
 type transportRequestUploadSOLMANCommonPipelineEnvironment struct {
@@ -41,7 +41,7 @@ func (p *transportRequestUploadSOLMANCommonPipelineEnvironment) persist(path, re
 	content := []struct {
 		category string
 		name     string
-		value    interface{}
+		value    any
 	}{
 		{category: "custom", name: "changeDocumentId", value: p.custom.changeDocumentID},
 		{category: "custom", name: "transportRequestId", value: p.custom.transportRequestID},
@@ -56,7 +56,7 @@ func (p *transportRequestUploadSOLMANCommonPipelineEnvironment) persist(path, re
 		}
 	}
 	if errCount > 0 {
-		log.Entry().Fatal("failed to persist Piper environment")
+		log.Entry().Error("failed to persist Piper environment")
 	}
 }
 
@@ -68,6 +68,9 @@ func TransportRequestUploadSOLMANCommand() *cobra.Command {
 	var stepConfig transportRequestUploadSOLMANOptions
 	var startTime time.Time
 	var commonPipelineEnvironment transportRequestUploadSOLMANCommonPipelineEnvironment
+	var logCollector *log.CollectorHook
+	var splunkClient *splunk.Splunk
+	telemetryClient := &telemetry.Telemetry{}
 
 	var createTransportRequestUploadSOLMANCmd = &cobra.Command{
 		Use:   STEP_NAME,
@@ -80,15 +83,31 @@ The application ID specifies how the file needs to be handled on server side.`,
 			log.SetStepName(STEP_NAME)
 			log.SetVerbose(GeneralConfig.Verbose)
 
-			path, _ := os.Getwd()
+			GeneralConfig.GitHubAccessTokens = ResolveAccessTokens(GeneralConfig.GitHubTokens)
+
+			path, err := os.Getwd()
+			if err != nil {
+				return err
+			}
 			fatalHook := &log.FatalHook{CorrelationID: GeneralConfig.CorrelationID, Path: path}
 			log.RegisterHook(fatalHook)
 
-			err := PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
+			err = PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
 			if err != nil {
 				log.SetErrorCategory(log.ErrorConfiguration)
 				return err
 			}
+
+			// Set step error patterns for improved error detection
+			stepErrors := make([]log.StepError, len(metadata.Metadata.Errors))
+			for i, err := range metadata.Metadata.Errors {
+				stepErrors[i] = log.StepError{
+					Pattern:  err.Pattern,
+					Message:  err.Message,
+					Category: err.Category,
+				}
+			}
+			log.SetStepErrors(stepErrors)
 			log.RegisterSecret(stepConfig.Username)
 			log.RegisterSecret(stepConfig.Password)
 
@@ -97,23 +116,82 @@ The application ID specifies how the file needs to be handled on server side.`,
 				log.RegisterHook(&sentryHook)
 			}
 
+			if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 || len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+				splunkClient = &splunk.Splunk{}
+				logCollector = &log.CollectorHook{CorrelationID: GeneralConfig.CorrelationID}
+				log.RegisterHook(logCollector)
+			}
+
+			if err = log.RegisterANSHookIfConfigured(GeneralConfig.CorrelationID); err != nil {
+				log.Entry().WithError(err).Warn("failed to set up SAP Alert Notification Service log hook")
+			}
+
+			validation, err := validation.New(validation.WithJSONNamesForStructFields(), validation.WithPredefinedErrorMessages())
+			if err != nil {
+				return err
+			}
+			if err = validation.ValidateStruct(stepConfig); err != nil {
+				log.SetErrorCategory(log.ErrorConfiguration)
+				return err
+			}
+
 			return nil
 		},
 		Run: func(_ *cobra.Command, _ []string) {
-			telemetryData := telemetry.CustomData{}
-			telemetryData.ErrorCode = "1"
+			vaultClient := config.GlobalVaultClient()
+			var oidcTokenProvider func(string) (string, error)
+			if vaultClient != nil {
+				defer vaultClient.MustRevokeToken()
+				oidcTokenProvider = vaultClient.GetOIDCTokenByValidation
+			}
+
+			stepTelemetryData := telemetry.CustomData{
+				ErrorCode: "1",
+			}
 			handler := func() {
-				config.RemoveVaultSecretFiles()
 				commonPipelineEnvironment.persist(GeneralConfig.EnvRootPath, "commonPipelineEnvironment")
-				telemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
-				telemetryData.ErrorCategory = log.GetErrorCategory().String()
-				telemetry.Send(&telemetryData)
+				config.RemoveVaultSecretFiles()
+				stepTelemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
+				stepTelemetryData.ErrorCategory = log.GetErrorCategory().String()
+				stepTelemetryData.PiperCommitHash = GitCommit
+				telemetryClient.SetData(&stepTelemetryData)
+				telemetryClient.LogStepTelemetryData()
+				if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.Dsn,
+						GeneralConfig.HookConfig.SplunkConfig.Token,
+						GeneralConfig.HookConfig.SplunkConfig.Index,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblToken,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblIndex,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.GCPPubSubConfig.ProjectNumber) > 0 {
+					if err := eventing.PublishTaskRunFinishedEvent(
+						oidcTokenProvider,
+						&GeneralConfig,
+						eventing.EventContext{
+							StepName:   STEP_NAME,
+							StageName:  telemetryClient.GetData().StageName,
+							ErrorCode:  stepTelemetryData.ErrorCode,
+							PipelineID: telemetryClient.GetBuildURL(),
+						},
+					); err != nil {
+						log.Entry().WithError(err).Warn("failed to publish GCP Pub/Sub event")
+					}
+				}
 			}
 			log.DeferExitHandler(handler)
 			defer handler()
-			telemetry.Initialize(GeneralConfig.NoTelemetry, STEP_NAME)
-			transportRequestUploadSOLMAN(stepConfig, &telemetryData, &commonPipelineEnvironment)
-			telemetryData.ErrorCode = "0"
+			telemetryClient.Initialize(STEP_NAME)
+			transportRequestUploadSOLMAN(stepConfig, &stepTelemetryData, &commonPipelineEnvironment)
+			stepTelemetryData.ErrorCode = "0"
 			log.Entry().Info("SUCCESS")
 		},
 	}
@@ -131,15 +209,13 @@ func addTransportRequestUploadSOLMANFlags(cmd *cobra.Command, stepConfig *transp
 	cmd.Flags().StringVar(&stepConfig.TransportRequestID, "transportRequestId", os.Getenv("PIPER_transportRequestId"), "ID of the transport request to which the file is uploaded")
 	cmd.Flags().StringVar(&stepConfig.FilePath, "filePath", os.Getenv("PIPER_filePath"), "Name/Path of the file which should be uploaded")
 	cmd.Flags().StringSliceVar(&stepConfig.CmClientOpts, "cmClientOpts", []string{}, "Additional options handed over to the cm client")
-	cmd.Flags().StringVar(&stepConfig.GitFrom, "gitFrom", `origin/master`, "GIT starting point for retrieving the change document and transport request ID")
-	cmd.Flags().StringVar(&stepConfig.GitTo, "gitTo", `HEAD`, "GIT ending point for retrieving the change document and transport request ID")
-	cmd.Flags().StringVar(&stepConfig.ChangeDocumentLabel, "changeDocumentLabel", `ChangeDocument`, "Pattern used for identifying lines holding the change document ID. The GIT commit log messages are scanned for this label")
-	cmd.Flags().StringVar(&stepConfig.TransportRequestLabel, "transportRequestLabel", `TransportRequest`, "Pattern used for identifying lines holding the transport request ID. The GIT commit log messages are scanned for this label")
 
 	cmd.MarkFlagRequired("endpoint")
 	cmd.MarkFlagRequired("username")
 	cmd.MarkFlagRequired("password")
 	cmd.MarkFlagRequired("applicationId")
+	cmd.MarkFlagRequired("changeDocumentId")
+	cmd.MarkFlagRequired("transportRequestId")
 	cmd.MarkFlagRequired("filePath")
 	cmd.MarkFlagRequired("cmClientOpts")
 }
@@ -154,6 +230,9 @@ func transportRequestUploadSOLMANMetadata() config.StepData {
 		},
 		Spec: config.StepSpec{
 			Inputs: config.StepInputs{
+				Secrets: []config.StepSecrets{
+					{Name: "uploadCredentialsId", Description: "Jenkins 'Username with password' credentials ID containing user and password to authenticate against the ABAP backend", Type: "jenkins", Aliases: []config.Alias{{Name: "changeManagement/credentialsId", Deprecated: false}}},
+				},
 				Parameters: []config.StepParameters{
 					{
 						Name:        "endpoint",
@@ -162,6 +241,7 @@ func transportRequestUploadSOLMANMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   true,
 						Aliases:     []config.Alias{{Name: "changeManagement/endpoint"}},
+						Default:     os.Getenv("PIPER_endpoint"),
 					},
 					{
 						Name: "username",
@@ -176,6 +256,7 @@ func transportRequestUploadSOLMANMetadata() config.StepData {
 						Type:      "string",
 						Mandatory: true,
 						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_username"),
 					},
 					{
 						Name: "password",
@@ -190,6 +271,7 @@ func transportRequestUploadSOLMANMetadata() config.StepData {
 						Type:      "string",
 						Mandatory: true,
 						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_password"),
 					},
 					{
 						Name:        "applicationId",
@@ -198,6 +280,7 @@ func transportRequestUploadSOLMANMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   true,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_applicationId"),
 					},
 					{
 						Name: "changeDocumentId",
@@ -209,8 +292,9 @@ func transportRequestUploadSOLMANMetadata() config.StepData {
 						},
 						Scope:     []string{"PARAMETERS"},
 						Type:      "string",
-						Mandatory: false,
+						Mandatory: true,
 						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_changeDocumentId"),
 					},
 					{
 						Name: "transportRequestId",
@@ -222,8 +306,9 @@ func transportRequestUploadSOLMANMetadata() config.StepData {
 						},
 						Scope:     []string{"PARAMETERS"},
 						Type:      "string",
-						Mandatory: false,
+						Mandatory: true,
 						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_transportRequestId"),
 					},
 					{
 						Name: "filePath",
@@ -237,60 +322,30 @@ func transportRequestUploadSOLMANMetadata() config.StepData {
 						Type:      "string",
 						Mandatory: true,
 						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_filePath"),
 					},
 					{
 						Name:        "cmClientOpts",
 						ResourceRef: []config.ResourceReference{},
-						Scope:       []string{"PARAMETERS", "STAGES", "STEP", "GENERAL"},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS", "GENERAL"},
 						Type:        "[]string",
 						Mandatory:   true,
 						Aliases:     []config.Alias{{Name: "clientOpts"}, {Name: "changeManagement/clientOpts"}},
-					},
-					{
-						Name:        "gitFrom",
-						ResourceRef: []config.ResourceReference{},
-						Scope:       []string{"PARAMETERS", "STAGES", "STEP", "GENERAL"},
-						Type:        "string",
-						Mandatory:   false,
-						Aliases:     []config.Alias{{Name: "changeManagement/git/from"}},
-					},
-					{
-						Name:        "gitTo",
-						ResourceRef: []config.ResourceReference{},
-						Scope:       []string{"PARAMETERS", "STAGES", "STEP", "GENERAL"},
-						Type:        "string",
-						Mandatory:   false,
-						Aliases:     []config.Alias{{Name: "changeManagement/git/to"}},
-					},
-					{
-						Name:        "changeDocumentLabel",
-						ResourceRef: []config.ResourceReference{},
-						Scope:       []string{"PARAMETERS", "STAGES", "STEP", "GENERAL"},
-						Type:        "string",
-						Mandatory:   false,
-						Aliases:     []config.Alias{{Name: "changeManagement/changeDocumentLabel"}},
-					},
-					{
-						Name:        "transportRequestLabel",
-						ResourceRef: []config.ResourceReference{},
-						Scope:       []string{"PARAMETERS", "STAGES", "STEP", "GENERAL"},
-						Type:        "string",
-						Mandatory:   false,
-						Aliases:     []config.Alias{{Name: "changeManagement/transportRequestLabel"}},
+						Default:     []string{},
 					},
 				},
 			},
 			Containers: []config.Container{
-				{Name: "cmclient", Image: "ppiper/cm-client"},
+				{Name: "cmclient", Image: "ppiper/cm-client:3.0.0.0"},
 			},
 			Outputs: config.StepOutputs{
 				Resources: []config.StepResources{
 					{
 						Name: "commonPipelineEnvironment",
 						Type: "piperEnvironment",
-						Parameters: []map[string]interface{}{
-							{"Name": "custom/changeDocumentId"},
-							{"Name": "custom/transportRequestId"},
+						Parameters: []map[string]any{
+							{"name": "custom/changeDocumentId"},
+							{"name": "custom/transportRequestId"},
 						},
 					},
 				},

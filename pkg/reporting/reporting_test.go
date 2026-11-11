@@ -1,17 +1,66 @@
+//go:build unit
+// +build unit
+
 package reporting
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 )
 
+func TestVulToMarkdown(t *testing.T) {
+	t.Parallel()
+	t.Run("success - empty", func(t *testing.T) {
+		t.Parallel()
+		vulReport := VulnerabilityReport{}
+		_, err := vulReport.ToMarkdown()
+		assert.NoError(t, err)
+	})
+
+	t.Run("success - filled", func(t *testing.T) {
+		t.Parallel()
+		vulReport := VulnerabilityReport{
+			ProjectName:          "theProjectName",
+			ProjectVersion:       "theProjectVersion",
+			BlackDuckProjectLink: "https://the.link.to.the.project.version",
+			ArtifactID:           "theArtifact",
+			Branch:               "main",
+			CommitID:             "acb123",
+			Description:          "This is the test description.",
+			Origin:               "Origin",
+			DependencyType:       "direct",
+			Footer:               "This is the test footer",
+			Group:                "the.group",
+			PipelineName:         "thePipelineName",
+			PipelineLink:         "https://the.link.to.the.pipeline",
+			PublishDate:          "2022-06-30",
+			Resolution:           "This is the test resolution.",
+			Score:                7.8,
+			Severity:             "high",
+			Version:              "1.2.3",
+			PackageURL:           "pkg:generic/the.group/theArtifact@1.2.3",
+			VulnerabilityLink:    "https://the.link/to/the/vulnerability",
+			VulnerabilityName:    "CVE-Test-001",
+		}
+		goldenFilePath := filepath.Join("testdata", "markdownVulnerability.golden")
+		expected, err := os.ReadFile(goldenFilePath)
+		assert.NoError(t, err)
+
+		res, err := vulReport.ToMarkdown()
+		assert.NoError(t, err)
+		assert.Equal(t, string(expected), string(res))
+	})
+}
+
 func TestToHTML(t *testing.T) {
 	t.Run("empty table", func(t *testing.T) {
 		report := ScanReport{
-			Title:      "Report Test Title",
-			Subheaders: []Subheader{{Description: "sub 1", Details: "1"}, {Description: "sub 2", Details: "2"}},
+			ReportTitle: "Report Test Title",
+			Subheaders:  []Subheader{{Description: "sub 1", Details: "1"}, {Description: "sub 2", Details: "2"}},
 			Overview: []OverviewRow{
 				{"overview 1", "1", Green},
 				{"overview 2", "2", Green},
@@ -52,8 +101,8 @@ func TestToHTML(t *testing.T) {
 
 	t.Run("table with content", func(t *testing.T) {
 		report := ScanReport{
-			Title:      "Report Test Title",
-			ReportTime: time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC),
+			ReportTitle: "Report Test Title",
+			ReportTime:  time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC),
 			DetailTable: ScanDetailTable{
 				Headers: []string{"column 1", "column 2"},
 				Rows: []ScanRow{
@@ -84,14 +133,15 @@ func TestToHTML(t *testing.T) {
 func TestToMarkdown(t *testing.T) {
 	t.Run("table with details", func(t *testing.T) {
 		report := ScanReport{
-			Title:      "Report Test Title",
-			Subheaders: []Subheader{{Description: "sub 1", Details: "1"}, {Description: "sub 2", Details: "2"}},
+			ReportTitle: "Report Test Title",
+			Subheaders:  []Subheader{{Description: "sub 1", Details: "1"}, {Description: "sub 2", Details: "2"}},
 			Overview: []OverviewRow{
 				{"overview 1", "1", Green},
 				{"overview 2", "2", Green},
 			},
-			FurtherInfo: "this is further information",
-			ReportTime:  time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC),
+			FurtherInfo:    "this is further information",
+			SuccessfulScan: true,
+			ReportTime:     time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC),
 			DetailTable: ScanDetailTable{
 				Headers: []string{"column 1", "column 2"},
 				Rows: []ScanRow{
@@ -107,7 +157,7 @@ func TestToMarkdown(t *testing.T) {
 		res, err := report.ToMarkdown()
 		result := string(res)
 		assert.NoError(t, err)
-		assert.Contains(t, result, `## Report Test Title`)
+		assert.Contains(t, result, `## :white_check_mark: Report Test Title`)
 		assert.Contains(t, result, `<td><b>sub 1:</b></td><td>1</td>`)
 		assert.Contains(t, result, `<td><b>sub 2:</b></td><td>2</td>`)
 		assert.Contains(t, result, `<tr><td>overview 1:</td><td>1</td></tr>`)
@@ -119,8 +169,8 @@ func TestToMarkdown(t *testing.T) {
 
 	t.Run("table without details", func(t *testing.T) {
 		report := ScanReport{
-			Title:      "Report Test Title",
-			Subheaders: []Subheader{{Description: "sub 1", Details: "1"}, {Description: "sub 2", Details: "2"}},
+			ReportTitle: "Report Test Title",
+			Subheaders:  []Subheader{{Description: "sub 1", Details: "1"}, {Description: "sub 2", Details: "2"}},
 			Overview: []OverviewRow{
 				{"overview 1", "1", Green},
 				{"overview 2", "2", Green},
@@ -132,6 +182,7 @@ func TestToMarkdown(t *testing.T) {
 		res, err := report.ToMarkdown()
 		result := string(res)
 		assert.NoError(t, err)
+		assert.Contains(t, result, `## :x: Report Test Title`)
 		assert.NotContains(t, result, "<details><summary><i>Report Test Title details:</i></summary>")
 	})
 }

@@ -58,24 +58,25 @@ testsPublishResults(
 
 ### jmeter
 
-| parameter | mandatory | default | possible values |
-| ----------|-----------|---------|-----------------|
+| parameter | mandatory | default      | possible values |
+| ----------|-----------|--------------|-----------------|
 | pattern | no | `'**/*.jtl'` |  |
-| errorFailedThreshold | no | `20` |  |
-| errorUnstableThreshold | no | `10` |  |
-| errorUnstableResponseTimeThreshold | no | `` |  |
-| relativeFailedThresholdPositive | no | `0` |  |
-| relativeFailedThresholdNegative | no | `0` |  |
-| relativeUnstableThresholdPositive | no | `0` |  |
-| relativeUnstableThresholdNegative | no | `0` |  |
-| modeOfThreshold | no | `false` | true, false |
-| modeThroughput | no | `false` | true, false |
-| nthBuildNumber | no | `0` |  |
-| configType | no | `PRT` |  |
-| failBuildIfNoResultFile | no | `false` | true, false |
-| compareBuildPrevious | no | `true` | true, false |
-| archive | no | `false` | true, false |
-| allowEmptyResults | no | `true` | true, false |
+| errorFailedThreshold | no | `20`         |  |
+| errorUnstableThreshold | no | `10`         |  |
+| errorUnstableResponseTimeThreshold | no | ``           |  |
+| relativeFailedThresholdPositive | no | `0`          |  |
+| relativeFailedThresholdNegative | no | `0`          |  |
+| relativeUnstableThresholdPositive | no | `0`          |  |
+| relativeUnstableThresholdNegative | no | `0`          |  |
+| modeOfThreshold | no | `false`      | true, false |
+| modeThroughput | no | `false`      | true, false |
+| nthBuildNumber | no | `0`          |  |
+| configType | no | `PRT`        |  |
+| failBuildIfNoResultFile | no | `false`      | true, false |
+| compareBuildPrevious | no | `true`       | true, false |
+| archive | no | `false`      | true, false |
+| allowEmptyResults | no | `true`       | true, false |
+| filterRegex | no | ' '           |  |
 
 ## ${docGenConfiguration}
 
@@ -105,4 +106,42 @@ testsPublishResults(
   junit: [pattern: '**/target/TEST*.xml', archive: true],
   cobertura: [pattern: '**/target/coverage/cobertura-coverage.xml']
 )
+```
+
+## Example: Jenkins job to run UI5 tests with Karma
+
+```groovy
+@Library(['piper-lib  ']) _
+pipeline {
+  agent any
+  tools { nodejs "npm" }
+  environment {
+    mainModule = "centralconfigui"
+  }
+  stages {
+    stage('Karma Tests') {
+      steps {
+        script {
+          karmaExecuteTests script: this, installCommand: 'npm install --quiet --no-package-lock'
+          // Remove browser-bundle.js class block from coverage.xml for Jenkins compatibility
+          sh """
+            sed -i '/<class[^>]*filename=".*browser-bundle\\.js"/,/<\\/class>/d' \\
+            centralconfigui/coverage/coverage.xml
+          """
+          testsPublishResults(
+            script: this,
+            failOnError: false,
+            junit: [pattern: "centralconfigui/webapp/test/reports/TESTS.xml"],
+            cobertura: [
+              archive: true,
+              onlyStableBuilds: false,
+              pattern: "centralconfigui/coverage/coverage.xml",
+              allowEmptyResults: true
+            ]
+          )
+        }
+      }
+    }
+  }
+}
 ```

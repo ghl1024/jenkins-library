@@ -3,14 +3,14 @@ package generator
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
+	"slices"
 	"strings"
 )
 
 func readAndAdjustTemplate(docFile io.ReadCloser) string {
 	//read template content
-	content, err := ioutil.ReadAll(docFile)
+	content, err := io.ReadAll(docFile)
 	checkError(err)
 	contentStr := string(content)
 
@@ -32,12 +32,7 @@ func checkError(err error) {
 }
 
 func contains(v []string, s string) bool {
-	for _, i := range v {
-		if i == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(v, s)
 }
 
 func ifThenElse(condition bool, positive string, negative string) string {

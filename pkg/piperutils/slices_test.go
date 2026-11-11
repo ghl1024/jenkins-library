@@ -1,3 +1,6 @@
+//go:build unit
+// +build unit
+
 package piperutils
 
 import (
@@ -5,29 +8,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 )
-
-func TestContainsInt(t *testing.T) {
-	var intList []int
-	assert.Equal(t, false, ContainsInt(intList, 4))
-
-	intList = append(intList, 1, 2, 3, 4, 5, 6, 20)
-	assert.Equal(t, true, ContainsInt(intList, 20))
-	assert.Equal(t, true, ContainsInt(intList, 1))
-	assert.Equal(t, true, ContainsInt(intList, 4))
-	assert.Equal(t, false, ContainsInt(intList, 13))
-}
-
-func TestContainsString(t *testing.T) {
-	var stringList []string
-	assert.False(t, ContainsString(stringList, "test"))
-	assert.False(t, ContainsString(stringList, ""))
-
-	stringList = append(stringList, "", "foo", "bar", "foo")
-	assert.True(t, ContainsString(stringList, ""))
-	assert.True(t, ContainsString(stringList, "bar"))
-	assert.True(t, ContainsString(stringList, "foo"))
-	assert.False(t, ContainsString(stringList, "baz"))
-}
 
 func TestRemoveAll(t *testing.T) {
 	t.Parallel()
@@ -139,5 +119,14 @@ func TestUniqueStrings(t *testing.T) {
 	unique := UniqueStrings([]string{"abc", "xyz", "123", "abc"})
 	if assert.Len(t, unique, 3) {
 		assert.Subset(t, []string{"123", "abc", "xyz"}, unique)
+	}
+}
+
+func TestCopyAtoB(t *testing.T) {
+	src := []string{"abc", "xyz", "123", "abc"}
+	target := make([]string, 4)
+	CopyAtoB(src, target)
+	if assert.Len(t, target, 4) {
+		assert.EqualValues(t, src, target)
 	}
 }

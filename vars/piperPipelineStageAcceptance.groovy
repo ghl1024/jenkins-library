@@ -17,6 +17,8 @@ import static com.sap.piper.Prerequisites.checkScript
     'cloudFoundryDeploy',
     /** Performs behavior-driven tests using Gauge test framework against the deployed application/service. */
     'gaugeExecuteTests',
+    /** For Kubernetes use-cases: Performs deployment to Kubernetes landscape. */
+    'kubernetesDeploy',
     /**
      * Performs health check in order to prove one aspect of operational readiness.
      * In order to be able to respond to health checks from infrastructure components (like load balancers) it is important to provide one unprotected application endpoint which allows a judgement about the health of your application.
@@ -58,6 +60,7 @@ void call(Map parameters = [:]) {
         .mixin(parameters, PARAMETER_KEYS)
         .addIfEmpty('multicloudDeploy', script.commonPipelineEnvironment.configuration.runStep?.get(stageName)?.multicloudDeploy)
         .addIfEmpty('cloudFoundryDeploy', script.commonPipelineEnvironment.configuration.runStep?.get(stageName)?.cloudFoundryDeploy)
+        .addIfEmpty('kubernetesDeploy', script.commonPipelineEnvironment.configuration.runStep?.get(stageName)?.kubernetesDeploy)
         .addIfEmpty('gaugeExecuteTests', script.commonPipelineEnvironment.configuration.runStep?.get(stageName)?.gaugeExecuteTests)
         .addIfEmpty('healthExecuteCheck', script.commonPipelineEnvironment.configuration.runStep?.get(stageName)?.healthExecuteCheck)
         .addIfEmpty('neoDeploy', script.commonPipelineEnvironment.configuration.runStep?.get(stageName)?.neoDeploy)
@@ -67,10 +70,6 @@ void call(Map parameters = [:]) {
         .use()
 
     piperStageWrapper (script: script, stageName: stageName) {
-
-        // telemetry reporting
-        utils.pushToSWA([step: STEP_NAME], config)
-
         // Prefer the newer multicloudDeploy step if it is configured as it is more capable
         if (config.multicloudDeploy) {
             durationMeasure(script: script, measurementName: 'deploy_test_multicloud_duration') {
@@ -86,6 +85,12 @@ void call(Map parameters = [:]) {
             if (config.neoDeploy) {
                 durationMeasure(script: script, measurementName: 'deploy_test_neo_duration') {
                     neoDeploy script: script
+                }
+            }
+
+            if (config.kubernetesDeploy){
+                durationMeasure(script: script, measurementName: 'deploy_release_kubernetes_duration') {
+                    kubernetesDeploy script: script
                 }
             }
         }
@@ -122,7 +127,7 @@ void call(Map parameters = [:]) {
 
         if (config.npmExecuteEndToEndTests) {
             durationMeasure(script: script, measurementName: 'npmExecuteEndToEndTests_duration') {
-                npmExecuteEndToEndTests script: script, stageName: stageName, runScript: 'ci-e2e'
+                npmExecuteEndToEndTests script: script, stageName: stageName
             }
         }
 

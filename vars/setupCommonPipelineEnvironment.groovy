@@ -6,6 +6,7 @@ import com.sap.piper.GenerateDocumentation
 import com.sap.piper.ConfigurationHelper
 import com.sap.piper.Utils
 import com.sap.piper.analytics.InfluxData
+import com.sap.piper.GitUtils
 
 import groovy.transform.Field
 
@@ -56,6 +57,7 @@ void call(Map parameters = [:]) {
     handlePipelineStepErrors (stepName: STEP_NAME, stepParameters: parameters) {
 
         def script = checkScript(this, parameters)
+        def utils = parameters.utils ?: new Utils()
 
         String configFile = parameters.get('configFile')
         loadConfigurationFromFile(script, configFile)
@@ -96,7 +98,7 @@ void call(Map parameters = [:]) {
         if (configFile && !configFile.startsWith('.pipeline/')) {
             stashIncludes += ", $configFile"
         }
-        stash name: 'pipelineConfigAndTests', includes: stashIncludes, allowEmpty: true
+        utils.stash name: 'pipelineConfigAndTests', includes: stashIncludes, allowEmpty: true
 
         Map config = ConfigurationHelper.newInstance(this)
             .loadStepDefaults()
@@ -105,12 +107,6 @@ void call(Map parameters = [:]) {
 
         inferBuildTool(script, config)
 
-        (parameters.utils ?: new Utils()).pushToSWA([
-            step: STEP_NAME,
-            stepParamKey4: 'customDefaults',
-            stepParam4: parameters.customDefaults?'true':'false'
-        ], config)
-
         InfluxData.addField('step_data', 'build_url', env.BUILD_URL)
         InfluxData.addField('pipeline_data', 'build_url', env.BUILD_URL)
 
@@ -118,6 +114,9 @@ void call(Map parameters = [:]) {
         if (scmInfo) {
             setGitUrlsOnCommonPipelineEnvironment(script, scmInfo.GIT_URL)
             script.commonPipelineEnvironment.setGitCommitId(scmInfo.GIT_COMMIT)
+
+            def gitUtils = parameters.gitUtils ?: new GitUtils()
+            setGitRefOnCommonPipelineEnvironment(script, scmInfo.GIT_COMMIT, scmInfo.GIT_BRANCH, gitUtils)
         }
     }
 }
@@ -258,4 +257,54 @@ private void setGitUrlsOnCommonPipelineEnvironment(script, String gitUrl) {
     }
     script.commonPipelineEnvironment.setGithubOrg(gitFolder)
     script.commonPipelineEnvironment.setGithubRepo(gitRepo)
+}
+
+private void setGitRefOnCommonPipelineEnvironment(script, String gitCommit, String gitBranch, def gitUtils) {
+    if(!gitBranch){
+        return
+    }
+
+    if(gitBranch.contains("/")){
+        gitBranchSplit = gitBranch.split("/")
+        if(gitBranchSplit[0] == "origin") {
+            gitBranch = gitBranchSplit[1..-1].join("/")
+        }
+    }
+
+    if (!gitBranch.startsWith("PR-")) {
+        if (gitBranch.startsWith("refs/") ){
+            script.commonPipelineEnvironment.setGitRef(gitBranch)
+        } else {
+            script.commonPipelineEnvironment.setGitRef("refs/heads/" + gitBranch)
+        }
+        script.commonPipelineEnvironment.setGitRemoteCommitId(gitCommit)
+        return
+    }
+
+    boolean isMergeCommit = false
+    try{
+        isMergeCommit = gitUtils.isMergeCommit()
+    }catch(MissingPropertyException e){
+        script.commonPipelineEnvironment.setGitRemoteCommitId("NA")
+        script.commonPipelineEnvironment.setGitRef("NA")
+        echo "[${STEP_NAME}] ${e}"
+        return
+    }
+
+    def mergeOrHead = isMergeCommit?"merge":"head"
+    def changeId = gitBranch.split("-")[1]
+    script.commonPipelineEnvironment.setGitRef("refs/pull/" + changeId + "/" + mergeOrHead)
+
+    if(!isMergeCommit){
+        script.commonPipelineEnvironment.setGitRemoteCommitId(gitCommit)
+        return
+    }
+
+    try{
+        script.commonPipelineEnvironment.setGitRemoteCommitId(gitUtils.getMergeCommitSha())
+    }catch(MissingPropertyException e){
+        echo "[${STEP_NAME}] ${e}"
+        echo "[${STEP_NAME}] Please make sure you have 'Pipeline: GitHub' plugin installed in Jenkins and your Jenkins is running Java 8 or higher."
+        script.commonPipelineEnvironment.setGitRemoteCommitId("NA")
+    }
 }

@@ -1,10 +1,34 @@
+//go:build unit
+// +build unit
+
 package versioning
 
 import (
+	"net/http"
 	"testing"
+
+	"github.com/SAP/jenkins-library/pkg/mock"
 
 	"github.com/stretchr/testify/assert"
 )
+
+type versioningMockUtils struct {
+	*mock.ExecMockRunner
+	*mock.FilesMock
+}
+
+func newVersioningMockUtils() *versioningMockUtils {
+	utils := versioningMockUtils{
+		ExecMockRunner: &mock.ExecMockRunner{},
+		FilesMock:      &mock.FilesMock{},
+	}
+	return &utils
+}
+
+func (v *versioningMockUtils) DownloadFile(url, filename string, header http.Header, cookies []*http.Cookie) error {
+	// so far no dedicated logic required for testing
+	return nil
+}
 
 func TestGetArtifact(t *testing.T) {
 	t.Run("custom", func(t *testing.T) {
@@ -45,8 +69,13 @@ func TestGetArtifact(t *testing.T) {
 		assert.Equal(t, "semver2", dub.VersioningScheme())
 	})
 
-	t.Run("golang", func(t *testing.T) {
-		fileExists = func(string) (bool, error) { return true, nil }
+	t.Run("golang - version file", func(t *testing.T) {
+		fileExists = func(s string) (bool, error) {
+			if s == "go.mod" {
+				return false, nil
+			}
+			return true, nil
+		}
 		golang, err := GetArtifact("golang", "", &Options{}, nil)
 
 		assert.NoError(t, err)
@@ -57,11 +86,28 @@ func TestGetArtifact(t *testing.T) {
 		assert.Equal(t, "semver2", golang.VersioningScheme())
 	})
 
+	t.Run("golang - gomod", func(t *testing.T) {
+		fileExists = func(s string) (bool, error) {
+			if s == "go.mod" {
+				return true, nil
+			}
+			return false, nil
+		}
+		golang, err := GetArtifact("golang", "", &Options{}, nil)
+
+		assert.NoError(t, err)
+
+		theType, ok := golang.(*GoMod)
+		assert.True(t, ok)
+		assert.Equal(t, "go.mod", theType.path)
+		assert.Equal(t, "semver2", golang.VersioningScheme())
+	})
+
 	t.Run("golang - error", func(t *testing.T) {
 		fileExists = func(string) (bool, error) { return false, nil }
 		_, err := GetArtifact("golang", "", &Options{}, nil)
 
-		assert.EqualError(t, err, "no build descriptor available, supported: [VERSION version.txt go.mod]")
+		assert.EqualError(t, err, "no build descriptor available, supported: [go.mod VERSION version.txt]")
 	})
 
 	t.Run("gradle", func(t *testing.T) {
@@ -76,6 +122,17 @@ func TestGetArtifact(t *testing.T) {
 		assert.Equal(t, "semver2", gradle.VersioningScheme())
 	})
 
+	t.Run("helm", func(t *testing.T) {
+		helm, err := GetArtifact("helm", "testchart/Chart.yaml", &Options{}, nil)
+
+		assert.NoError(t, err)
+
+		theType, ok := helm.(*HelmChart)
+		assert.True(t, ok)
+		assert.Equal(t, "testchart/Chart.yaml", theType.path)
+		assert.Equal(t, "semver2", helm.VersioningScheme())
+	})
+
 	t.Run("maven", func(t *testing.T) {
 		opts := Options{
 			ProjectSettingsFile: "projectsettings.xml",
@@ -83,6 +140,25 @@ func TestGetArtifact(t *testing.T) {
 			M2Path:              "m2/path",
 		}
 		maven, err := GetArtifact("maven", "", &opts, nil)
+		assert.NoError(t, err)
+
+		theType, ok := maven.(*Maven)
+		assert.True(t, ok)
+		assert.Equal(t, "pom.xml", theType.options.PomPath)
+		assert.Equal(t, opts.ProjectSettingsFile, theType.options.ProjectSettingsFile)
+		assert.Equal(t, opts.GlobalSettingsFile, theType.options.GlobalSettingsFile)
+		assert.Equal(t, opts.M2Path, theType.options.M2Path)
+		assert.Equal(t, "maven", maven.VersioningScheme())
+	})
+
+	t.Run("CAP - maven", func(t *testing.T) {
+		opts := Options{
+			ProjectSettingsFile:     "projectsettings.xml",
+			GlobalSettingsFile:      "globalsettings.xml",
+			M2Path:                  "m2/path",
+			CAPVersioningPreference: "maven",
+		}
+		maven, err := GetArtifact("CAP", "", &opts, nil)
 		assert.NoError(t, err)
 
 		theType, ok := maven.(*Maven)
@@ -118,6 +194,28 @@ func TestGetArtifact(t *testing.T) {
 		assert.Equal(t, "semver2", npm.VersioningScheme())
 	})
 
+	t.Run("rust", func(t *testing.T) {
+		rust, err := GetArtifact("rust", "", &Options{}, nil)
+
+		assert.NoError(t, err)
+
+		theType, ok := rust.(*Cargo)
+		assert.True(t, ok)
+		assert.Equal(t, CargoBuildDescriptor, theType.path)
+		assert.Equal(t, "semver2", rust.VersioningScheme())
+	})
+
+	t.Run("CAP - npm", func(t *testing.T) {
+		npm, err := GetArtifact("CAP", "", &Options{VersionField: "theversion", CAPVersioningPreference: "npm"}, nil)
+		assert.NoError(t, err)
+
+		theType, ok := npm.(*JSONfile)
+		assert.True(t, ok)
+		assert.Equal(t, "package.json", theType.path)
+		assert.Equal(t, "version", theType.versionField)
+		assert.Equal(t, "semver2", npm.VersioningScheme())
+	})
+
 	t.Run("yarn", func(t *testing.T) {
 		npm, err := GetArtifact("yarn", "", &Options{VersionField: "theversion"}, nil)
 
@@ -131,8 +229,10 @@ func TestGetArtifact(t *testing.T) {
 	})
 
 	t.Run("pip", func(t *testing.T) {
-		fileExists = func(string) (bool, error) { return true, nil }
-		pip, err := GetArtifact("pip", "", &Options{}, nil)
+		utils := newVersioningMockUtils()
+		utils.FilesMock.AddFile("setup.py", []byte(""))
+		fileExists = utils.FilesMock.FileExists
+		pip, err := GetArtifact("pip", "", &Options{}, utils)
 
 		assert.NoError(t, err)
 
@@ -146,7 +246,7 @@ func TestGetArtifact(t *testing.T) {
 		fileExists = func(string) (bool, error) { return false, nil }
 		_, err := GetArtifact("pip", "", &Options{}, nil)
 
-		assert.EqualError(t, err, "no build descriptor available, supported: [setup.py version.txt VERSION]")
+		assert.EqualError(t, err, "no build descriptor available, supported: [pyproject.toml setup.py version.txt VERSION]")
 	})
 
 	t.Run("sbt", func(t *testing.T) {
@@ -190,13 +290,15 @@ func TestCustomArtifact(t *testing.T) {
 	}
 
 	for _, test := range tt {
-		res, err := customArtifact(test.file, test.field, test.section, test.scheme)
+		t.Run(test.file, func(t *testing.T) {
+			res, err := customArtifact(test.file, test.field, test.section, test.scheme)
+			if len(test.expectedErr) == 0 {
+				assert.NoError(t, err)
+				assert.Equal(t, test.expected, res)
+			} else {
+				assert.EqualError(t, err, test.expectedErr)
+			}
+		})
 
-		if len(test.expectedErr) == 0 {
-			assert.NoError(t, err)
-			assert.Equal(t, test.expected, res)
-		} else {
-			assert.EqualError(t, err, test.expectedErr)
-		}
 	}
 }

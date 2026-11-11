@@ -2,9 +2,12 @@ package cmd
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/SAP/jenkins-library/pkg/command"
@@ -12,20 +15,19 @@ import (
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/piperutils"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/pkg/errors"
 )
 
 const hadolintCommand = "hadolint"
 
 // HadolintPiperFileUtils abstracts piperutils.Files
-// mock generated with: mockery --name HadolintPiperFileUtils --dir cmd --output pkg/hadolint/mocks
 type HadolintPiperFileUtils interface {
 	FileExists(filename string) (bool, error)
 	FileWrite(filename string, data []byte, perm os.FileMode) error
+	WriteFile(filename string, data []byte, perm os.FileMode) error
+	Glob(pattern string) (matches []string, err error)
 }
 
 // HadolintClient abstracts http.Client
-// mock generated with: mockery --name hadolintClient --dir cmd --output pkg/hadolint/mocks
 type HadolintClient interface {
 	SetOptions(options piperhttp.ClientOptions)
 	DownloadFile(url, filename string, header http.Header, cookies []*http.Cookie) error
@@ -76,13 +78,18 @@ func runHadolint(config hadolintExecuteOptions, utils hadolintUtils) error {
 			TransportTimeout:          20 * time.Second,
 			TransportSkipVerification: true,
 		}
+		if len(config.CustomTLSCertificateLinks) > 0 {
+			clientOptions.TransportSkipVerification = false
+			clientOptions.TrustedCerts = config.CustomTLSCertificateLinks
+		}
+
 		if len(config.ConfigurationUsername) > 0 {
 			clientOptions.Username = config.ConfigurationUsername
 			clientOptions.Password = config.ConfigurationPassword
 		}
 		utils.SetOptions(clientOptions)
 		if err := loadConfigurationFile(config.ConfigurationURL, config.ConfigurationFile, utils); err != nil {
-			return errors.Wrap(err, "failed to load configuration file from URL")
+			return fmt.Errorf("failed to load configuration file from URL: %w", err)
 		}
 	}
 	// use config
@@ -93,22 +100,57 @@ func runHadolint(config hadolintExecuteOptions, utils hadolintUtils) error {
 		log.Entry().Debug("No configuration file found.")
 	}
 	// execute scan command
-	err := utils.RunExecutable(hadolintCommand, append([]string{config.DockerFile}, options...)...)
+	filesToLint, err := utils.Glob(config.DockerFile)
+	if err != nil {
+		return fmt.Errorf("failed to expand glob pattern '%s': %w", config.DockerFile, err)
+	}
+	if len(filesToLint) == 0 {
+		return fmt.Errorf("no Dockerfiles found for pattern '%s'", config.DockerFile)
+	}
+	filesToLint, err = excludeDockerfiles(filesToLint, config.DockerFileExclude)
+	if err != nil {
+		return fmt.Errorf("failed to apply dockerFileExclude: %w", err)
+	}
+	if len(filesToLint) == 0 {
+		return fmt.Errorf("no Dockerfiles found for pattern '%s' after applying dockerFileExclude", config.DockerFile)
+	}
+	err = utils.RunExecutable(hadolintCommand, append(filesToLint, options...)...)
 
 	//TODO: related to https://github.com/hadolint/hadolint/issues/391
 	// hadolint exists with 1 if there are processing issues but also if there are findings
 	// thus check stdout first if a report was created
 	if output := outputBuffer.String(); len(output) > 0 {
 		log.Entry().WithField("report", output).Debug("Report created")
-		utils.FileWrite(config.ReportFile, []byte(output), 0666)
+		if err := utils.FileWrite(config.ReportFile, []byte(output), 0666); err != nil {
+			log.Entry().WithError(err).Warningf("failed to write report %v", config.ReportFile)
+		}
 	} else if err != nil {
 		// if stdout is empty a processing issue occured
-		return errors.Wrap(err, errorBuffer.String())
+		return fmt.Errorf(errorBuffer.String(), err)
 	}
 	//TODO: mock away in tests
 	// persist report information
-	piperutils.PersistReportsAndLinks("hadolintExecute", "./", []piperutils.Path{{Target: config.ReportFile}}, []piperutils.Path{})
+	piperutils.PersistReportsAndLinks("hadolintExecute", "./", utils, []piperutils.Path{{Target: config.ReportFile}}, []piperutils.Path{})
 	return nil
+}
+
+func excludeDockerfiles(files, exclusions []string) ([]string, error) {
+	if len(exclusions) == 0 {
+		return files, nil
+	}
+
+	patterns := make([]string, 0, len(exclusions)*2)
+	for _, exclusion := range exclusions {
+		if strings.TrimSpace(exclusion) == "" {
+			continue
+		}
+		patterns = append(patterns, exclusion)
+		// Treat a directory value as a recursive exclusion while preserving
+		// exact-file and regular glob matching through the original pattern.
+		patterns = append(patterns, filepath.Join(exclusion, "**"))
+	}
+
+	return piperutils.ExcludeFiles(files, patterns)
 }
 
 // loadConfigurationFile loads a file from the provided url

@@ -2,17 +2,23 @@ package generator
 
 import (
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/SAP/jenkins-library/pkg/config"
+	"github.com/SAP/jenkins-library/pkg/piperutils"
 )
 
-const configRecommendation = "We recommend to define values of [step parameters](#parameters) via [config.yml file](../configuration.md). In this case, calling the step is reduced to one simple line.<br />Calling the step can be done either via the Jenkins library step or on the [command line](../cli/index.md)."
+const configRecommendation = "We recommend to define values of [step parameters](#parameters) via [.pipeline/config.yml file](../configuration.md).<br />In this case, calling the step is essentially reduced to defining the step name.<br />Calling the step can be done either in an orchestrator specific way (e.g. via a Jenkins library step) or on the command line."
 
 const (
 	headlineDescription     = "## Description\n\n"
 	headlineUsage           = "## Usage\n\n"
-	headlineJenkinsPipeline = "### Jenkins Pipeline\n\n"
-	headlineCommandLine     = "### Command Line\n\n"
+	headlineJenkinsPipeline = "    === \"Jenkins\"\n\n"
+	headlineCommandLine     = "    === \"Command Line\"\n\n"
+	headlineAzure           = "    === \"Azure DevOps\"\n\n"
+	headlineGHA             = "    === \"GitHub Actions\"\n\n"
+	spacingTabBox           = "        "
 )
 
 // defaultBinaryName is the name of the local binary that is used for sample generation.
@@ -26,15 +32,41 @@ var CustomLibrarySteps = []CustomLibrary{}
 
 // CustomLibrary represents a custom library with it's custom step names, binary name and library name.
 type CustomLibrary struct {
-	Name        string   `yaml: "name,omitempty"`
-	BinaryName  string   `yaml: "binaryName,omitempty"`
-	LibraryName string   `yaml: "libraryName,omitempty"`
-	Steps       []string `yaml: "steps,omitempty"`
+	Name        string   `yaml:"name,omitempty" yaml:"name,omitempty"`
+	BinaryName  string   `yaml:"binaryName,omitempty" yaml:"binaryName,omitempty"`
+	LibraryName string   `yaml:"libraryName,omitempty" yaml:"libraryName,omitempty"`
+	Steps       []string `yaml:"steps,omitempty" yaml:"steps,omitempty"`
+}
+
+type orchestratorInfo struct {
+	label string
+	color string
+}
+
+var orchestrators = map[string]orchestratorInfo{
+	"jenkins": {label: "Jenkins", color: "yellowgreen"},
+	"gha":     {label: "GitHub Actions", color: "blue"},
+	"azure":   {label: "Azure DevOps", color: "9cf"},
+}
+
+func orchestratorBadge(orchestrator string) string {
+	info, ok := orchestrators[strings.ToLower(orchestrator)]
+	if !ok {
+		label := piperutils.Title(strings.ToLower(orchestrator))
+		info = orchestratorInfo{label: label, color: "lightgrey"}
+	}
+	badgeText := info.label + " only"
+	badgeURL := strings.ReplaceAll(badgeText, " ", "%20")
+	return fmt.Sprintf("[![%s](https://img.shields.io/badge/-%s-%s)](#)", badgeText, badgeURL, info.color)
 }
 
 // Replaces the StepName placeholder with the content from the yaml
 func createStepName(stepData *config.StepData) string {
-	return "# " + stepData.Metadata.Name + "\n\n" + stepData.Metadata.Description + "\n"
+	badge := ""
+	if len(stepData.Metadata.Orchestrators) == 1 {
+		badge = " " + orchestratorBadge(stepData.Metadata.Orchestrators[0])
+	}
+	return "# " + stepData.Metadata.Name + badge + "\n\n" + stepData.Metadata.Description + "\n"
 }
 
 // Replaces the Description placeholder with content from the yaml
@@ -45,20 +77,54 @@ func createDescriptionSection(stepData *config.StepData) string {
 	description += headlineDescription + stepData.Metadata.LongDescription + "\n\n"
 	description += headlineUsage
 	description += configRecommendation + "\n\n"
+	description += `!!! tip ""` + "\n\n"
+	// add Jenkins-specific information
 	description += headlineJenkinsPipeline
-	description += fmt.Sprintf("```groovy\nlibrary('%s')\n\n%v script: this\n```\n\n", libraryName, stepData.Metadata.Name)
+	description += fmt.Sprintf("%v```groovy\n", spacingTabBox)
+	description += fmt.Sprintf("%vlibrary('%s')\n\n", spacingTabBox, libraryName)
+	description += fmt.Sprintf("%v%v script: this\n", spacingTabBox, stepData.Metadata.Name)
+	description += fmt.Sprintf("%v```\n\n", spacingTabBox)
+
+	// add Azure-specific information if activated
+	if includeAzure {
+		description += headlineAzure
+		description += fmt.Sprintf("%v```\n", spacingTabBox)
+		description += fmt.Sprintf("%vsteps:\n", spacingTabBox)
+		description += fmt.Sprintf("%v  - task: piper@1\n", spacingTabBox)
+		description += fmt.Sprintf("%v    name: %v\n", spacingTabBox, stepData.Metadata.Name)
+		description += fmt.Sprintf("%v    inputs:\n", spacingTabBox)
+		description += fmt.Sprintf("%v      stepName: %v\n", spacingTabBox, stepData.Metadata.Name)
+		description += fmt.Sprintf("%v      flags: --anyStepParameter\n", spacingTabBox)
+		description += fmt.Sprintf("%v```\n\n", spacingTabBox)
+	}
+
+	// add GiHub Actions specific information if activated
+	if includeGHA {
+		description += headlineGHA
+		description += fmt.Sprintf("%v```\n", spacingTabBox)
+		description += fmt.Sprintf("%vsteps:\n", spacingTabBox)
+		description += fmt.Sprintf("%v  - uses: SAP/project-piper-action@releaseCommitSHA\n", spacingTabBox)
+		description += fmt.Sprintf("%v    name: %v\n", spacingTabBox, stepData.Metadata.Name)
+		description += fmt.Sprintf("%v    with:\n", spacingTabBox)
+		description += fmt.Sprintf("%v      step-name: %v\n", spacingTabBox, stepData.Metadata.Name)
+		description += fmt.Sprintf("%v      flags: --anyStepParameter\n", spacingTabBox)
+		description += fmt.Sprintf("%v```\n\n", spacingTabBox)
+	}
+
+	// add command line information
 	description += headlineCommandLine
-	description += fmt.Sprintf("```sh\n%s %v\n```\n\n", binaryName, stepData.Metadata.Name)
+	description += fmt.Sprintf("%v```sh\n", spacingTabBox)
+	description += fmt.Sprintf("%v%s %v\n", spacingTabBox, binaryName, stepData.Metadata.Name)
+	description += fmt.Sprintf("%v```\n\n", spacingTabBox)
+
 	description += stepOutputs(stepData)
 	return description
 }
 
 func getNames(stepName string) (string, string) {
 	for _, library := range CustomLibrarySteps {
-		for _, customStepName := range library.Steps {
-			if stepName == customStepName {
-				return library.LibraryName, library.BinaryName
-			}
+		if slices.Contains(library.Steps, stepName) {
+			return library.LibraryName, library.BinaryName
 		}
 	}
 	return defaultLibraryName, defaultBinaryName

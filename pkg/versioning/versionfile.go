@@ -1,11 +1,9 @@
 package versioning
 
 import (
-	"io/ioutil"
+	"fmt"
 	"os"
 	"strings"
-
-	"github.com/pkg/errors"
 )
 
 // Versionfile defines an artifact containing the version in a file, e.g. VERSION
@@ -21,11 +19,11 @@ func (v *Versionfile) init() {
 		v.path = "VERSION"
 	}
 	if v.readFile == nil {
-		v.readFile = ioutil.ReadFile
+		v.readFile = os.ReadFile
 	}
 
 	if v.writeFile == nil {
-		v.writeFile = ioutil.WriteFile
+		v.writeFile = os.WriteFile
 	}
 }
 
@@ -43,7 +41,7 @@ func (v *Versionfile) GetVersion() (string, error) {
 
 	content, err := v.readFile(v.path)
 	if err != nil {
-		return "", errors.Wrapf(err, "failed to read file '%v'", v.path)
+		return "", fmt.Errorf("failed to read file '%v': %w", v.path, err)
 	}
 
 	return strings.TrimSpace(string(content)), nil
@@ -55,7 +53,7 @@ func (v *Versionfile) SetVersion(version string) error {
 
 	err := v.writeFile(v.path, []byte(version), 0700)
 	if err != nil {
-		return errors.Wrapf(err, "failed to write file '%v'", v.path)
+		return fmt.Errorf("failed to write file '%v': %w", v.path, err)
 	}
 
 	return nil

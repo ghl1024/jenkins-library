@@ -4,45 +4,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 
-	"github.com/Jeffail/gabs/v2"
-	"github.com/SAP/jenkins-library/pkg/command"
 	"github.com/SAP/jenkins-library/pkg/cpi"
 	piperhttp "github.com/SAP/jenkins-library/pkg/http"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/pkg/errors"
+
+	"github.com/Jeffail/gabs/v2"
 )
-
-type integrationArtifactUpdateConfigurationUtils interface {
-	command.ExecRunner
-
-	// Add more methods here, or embed additional interfaces, or remove/replace as required.
-	// The integrationArtifactUpdateConfigurationUtils interface should be descriptive of your runtime dependencies,
-	// i.e. include everything you need to be able to mock in tests.
-	// Unit tests shall be executable in parallel (not depend on global state), and don't (re-)test dependencies.
-}
-
-type integrationArtifactUpdateConfigurationUtilsBundle struct {
-	*command.Command
-
-	// Embed more structs as necessary to implement methods or interfaces you add to integrationArtifactUpdateConfigurationUtils.
-	// Structs embedded in this way must each have a unique set of methods attached.
-	// If there is no struct which implements the method you need, attach the method to
-	// integrationArtifactUpdateConfigurationUtilsBundle and forward to the implementation of the dependency.
-}
-
-func newIntegrationArtifactUpdateConfigurationUtils() integrationArtifactUpdateConfigurationUtils {
-	utils := integrationArtifactUpdateConfigurationUtilsBundle{
-		Command: &command.Command{},
-	}
-	// Reroute command output to logging framework
-	utils.Stdout(log.Writer())
-	utils.Stderr(log.Writer())
-	return &utils
-}
 
 func integrationArtifactUpdateConfiguration(config integrationArtifactUpdateConfigurationOptions, telemetryData *telemetry.CustomData) {
 	// Utils can be used wherever the command.ExecRunner interface is expected.
@@ -63,12 +34,15 @@ func integrationArtifactUpdateConfiguration(config integrationArtifactUpdateConf
 
 func runIntegrationArtifactUpdateConfiguration(config *integrationArtifactUpdateConfigurationOptions, telemetryData *telemetry.CustomData, httpClient piperhttp.Sender) error {
 	clientOptions := piperhttp.ClientOptions{}
-
-	configUpdateURL := fmt.Sprintf("%s/api/v1/IntegrationDesigntimeArtifacts(Id='%s',Version='%s')/$links/Configurations('%s')", config.Host, config.IntegrationFlowID, config.IntegrationFlowVersion, config.ParameterKey)
-	tokenParameters := cpi.TokenParameters{TokenURL: config.OAuthTokenProviderURL, Username: config.Username, Password: config.Password, Client: httpClient}
+	serviceKey, err := cpi.ReadCpiServiceKey(config.APIServiceKey)
+	if err != nil {
+		return err
+	}
+	configUpdateURL := fmt.Sprintf("%s/api/v1/IntegrationDesigntimeArtifacts(Id='%s',Version='%s')/$links/Configurations('%s')", serviceKey.OAuth.Host, config.IntegrationFlowID, config.IntegrationFlowVersion, config.ParameterKey)
+	tokenParameters := cpi.TokenParameters{TokenURL: serviceKey.OAuth.OAuthTokenProviderURL, Username: serviceKey.OAuth.ClientID, Password: serviceKey.OAuth.ClientSecret, Client: httpClient}
 	token, err := cpi.CommonUtils.GetBearerToken(tokenParameters)
 	if err != nil {
-		return errors.Wrap(err, "failed to fetch Bearer Token")
+		return fmt.Errorf("failed to fetch Bearer Token: %w", err)
 	}
 	clientOptions.Token = fmt.Sprintf("Bearer %s", token)
 	httpClient.SetOptions(clientOptions)
@@ -81,11 +55,11 @@ func runIntegrationArtifactUpdateConfiguration(config *integrationArtifactUpdate
 	jsonBody, jsonErr := json.Marshal(jsonObj)
 
 	if jsonErr != nil {
-		return errors.Wrapf(jsonErr, "input json body is invalid for parameterValue %q", config.ParameterValue)
+		return fmt.Errorf("input json body is invalid for parameterValue %q: %w", config.ParameterValue, jsonErr)
 	}
 	configUpdateResp, httpErr := httpClient.SendRequest(httpMethod, configUpdateURL, bytes.NewBuffer(jsonBody), header, nil)
 	if httpErr != nil {
-		return errors.Wrapf(httpErr, "HTTP %q request to %q failed with error", httpMethod, configUpdateURL)
+		return fmt.Errorf("HTTP %q request to %q failed with error: %w", httpMethod, configUpdateURL, httpErr)
 	}
 
 	if configUpdateResp != nil && configUpdateResp.Body != nil {
@@ -93,7 +67,7 @@ func runIntegrationArtifactUpdateConfiguration(config *integrationArtifactUpdate
 	}
 
 	if configUpdateResp == nil {
-		return errors.Errorf("did not retrieve a HTTP response")
+		return fmt.Errorf("did not retrieve a HTTP response")
 	}
 
 	if configUpdateResp.StatusCode == http.StatusAccepted {
@@ -102,12 +76,12 @@ func runIntegrationArtifactUpdateConfiguration(config *integrationArtifactUpdate
 			Info("successfully updated the integration flow configuration parameter")
 		return nil
 	}
-	response, readErr := ioutil.ReadAll(configUpdateResp.Body)
+	response, readErr := io.ReadAll(configUpdateResp.Body)
 
 	if readErr != nil {
-		return errors.Wrapf(readErr, "HTTP response body could not be read, Response status code: %v", configUpdateResp.StatusCode)
+		return fmt.Errorf("HTTP response body could not be read, Response status code: %v: %w", configUpdateResp.StatusCode, readErr)
 	}
 
-	log.Entry().Errorf("a HTTP error occurred! Response body: %v, Response status code: %v", response, configUpdateResp.StatusCode)
-	return errors.Errorf("Failed to update the integration flow configuration parameter, Response Status code: %v", configUpdateResp.StatusCode)
+	log.Entry().Errorf("a HTTP error occurred! Response body: %v, Response status code: %v", string(response), configUpdateResp.StatusCode)
+	return fmt.Errorf("Failed to update the integration flow configuration parameter, Response Status code: %v", configUpdateResp.StatusCode)
 }

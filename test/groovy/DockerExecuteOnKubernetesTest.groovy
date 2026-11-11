@@ -68,6 +68,18 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
     def podSpec
     Map resources =  [:]
     List stashList = []
+    List unstashList = []
+    def utilsMock = newUtilsMock()
+
+    Utils newUtilsMock() {
+        def utilsMock = new Utils()
+        utilsMock.steps = [
+            stash  : { m -> stashList.add(m) },
+            unstash  : { m -> unstashList.add(m) }
+        ]
+        utilsMock.echo = { def m -> }
+        return utilsMock
+    }
 
     @Before
     void init() {
@@ -115,23 +127,13 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
             }
             body()
         })
-        helper.registerAllowedMethod('stash', [Map.class], { m ->
-            stashList.add(m)
-        })
-
-        Utils.metaClass.echo = { def m -> }
-    }
-
-    @After
-    public void tearDown() {
-        Utils.metaClass = null
     }
 
     @Test
     void testRunOnPodNoContainerMapOnlyDockerImage() throws Exception {
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             dockerImage: 'maven:3.5-jdk-8-alpine',
             dockerOptions: '-it',
             dockerVolumeBind: ['my_vol': '/my_vol'],
@@ -152,7 +154,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
     void testDockerExecuteOnKubernetesEmptyContainerMapNoDockerImage() throws Exception {
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             containerMap: [:],
             dockerEnvVars: ['customEnvKey': 'customEnvValue']) {
             bodyExecuted = true
@@ -162,7 +164,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
 
     @Test
     void testDockerExecuteOnKubernetesWithCustomContainerMap() throws Exception {
-        stepRule.step.dockerExecuteOnKubernetes(script: nullScript,
+        stepRule.step.dockerExecuteOnKubernetes(script: nullScript, juStabUtils: utilsMock,
             containerMap: ['maven:3.5-jdk-8-alpine': 'mavenexecute']) {
             container(name: 'mavenexecute') {
                 bodyExecuted = true
@@ -178,7 +180,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
     @Test
     void testInheritFromPodTemplate() throws Exception {
         nullScript.commonPipelineEnvironment.configuration = ['general': ['jenkinsKubernetes': ['inheritFrom': 'default']]]
-        stepRule.step.dockerExecuteOnKubernetes(script: nullScript,
+        stepRule.step.dockerExecuteOnKubernetes(script: nullScript, juStabUtils: utilsMock,
             containerMap: ['maven:3.5-jdk-8-alpine': 'mavenexecute']) {
             container(name: 'mavenexecute') {
                 bodyExecuted = true
@@ -192,7 +194,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
     @Test
     void testDockerExecuteOnKubernetesWithCustomJnlpWithContainerMap() throws Exception {
         nullScript.commonPipelineEnvironment.configuration = ['general': ['jenkinsKubernetes': ['jnlpAgent': 'myJnalpAgent']]]
-        stepRule.step.dockerExecuteOnKubernetes(script: nullScript,
+        stepRule.step.dockerExecuteOnKubernetes(script: nullScript, juStabUtils: utilsMock,
             containerMap: ['maven:3.5-jdk-8-alpine': 'mavenexecute']) {
             container(name: 'mavenexecute') {
                 bodyExecuted = true
@@ -212,7 +214,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
         nullScript.commonPipelineEnvironment.configuration = ['general': ['jenkinsKubernetes': ['jnlpAgent': 'myJnalpAgent']]]
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             dockerImage: 'maven:3.5-jdk-8-alpine') {
             bodyExecuted = true
         }
@@ -226,7 +228,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
 
     @Test
     void testDockerExecuteOnKubernetesWithCustomWorkspace() throws Exception {
-        stepRule.step.dockerExecuteOnKubernetes(script: nullScript,
+        stepRule.step.dockerExecuteOnKubernetes(script: nullScript, juStabUtils: utilsMock,
             containerMap: ['maven:3.5-jdk-8-alpine': 'mavenexecute'],
             dockerWorkspace: '/home/piper') {
             container(name: 'mavenexecute') {
@@ -239,7 +241,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
 
     @Test
     void testDockerExecuteOnKubernetesWithCustomEnv() throws Exception {
-        stepRule.step.dockerExecuteOnKubernetes(script: nullScript,
+        stepRule.step.dockerExecuteOnKubernetes(script: nullScript, juStabUtils: utilsMock,
             containerMap: ['maven:3.5-jdk-8-alpine': 'mavenexecute'],
             dockerEnvVars: ['customEnvKey': 'customEnvValue']) {
             container(name: 'mavenexecute') {
@@ -270,7 +272,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
                 ]
             ]
         ]]
-        stepRule.step.dockerExecuteOnKubernetes(script: nullScript,
+        stepRule.step.dockerExecuteOnKubernetes(script: nullScript, juStabUtils: utilsMock,
             containerMap: ['maven:3.5-jdk-8-alpine': 'mavenexecute'], {
                 bodyExecuted = true
             })
@@ -296,7 +298,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
                 ]
             ]
         ]]]
-        stepRule.step.dockerExecuteOnKubernetes(script: nullScript,
+        stepRule.step.dockerExecuteOnKubernetes(script: nullScript, juStabUtils: utilsMock,
             containerMap: ['maven:3.5-jdk-8-alpine': 'mavenexecute'], {
                 bodyExecuted = true
             })
@@ -325,7 +327,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
                 ]
             ]
         ]]]
-        stepRule.step.dockerExecuteOnKubernetes(script: nullScript,
+        stepRule.step.dockerExecuteOnKubernetes(script: nullScript, juStabUtils: utilsMock,
             containerMap: ['maven:3.5-jdk-8-alpine': 'mavenexecute'],
             resources: [
                     mavenexecute: [
@@ -395,13 +397,13 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
                 ]
             ]
         ]]
-        stepRule.step.dockerExecuteOnKubernetes(script: nullScript,
+        stepRule.step.dockerExecuteOnKubernetes(script: nullScript, juStabUtils: utilsMock,
             containerMap: ['maven:3.5-jdk-8-alpine': 'mavenexecute'],
             sidecarImage: 'ubuntu',
             sidecarName: 'mysidecar') {
                 bodyExecuted = true
             }
-            
+
         assertEquals(requests: [memory: '10Gi',cpu: '5.00'],limits: [memory: '20Gi',cpu: '10'], resources.mysidecar)
         assertEquals(requests: [memory: '3Gi',cpu: '0.33'],limits: [memory: '6Gi',cpu: '3'], resources.jnlp)
         assertEquals(requests: [memory: '2Gi',cpu: '0.75'],limits: [memory: '4Gi',cpu: '2'], resources.mavenexecute)
@@ -410,7 +412,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
 
     @Test
     void testDockerExecuteOnKubernetesUpperCaseContainerName() throws Exception {
-        stepRule.step.dockerExecuteOnKubernetes(script: nullScript,
+        stepRule.step.dockerExecuteOnKubernetes(script: nullScript, juStabUtils: utilsMock,
             containerMap: ['maven:3.5-jdk-8-alpine': 'MAVENEXECUTE'],
             dockerEnvVars: ['customEnvKey': 'customEnvValue']) {
             container(name: 'mavenexecute') {
@@ -432,7 +434,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
         })
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             containerCommands: ['selenium/standalone-chrome': ''],
             containerEnvVars: [
                 'selenium/standalone-chrome': ['customEnvKey': 'customEnvValue']
@@ -478,7 +480,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
         })
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             containerMap: ['maven:3.5-jdk-8-alpine': 'mavenexecute'],
             containerName: 'mavenexecute',
             dockerOptions: '-it',
@@ -507,7 +509,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
     void testDockerExecuteOnKubernetesWithCustomShell() {
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             dockerImage: 'maven:3.5-jdk-8-alpine',
             containerShell: '/busybox/sh'
         ) {
@@ -520,7 +522,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
     void testDockerExecuteOnKubernetesWithCustomContainerCommand() {
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             dockerImage: 'maven:3.5-jdk-8-alpine',
             containerCommand: '/busybox/tail -f /dev/null'
         ) {
@@ -533,6 +535,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
     void testSkipDockerImagePull() throws Exception {
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
+            juStabUtils: utilsMock,
             dockerPullImage: false,
             containerMap: ['maven:3.5-jdk-8-alpine': 'mavenexecute']
         ) {
@@ -548,7 +551,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
     void testSkipSidecarImagePull() throws Exception {
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             containerCommands: ['selenium/standalone-chrome': ''],
             containerEnvVars: [
                 'selenium/standalone-chrome': ['customEnvKey': 'customEnvValue']
@@ -581,7 +584,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
 
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             dockerImage: 'maven:3.5-jdk-8-alpine',
         ) { bodyExecuted = true }
         assertTrue(bodyExecuted)
@@ -613,7 +616,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
 
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             dockerImage: 'maven:3.5-jdk-8-alpine',
         ) { bodyExecuted = true }
         assertTrue(bodyExecuted)
@@ -655,7 +658,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
 
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             dockerImage: 'maven:3.5-jdk-8-alpine',
         ) { bodyExecuted = true }
         assertTrue(bodyExecuted)
@@ -676,10 +679,9 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
         def expectedSecurityContext = [runAsUser: 1000, fsGroup: 1000]
         nullScript.commonPipelineEnvironment.configuration = [general: [jenkinsKubernetes: [
             securityContext: expectedSecurityContext]]]
-
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             dockerImage: 'maven:3.5-jdk-8-alpine',
         ) { bodyExecuted = true }
         assertTrue(bodyExecuted)
@@ -691,7 +693,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
 
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             dockerImage: 'maven:3.5-jdk-8-alpine',
             nodeSelector: 'size:big'
         ) { bodyExecuted = true }
@@ -708,7 +710,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
         binding.variables.env.JENKINS_JNLP_IMAGE = 'env/jnlp:latest'
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             dockerImage: 'maven:3.5-jdk-8-alpine',
         ) { bodyExecuted = true }
         assertTrue(bodyExecuted)
@@ -732,7 +734,7 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
         //binding.variables.env.JENKINS_JNLP_IMAGE = 'config/jnlp:latest'
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             dockerImage: 'maven:3.5-jdk-8-alpine',
         ) { bodyExecuted = true }
         assertTrue(bodyExecuted)
@@ -759,9 +761,22 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
         //binding.variables.env.JENKINS_JNLP_IMAGE = 'config/jnlp:latest'
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             dockerImage: 'maven:3.5-jdk-8-alpine',
         ) { throw new AbortException('Execution failed.') }
+    }
+
+    @Test
+    void testDockerExecuteOnKubernetesAnnotations(){
+        stepRule.step.dockerExecuteOnKubernetes(
+            script: nullScript,
+            juStabUtils: utilsMock,
+            annotations: ['testAnnotation':'testValue']
+        )
+        {
+            bodyExecuted = true
+        }
+        assertEquals(['testAnnotation':'testValue'], podSpec.metadata.annotations)
     }
 
     @Test
@@ -782,19 +797,96 @@ class DockerExecuteOnKubernetesTest extends BasePiperTest {
         ]
         stepRule.step.dockerExecuteOnKubernetes(
             script: nullScript,
-            juStabUtils: utils,
+            juStabUtils: utilsMock,
             dockerImage: 'maven:3.5-jdk-8-alpine',
         ) {
             bodyExecuted = true
         }
         assertThat(stashList, hasItem(allOf(
-            not(hasEntry('allowEmpty', true)),
+            hasEntry('allowEmpty', true),
             hasEntry('includes', 'workspace/include.test'),
             hasEntry('excludes', 'workspace/exclude.test'))))
         assertThat(stashList, hasItem(allOf(
-            not(hasEntry('allowEmpty', true)),
+            hasEntry('allowEmpty', true),
             hasEntry('includes', 'container/include.test'),
             hasEntry('excludes', 'container/exclude.test'))))
+    }
+
+    @Test
+    void testUnstash() {
+        stepRule.step.dockerExecuteOnKubernetes(
+            script: nullScript,
+            juStabUtils: utilsMock,
+            dockerImage: 'maven:3.5-jdk-8-alpine',
+        ) {}
+        assertEquals(2, unstashList.size())
+        assertTrue(unstashList[0].startsWith('workspace-'))
+        assertTrue(unstashList[1].startsWith('container-'))
+    }
+
+    @Test
+    void testDockerExecuteWithVolumeProperties() {
+        stepRule.step.dockerExecuteOnKubernetes(
+            script: nullScript,
+            juStabUtils: utilsMock,
+            containerName: 'mycontainer',
+            initContainerImage: 'ppiper/cf-cli',
+            dockerImage: 'maven:3.5-jdk-8-alpine',
+            containerMountPath: '/opt',
+        ) { bodyExecuted = true }
+        def containerSpec = podSpec.spec.containers.find{it.image == "maven:3.5-jdk-8-alpine"}
+        def initContainerSpec = podSpec.spec.initContainers[0]
+        assertTrue(bodyExecuted)
+        assertEquals(
+            [[
+                 "name"    : "volume",
+                 "emptyDir": [:]
+             ]], podSpec.spec.volumes)
+        assertEquals(
+            [[
+                "name"     : "volume",
+                "mountPath": "/opt"
+            ]], containerSpec.volumeMounts)
+        assertEquals(
+            [[
+                 "name"     : "volume",
+                 "mountPath": "/opt"
+             ]], initContainerSpec.volumeMounts)
+    }
+
+    @Test
+    void testInitContainerDefaultWithParameters() {
+        stepRule.step.dockerExecuteOnKubernetes(
+            script: nullScript,
+            juStabUtils: utilsMock,
+            containerName: 'mycontainer',
+            initContainerImage: 'ppiper/cf-cli@sha256:latest',
+            initContainerCommand: 'cp /usr/local/bin/cf7 /opt/bin/cf',
+            dockerImage: 'maven:3.5-jdk-8-alpine',
+            containerMountPath: '/opt',
+        ) { bodyExecuted = true }
+        def initContainer = podSpec.spec.initContainers[0]
+        def expectedCommandOutput = ["sh", "-c", "cp /usr/local/bin/cf7 /opt/bin/cf"]
+        assertTrue(bodyExecuted)
+        assertEquals("ppiper-cf-cli-sha256-latest", initContainer.name)
+        assertEquals("ppiper/cf-cli@sha256:latest", initContainer.image)
+        assertThat(initContainer.command, is(equalTo(expectedCommandOutput)))
+    }
+
+    @Test
+    void testInitContainerWithoutContainerCommand() {
+        stepRule.step.dockerExecuteOnKubernetes(
+            script: nullScript,
+            juStabUtils: utilsMock,
+            containerName: 'mycontainer',
+            initContainerImage: 'ppiper/cf-cli@sha256:latest',
+            dockerImage: 'maven:3.5-jdk-8-alpine',
+            containerMountPath: '/opt',
+        ) { bodyExecuted = true }
+        def initContainer = podSpec.spec.initContainers[0]
+        def expectedCommandOutput = ["/usr/bin/tail", "-f", "/dev/null"]
+        assertTrue(bodyExecuted)
+        assertThat(initContainer.command, is(equalTo(expectedCommandOutput)))
     }
 
 

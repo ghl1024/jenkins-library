@@ -3,31 +3,37 @@ package whitesource
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/maven"
+
 	"github.com/magiconair/properties"
-	"github.com/pkg/errors"
 )
 
 // ConfigOption defines a dedicated WhiteSource config which can be enforced if required
 type ConfigOption struct {
 	Name          string
-	Value         interface{}
+	Value         any
 	OmitIfPresent string
 	Force         bool
 	Append        bool
 }
 
+const configFileName = "wss-unified-agent.config"
+
 // ConfigOptions contains a list of config options (ConfigOption)
 type ConfigOptions []ConfigOption
 
+// Needed parameters from UAConfiguration to print in verbose=true
+var parametersForLog = []string{"docker.excludeBaseImage", "docker.dockerfilePath"}
+
 // RewriteUAConfigurationFile updates the user's Unified Agent configuration with configuration which should be enforced or just eases the overall configuration
 // It then returns the path to the file containing the updated configuration
-func (s *ScanOptions) RewriteUAConfigurationFile(utils Utils, projectName string) (string, error) {
+func (s *ScanOptions) RewriteUAConfigurationFile(utils Utils, projectName string, verbose bool) (string, error) {
 
 	uaContent, err := utils.FileRead(s.ConfigFilePath)
 	uaConfig, propErr := properties.Load(uaContent, properties.UTF8)
@@ -45,18 +51,31 @@ func (s *ScanOptions) RewriteUAConfigurationFile(utils Utils, projectName string
 	newConfigMap := cOptions.updateConfig(&uaConfigMap)
 	newConfig := properties.LoadMap(newConfigMap)
 
+	if verbose {
+		var printLog strings.Builder
+		for _, p := range parametersForLog {
+			if val, ok := newConfigMap[p]; ok {
+				printLog.WriteString(fmt.Sprintf("%s:%s ", p, val))
+			}
+		}
+		if len(printLog.String()) > 0 {
+			log.Entry().Debugf("ScanUA configuration: %s", printLog.String())
+		}
+	}
+
 	now := time.Now().Format("20060102150405")
+
 	newConfigFilePath := fmt.Sprintf("%v.%v", s.ConfigFilePath, now)
 
 	var configContent bytes.Buffer
 	_, err = newConfig.Write(&configContent, properties.UTF8)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to write properties")
+		return "", fmt.Errorf("failed to write properties: %w", err)
 	}
 
 	err = utils.FileWrite(newConfigFilePath, configContent.Bytes(), 0666)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to write file")
+		return "", fmt.Errorf("failed to write file: %w", err)
 	}
 
 	return newConfigFilePath, nil
@@ -64,9 +83,7 @@ func (s *ScanOptions) RewriteUAConfigurationFile(utils Utils, projectName string
 
 func (c *ConfigOptions) updateConfig(originalConfig *map[string]string) map[string]string {
 	newConfig := map[string]string{}
-	for k, v := range *originalConfig {
-		newConfig[k] = v
-	}
+	maps.Copy(newConfig, *originalConfig)
 
 	for _, cOpt := range *c {
 		//omit default if value present
@@ -134,9 +151,8 @@ func (c *ConfigOptions) addGeneralDefaults(config *ScanOptions, utils Utils, pro
 		{Name: "userKey", Value: config.UserToken, Force: true},
 		{Name: "forceUpdate", Value: true, Force: true},
 		{Name: "offline", Value: false, Force: true},
-		{Name: "ignoreSourceFiles", Value: true, Force: true},
-		{Name: "resolveAllDependencies", Value: false, Force: true},
-		{Name: "failErrorLevel", Value: "ALL", Force: true},
+		{Name: "resolveAllDependencies", Value: false, Force: false},
+		{Name: "failErrorLevel", Value: "ALL", Force: false},
 		{Name: "case.sensitive.glob", Value: false},
 		{Name: "followSymbolicLinks", Value: true},
 	}...)
@@ -152,27 +168,47 @@ func (c *ConfigOptions) addBuildToolDefaults(config *ScanOptions, utils Utils) e
 			{Name: "docker.scanImages", Value: true, Force: true},
 			{Name: "docker.scanTarFiles", Value: true, Force: true},
 			{Name: "docker.includes", Value: ".*.tar", Force: true},
+			{Name: "fileSystemScan", Value: true},
 			{Name: "ignoreSourceFiles", Value: false},
 			{Name: "python.resolveGlobalPackages", Value: true, Force: false},
-			{Name: "resolveAllDependencies", Value: true, Force: false},
 			{Name: "updateType", Value: "OVERRIDE", Force: true},
 			{Name: "docker.excludeBaseImage", Value: "true", Force: false},
 		},
 		"dub": {
+			{Name: "ignoreSourceFiles", Value: true, Force: true},
+			{Name: "includes", Value: "**/*.d **/*.di"},
+		},
+		"dub2": {
+			{Name: "fileSystemScan", Value: false, Force: true},
 			{Name: "includes", Value: "**/*.d **/*.di"},
 		},
 		//ToDo: rename to go?
 		//ToDo: switch to gomod as dependency manager
 		"golang": {
-			{Name: "go.resolveDependencies", Value: true, Force: true},
+			{Name: "fileSystemScan", Value: false, Force: true},
+			{Name: "ignoreSourceFiles", Value: true, Force: true},
 			{Name: "go.ignoreSourceFiles", Value: true, Force: true},
 			{Name: "go.collectDependenciesAtRuntime", Value: false},
-			{Name: "go.dependencyManager", Value: "modules"},
+			{Name: "go.modules.resolveDependencies", Value: true, Force: true},
+			{Name: "go.modules.ignoreSourceFiles", Value: true, Force: true},
+			{Name: "includes", Value: "**/*.lock **/*.y*ml **/*.json **/*.tsv"},
 		},
 		"gradle": {
-			{Name: "gradle.localRepositoryPath", Value: ".gradle", Force: false},
+			{Name: "fileSystemScan", Value: false, Force: true},
+			{Name: "ignoreSourceFiles", Value: true, Force: true},
+			{Name: "gradle.resolveDependencies", Value: true, Force: true},
+			{Name: "gradle.ignoreSourceFiles", Value: true, Force: true},
+			{Name: "gradle.aggregateModules", Value: false, Force: false},
+			{Name: "gradle.runAssembleCommand", Value: true},
+			{Name: "gradle.runPreStep", Value: true},
+			{Name: "gradle.preferredEnvironment", Value: "wrapper"},
+			{Name: "resolveAllDependencies", Value: false},
+			{Name: "includes", Value: "**/*.jar"},
+			{Name: "excludes", Value: "**/*sources.jar **/*javadoc.jar"},
 		},
 		"maven": {
+			{Name: "fileSystemScan", Value: false, Force: true},
+			{Name: "ignoreSourceFiles", Value: true, Force: true},
 			{Name: "updateEmptyProject", Value: true, Force: true},
 			{Name: "maven.resolveDependencies", Value: true, Force: true},
 			{Name: "maven.ignoreSourceFiles", Value: true, Force: true},
@@ -186,6 +222,8 @@ func (c *ConfigOptions) addBuildToolDefaults(config *ScanOptions, utils Utils) e
 			{Name: "excludes", Value: "**/*sources.jar **/*javadoc.jar"},
 		},
 		"npm": {
+			{Name: "fileSystemScan", Value: false, Force: true},
+			{Name: "ignoreSourceFiles", Value: true, Force: true},
 			{Name: "npm.resolveDependencies", Value: true, Force: true},
 			{Name: "npm.ignoreSourceFiles", Value: true, Force: true},
 			{Name: "npm.ignoreNpmLsErrors", Value: true},
@@ -195,6 +233,8 @@ func (c *ConfigOptions) addBuildToolDefaults(config *ScanOptions, utils Utils) e
 			{Name: "npm.resolveLockFile", Value: true},
 		},
 		"pip": {
+			{Name: "fileSystemScan", Value: false, Force: true},
+			{Name: "ignoreSourceFiles", Value: true, Force: true},
 			{Name: "python.resolveDependencies", Value: true, Force: true},
 			{Name: "python.ignoreSourceFiles", Value: true, Force: true},
 			{Name: "python.ignorePipInstallErrors", Value: false},
@@ -209,6 +249,8 @@ func (c *ConfigOptions) addBuildToolDefaults(config *ScanOptions, utils Utils) e
 			{Name: "excludes", Value: "**/*sources.jar **/*javadoc.jar"},
 		},
 		"sbt": {
+			{Name: "fileSystemScan", Value: false, Force: true},
+			{Name: "ignoreSourceFiles", Value: true, Force: true},
 			{Name: "sbt.resolveDependencies", Value: true, Force: true},
 			{Name: "sbt.ignoreSourceFiles", Value: true, Force: true},
 			{Name: "sbt.aggregateModules", Value: false, Force: true},
@@ -217,6 +259,8 @@ func (c *ConfigOptions) addBuildToolDefaults(config *ScanOptions, utils Utils) e
 			{Name: "excludes", Value: "**/*sources.jar **/*javadoc.jar"},
 		},
 		"yarn": {
+			{Name: "fileSystemScan", Value: false, Force: true},
+			{Name: "ignoreSourceFiles", Value: true, Force: true},
 			{Name: "npm.resolveDependencies", Value: true, Force: true},
 			{Name: "npm.ignoreSourceFiles", Value: true, Force: true},
 			{Name: "npm.yarnProject", Value: true, Force: true},
@@ -235,6 +279,21 @@ func (c *ConfigOptions) addBuildToolDefaults(config *ScanOptions, utils Utils) e
 			*c = append(*c, ConfigOption{Name: "maven.additionalArguments", Value: strings.Join(mvnAdditionalArguments, " "), Append: true})
 		}
 
+	}
+	if config.BuildTool == "npm" {
+		if len(config.BuildDescriptorExcludeList) > 0 {
+			var excludePaths []string
+			for _, buildDescriptor := range config.BuildDescriptorExcludeList {
+				if strings.HasSuffix(buildDescriptor, "pom.xml") {
+					continue
+				}
+				modulePath, _ := filepath.Split(buildDescriptor)
+				excludePaths = append(excludePaths, modulePath)
+			}
+			*c = append(*c, ConfigOption{Name: "npm.ignoreDirectoryPatterns", Value: strings.Join(excludePaths, ",")})
+		}
+
+		*c = append(*c, ConfigOption{Name: "npm.includeDevDependencies", Value: config.NpmIncludeDevDependencies, Force: false})
 	}
 
 	if config.BuildTool == "docker" {
@@ -277,7 +336,7 @@ func mvnProjectExcludes(buildDescriptorExcludeList []string, utils Utils) []stri
 	return []string{}
 }
 
-//ToDo: Check if we want to optionally allow auto generation for unknown projects
+// ToDo: Check if we want to optionally allow auto generation for unknown projects
 func autoGenerateWhitesourceConfig(config *ScanOptions, utils Utils) error {
 	// TODO: Should we rely on -detect, or set the parameters manually?
 	if err := utils.RunExecutable("java", "-jar", config.AgentFileName, "-d", ".", "-detect"); err != nil {

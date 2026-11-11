@@ -1,16 +1,22 @@
+//go:build unit
+// +build unit
+
 package config
 
 import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/piperenv"
+
+	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -24,8 +30,8 @@ func (errReadCloser) Close() error {
 	return nil
 }
 
-func customDefaultsOpenFileMock(name string) (io.ReadCloser, error) {
-	return ioutil.NopCloser(strings.NewReader("general:\n  p0: p0_custom_default\nstages:\n  stage1:\n    p1: p1_custom_default")), nil
+func customDefaultsOpenFileMock(name string, tokens map[string]string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("general:\n  p0: p0_custom_default\nstages:\n  stage1:\n    p1: p1_custom_default")), nil
 }
 
 func TestReadConfig(t *testing.T) {
@@ -36,7 +42,7 @@ func TestReadConfig(t *testing.T) {
 
 		myConfig := strings.NewReader("general:\n  generalTestKey: generalTestValue\nsteps:\n  testStep:\n    testStepKey: testStepValue")
 
-		err := c.ReadConfig(ioutil.NopCloser(myConfig)) // NopCloser "no-ops" the closing interface since strings do not need to be closed
+		err := c.ReadConfig(io.NopCloser(myConfig)) // NopCloser "no-ops" the closing interface since strings do not need to be closed
 		if err != nil {
 			t.Errorf("Got error although no error expected: %v", err)
 		}
@@ -60,7 +66,7 @@ func TestReadConfig(t *testing.T) {
 
 	t.Run("Unmarshalling failure", func(t *testing.T) {
 		myConfig := strings.NewReader("general:\n  generalTestKey: generalTestValue\nsteps:\n  testStep:\n\ttestStepKey: testStepValue")
-		err := c.ReadConfig(ioutil.NopCloser(myConfig))
+		err := c.ReadConfig(io.NopCloser(myConfig))
 		if err == nil {
 			t.Errorf("Got no error although error expected.")
 		}
@@ -122,9 +128,9 @@ steps:
 		flags := map[string]interface{}{"p7": "p7_flag"}
 
 		var c Config
-		defaults := []io.ReadCloser{ioutil.NopCloser(strings.NewReader(defaults1)), ioutil.NopCloser(strings.NewReader(defaults2))}
+		defaults := []io.ReadCloser{io.NopCloser(strings.NewReader(defaults1)), io.NopCloser(strings.NewReader(defaults2))}
 
-		myConfig := ioutil.NopCloser(strings.NewReader(testConfig))
+		myConfig := io.NopCloser(strings.NewReader(testConfig))
 
 		parameterMetadata := []StepParameters{
 			{
@@ -164,20 +170,25 @@ steps:
 			},
 		}
 
-		stepMeta := StepData{Spec: StepSpec{Inputs: StepInputs{Parameters: parameterMetadata, Secrets: secretMetadata}}}
+		stepAliases := []Alias{{Name: "stepAlias"}}
 
-		dir, err := ioutil.TempDir("", "")
-		if err != nil {
-			t.Fatal("Failed to create temporary directory")
+		stepMeta := StepData{
+			Spec: StepSpec{
+				Inputs: StepInputs{
+					Parameters: parameterMetadata,
+					Secrets:    secretMetadata,
+				},
+			},
+			Metadata: StepMetadata{
+				Aliases: stepAliases,
+			},
 		}
 
-		// clean up tmp dir
-		defer os.RemoveAll(dir)
+		dir := t.TempDir()
 
 		piperenv.SetParameter(filepath.Join(dir, "commonPipelineEnvironment"), "test_pe1", "pe1_val")
 
-		stepAliases := []Alias{{Name: "stepAlias"}}
-		stepConfig, err := c.GetStepConfig(flags, paramJSON, myConfig, defaults, false, filters, parameterMetadata, secretMetadata, stepMeta.GetResourceParameters(dir, "commonPipelineEnvironment"), "stage1", "step1", stepAliases)
+		stepConfig, err := c.GetStepConfig(flags, paramJSON, myConfig, defaults, false, filters, stepMeta, stepMeta.GetResourceParameters(dir, "commonPipelineEnvironment"), "stage1", "step1")
 
 		assert.Equal(t, nil, err, "error occurred but none expected")
 
@@ -229,23 +240,17 @@ steps:
   p0: p0_general_default
 `
 		var c Config
-		defaults := []io.ReadCloser{ioutil.NopCloser(strings.NewReader(defaults1))}
+		defaults := []io.ReadCloser{io.NopCloser(strings.NewReader(defaults1))}
 
-		myConfig := ioutil.NopCloser(strings.NewReader(testConfig))
+		myConfig := io.NopCloser(strings.NewReader(testConfig))
 
 		stepMeta := StepData{Spec: StepSpec{Inputs: StepInputs{Parameters: []StepParameters{
 			{Name: "p0", ResourceRef: []ResourceReference{{Name: "commonPipelineEnvironment", Param: "p0"}}},
 		}}}}
 
-		dir, err := ioutil.TempDir("", "")
-		if err != nil {
-			t.Fatal("Failed to create temporary directory")
-		}
+		dir := t.TempDir()
 
-		// clean up tmp dir
-		defer os.RemoveAll(dir)
-
-		stepConfig, err := c.GetStepConfig(map[string]interface{}{}, "", myConfig, defaults, false, filters, []StepParameters{}, []StepSecrets{}, stepMeta.GetResourceParameters(dir, "commonPipelineEnvironment"), "stage1", "step1", []Alias{})
+		stepConfig, err := c.GetStepConfig(map[string]interface{}{}, "", myConfig, defaults, false, filters, stepMeta, stepMeta.GetResourceParameters(dir, "commonPipelineEnvironment"), "stage1", "step1")
 
 		assert.Equal(t, nil, err, "error occurred but none expected")
 
@@ -258,7 +263,7 @@ steps:
 
 		c.openFile = customDefaultsOpenFileMock
 
-		stepConfig, err := c.GetStepConfig(nil, "", ioutil.NopCloser(strings.NewReader(testConfDefaults)), nil, false, StepFilters{General: []string{"p0"}}, []StepParameters{}, nil, nil, "stage1", "step1", []Alias{})
+		stepConfig, err := c.GetStepConfig(nil, "", io.NopCloser(strings.NewReader(testConfDefaults)), nil, false, StepFilters{General: []string{"p0"}}, StepData{}, nil, "stage1", "step1")
 
 		assert.NoError(t, err, "Error occurred but no error expected")
 		assert.Equal(t, "p0_custom_default", stepConfig.Config["p0"])
@@ -272,7 +277,7 @@ steps:
 
 		c.openFile = customDefaultsOpenFileMock
 
-		stepConfig, err := c.GetStepConfig(nil, "", ioutil.NopCloser(strings.NewReader(testConfDefaults)), nil, true, StepFilters{General: []string{"p0"}}, []StepParameters{}, nil, nil, "stage1", "step1", []Alias{})
+		stepConfig, err := c.GetStepConfig(nil, "", io.NopCloser(strings.NewReader(testConfDefaults)), nil, true, StepFilters{General: []string{"p0"}}, StepData{}, nil, "stage1", "step1")
 
 		assert.NoError(t, err, "Error occurred but no error expected")
 		assert.Equal(t, nil, stepConfig.Config["p0"])
@@ -284,9 +289,16 @@ steps:
 		var c Config
 
 		stepParams := []StepParameters{{Name: "p0", Scope: []string{"GENERAL"}, Type: "string", Default: "p0_step_default", Aliases: []Alias{{Name: "p0_alias"}}}}
+		metadata := StepData{
+			Spec: StepSpec{
+				Inputs: StepInputs{
+					Parameters: stepParams,
+				},
+			},
+		}
 		testConf := "general:\n p1: p1_conf"
 
-		stepConfig, err := c.GetStepConfig(nil, "", ioutil.NopCloser(strings.NewReader(testConf)), nil, false, StepFilters{General: []string{"p0", "p1"}}, stepParams, nil, nil, "stage1", "step1", []Alias{})
+		stepConfig, err := c.GetStepConfig(nil, "", io.NopCloser(strings.NewReader(testConf)), nil, false, StepFilters{General: []string{"p0", "p1"}}, metadata, nil, "stage1", "step1")
 
 		assert.NoError(t, err, "Error occurred but no error expected")
 		assert.Equal(t, "p0_step_default", stepConfig.Config["p0"])
@@ -299,9 +311,16 @@ steps:
 		stepParams := []StepParameters{
 			{Name: "p0", Scope: []string{"GENERAL"}, Type: "bool", Aliases: []Alias{}},
 			{Name: "p1", Scope: []string{"GENERAL"}, Type: "string", Aliases: []Alias{{Name: "p0/subParam"}}}}
+		metadata := StepData{
+			Spec: StepSpec{
+				Inputs: StepInputs{
+					Parameters: stepParams,
+				},
+			},
+		}
 		testConf := "general:\n p0: true"
 
-		stepConfig, err := c.GetStepConfig(nil, "", ioutil.NopCloser(strings.NewReader(testConf)), nil, false, StepFilters{General: []string{"p0", "p1"}}, stepParams, nil, nil, "stage1", "step1", []Alias{{}})
+		stepConfig, err := c.GetStepConfig(nil, "", io.NopCloser(strings.NewReader(testConf)), nil, false, StepFilters{General: []string{"p0", "p1"}}, metadata, nil, "stage1", "step1")
 
 		assert.NoError(t, err, "Error occurred but no error expected")
 		assert.Equal(t, true, stepConfig.Config["p0"])
@@ -313,10 +332,17 @@ steps:
 
 		secrets := []StepSecrets{
 			{Name: "p0", Type: "string", Aliases: []Alias{{Name: "p1/subParam"}}}}
+		metadata := StepData{
+			Spec: StepSpec{
+				Inputs: StepInputs{
+					Secrets: secrets,
+				},
+			},
+		}
 		testConf := ""
 
 		paramJSON := "{\"p1\":{\"subParam\":\"p1_value\"}}"
-		stepConfig, err := c.GetStepConfig(nil, paramJSON, ioutil.NopCloser(strings.NewReader(testConf)), nil, true, StepFilters{Parameters: []string{"p0"}}, nil, secrets, nil, "stage1", "step1", []Alias{{}})
+		stepConfig, err := c.GetStepConfig(nil, paramJSON, io.NopCloser(strings.NewReader(testConf)), nil, true, StepFilters{Parameters: []string{"p0"}}, metadata, nil, "stage1", "step1")
 
 		assert.NoError(t, err, "Error occurred but no error expected")
 		assert.Equal(t, "p1_value", stepConfig.Config["p0"])
@@ -324,17 +350,48 @@ steps:
 
 	t.Run("Failure case config", func(t *testing.T) {
 		var c Config
-		myConfig := ioutil.NopCloser(strings.NewReader("invalid config"))
-		_, err := c.GetStepConfig(nil, "", myConfig, nil, false, StepFilters{}, []StepParameters{}, nil, nil, "stage1", "step1", []Alias{})
-		assert.EqualError(t, err, "failed to parse custom pipeline configuration: format of configuration is invalid \"invalid config\": error unmarshaling JSON: json: cannot unmarshal string into Go value of type config.Config", "default error expected")
+		myConfig := io.NopCloser(strings.NewReader("invalid config"))
+		_, err := c.GetStepConfig(nil, "", myConfig, nil, false, StepFilters{}, StepData{}, nil, "stage1", "step1")
+		assert.EqualError(t, err, "failed to parse custom pipeline configuration: format of configuration is invalid \"invalid config\": yaml: unmarshal errors:\n  line 1: cannot unmarshal !!str `invalid...` into config.Config", "default error expected")
 	})
 
 	t.Run("Failure case defaults", func(t *testing.T) {
 		var c Config
-		myConfig := ioutil.NopCloser(strings.NewReader(""))
-		myDefaults := []io.ReadCloser{ioutil.NopCloser(strings.NewReader("invalid defaults"))}
-		_, err := c.GetStepConfig(nil, "", myConfig, myDefaults, false, StepFilters{}, []StepParameters{}, nil, nil, "stage1", "step1", []Alias{})
-		assert.EqualError(t, err, "failed to read default configuration: error unmarshalling \"invalid defaults\": error unmarshaling JSON: json: cannot unmarshal string into Go value of type config.Config", "default error expected")
+		myConfig := io.NopCloser(strings.NewReader(""))
+		myDefaults := []io.ReadCloser{io.NopCloser(strings.NewReader("invalid defaults"))}
+		_, err := c.GetStepConfig(nil, "", myConfig, myDefaults, false, StepFilters{}, StepData{}, nil, "stage1", "step1")
+		assert.EqualError(t, err, "failed to read default configuration: error unmarshalling \"invalid defaults\": yaml: unmarshal errors:\n  line 1: cannot unmarshal !!str `invalid...` into config.Config", "default error expected")
+	})
+
+	t.Run("Test reporting parameters with aliases and cpe resources", func(t *testing.T) {
+		var c Config
+		testConfig := io.NopCloser(strings.NewReader(`general:
+  gcpJsonKeyFilePath: gcpJsonKeyFilePath_value
+steps:
+  step1:
+    jsonKeyFilePath: gcpJsonKeyFilePath_from_alias`))
+		testDefaults := []io.ReadCloser{io.NopCloser(strings.NewReader(`general:
+  pipelineId: gcsBucketId_from_alias
+steps:
+  step1:
+    gcsBucketId: gcsBucketId_value`))}
+		dir := t.TempDir()
+		cpeDir := filepath.Join(dir, "commonPipelineEnvironment/custom")
+		err := os.MkdirAll(cpeDir, 0700)
+		if err != nil {
+			t.Fatal("Failed to create sub directory")
+		}
+
+		err = os.WriteFile(filepath.Join(cpeDir, "gcsFolderPath.json"), []byte("\"value_from_cpe\""), 0700)
+		assert.NoError(t, err)
+
+		stepMeta := StepData{Spec: StepSpec{Inputs: StepInputs{Parameters: []StepParameters{}}}}
+		stepConfig, err := c.GetStepConfig(nil, "", testConfig, testDefaults, false, StepFilters{General: []string{"p0", "p1"}}, stepMeta, ReportingParameters.GetResourceParameters(dir, "commonPipelineEnvironment"), "stage1", "step1")
+
+		assert.NoError(t, err, "Error occurred but no error expected")
+		assert.Equal(t, "gcpJsonKeyFilePath_from_alias", stepConfig.Config["gcpJsonKeyFilePath"])
+		assert.Equal(t, "gcsBucketId_value", stepConfig.Config["gcsBucketId"])
+		assert.Equal(t, "value_from_cpe", stepConfig.Config["gcsFolderPath"])
 	})
 
 	//ToDo: test merging of env and parameters/flags
@@ -358,6 +415,99 @@ func TestGetStepConfigWithJSON(t *testing.T) {
 		if sc.Config["key1"] != "flagVal1" {
 			t.Errorf("got: %v, expected: %v", sc.Config["key1"], "flagVal1")
 		}
+	})
+}
+
+func TestGetStageConfig(t *testing.T) {
+
+	testConfig := `general:
+  p1: p1_general
+  px1: px1_general
+stages:
+  stage1:
+    p2: p2_stage
+    px2: px2_stage
+`
+	defaults1 := `general:
+  p0: p0_general_default
+  px0: px0_general_default
+`
+	paramJSON := `{"p3":"p3_param"}`
+
+	t.Run("Success case - with filters", func(t *testing.T) {
+
+		acceptedParams := []string{"p0", "p1", "p2", "p3"}
+
+		var c Config
+		defaults := []io.ReadCloser{io.NopCloser(strings.NewReader(defaults1))}
+
+		myConfig := io.NopCloser(strings.NewReader(testConfig))
+
+		stepConfig, err := c.GetStageConfig(paramJSON, myConfig, defaults, false, acceptedParams, "stage1")
+
+		assert.Equal(t, nil, err, "error occurred but none expected")
+
+		t.Run("Config", func(t *testing.T) {
+			expected := map[string]string{
+				"p0": "p0_general_default",
+				"p1": "p1_general",
+				"p2": "p2_stage",
+				"p3": "p3_param",
+			}
+
+			for k, v := range expected {
+				t.Run(k, func(t *testing.T) {
+					if stepConfig.Config[k] != v {
+						t.Errorf("got: %v, expected: %v", stepConfig.Config[k], v)
+					}
+				})
+			}
+		})
+
+		t.Run("Config not expected", func(t *testing.T) {
+			notExpectedKeys := []string{"px0", "px1", "px2"}
+			for _, p := range notExpectedKeys {
+				t.Run(p, func(t *testing.T) {
+					if stepConfig.Config[p] != nil {
+						t.Errorf("unexpected: %v", p)
+					}
+				})
+			}
+		})
+	})
+
+	t.Run("Success case - no filters", func(t *testing.T) {
+
+		acceptedParams := []string{}
+
+		var c Config
+		defaults := []io.ReadCloser{io.NopCloser(strings.NewReader(defaults1))}
+
+		myConfig := io.NopCloser(strings.NewReader(testConfig))
+
+		stepConfig, err := c.GetStageConfig(paramJSON, myConfig, defaults, false, acceptedParams, "stage1")
+
+		assert.Equal(t, nil, err, "error occurred but none expected")
+
+		t.Run("Config", func(t *testing.T) {
+			expected := map[string]string{
+				"p0":  "p0_general_default",
+				"px0": "px0_general_default",
+				"p1":  "p1_general",
+				"px1": "px1_general",
+				"p2":  "p2_stage",
+				"px2": "px2_stage",
+				"p3":  "p3_param",
+			}
+
+			for k, v := range expected {
+				t.Run(k, func(t *testing.T) {
+					if stepConfig.Config[k] != v {
+						t.Errorf("got: %v, expected: %v", stepConfig.Config[k], v)
+					}
+				})
+			}
+		})
 	})
 }
 
@@ -642,13 +792,246 @@ func TestMerge(t *testing.T) {
 			MergeData:      map[string]interface{}{"key1": map[string]interface{}{"key1_2": "value2"}},
 			ExpectedOutput: map[string]interface{}{"key1": map[string]interface{}{"key1_1": "value1", "key1_2": "value2"}},
 		},
+		{
+			Source:         map[string]interface{}{"key1": "value1"},
+			Filter:         []string{"key1", ".+Key$"},
+			MergeData:      map[string]interface{}{"regexKey": "value2", "regexKeyIgnored": "value3", "Key": "value3"},
+			ExpectedOutput: map[string]interface{}{"key1": "value1", "regexKey": "value2"},
+		},
 	}
 
 	for _, row := range testTable {
 		t.Run(fmt.Sprintf("Merging %v into %v", row.MergeData, row.Source), func(t *testing.T) {
 			stepConfig := StepConfig{Config: row.Source}
-			stepConfig.mixIn(row.MergeData, row.Filter)
-			assert.Equal(t, row.ExpectedOutput, stepConfig.Config, "Mixin  was incorrect")
+			stepConfig.mixIn(row.MergeData, row.Filter, StepData{})
+			assert.Equal(t, row.ExpectedOutput, stepConfig.Config, "Mixin was incorrect")
 		})
 	}
+}
+
+func TestMergeTypeWarnings(t *testing.T) {
+	metadata := StepData{Spec: StepSpec{Inputs: StepInputs{Parameters: []StepParameters{
+		{Name: "stringList", Type: "[]string"},
+		{Name: "mapList", Type: "[]map[string]interface{}"},
+		{Name: "anyMapList", Type: "[]map[string]any"},
+		{Name: "flag", Type: "bool"},
+	}}}}
+
+	testTable := []struct {
+		name             string
+		mergeData        map[string]any
+		expectedWarnings []string
+	}{
+		{
+			name:      "list of strings from JSON",
+			mergeData: map[string]any{"stringList": []any{"a", "b"}},
+		},
+		{
+			name:      "list of maps from JSON",
+			mergeData: map[string]any{"mapList": []any{map[string]any{"name": "a"}}},
+		},
+		{
+			name:      "list of maps from JSON, type written with any",
+			mergeData: map[string]any{"anyMapList": []any{map[string]any{"name": "a"}}},
+		},
+		{
+			name:             "list of maps with wrong element",
+			mergeData:        map[string]any{"mapList": []any{map[string]any{"name": "a"}, "b"}},
+			expectedWarnings: []string{"config id mapList should only contain maps but contains a string"},
+		},
+		{
+			name:             "wrong type",
+			mergeData:        map[string]any{"flag": "true"},
+			expectedWarnings: []string{"config value provided for flag is of wrong type string should be of type bool"},
+		},
+	}
+
+	_, hook := test.NewNullLogger()
+	log.RegisterHook(hook)
+
+	for _, row := range testTable {
+		t.Run(row.name, func(t *testing.T) {
+			hook.Reset()
+			stepConfig := StepConfig{}
+			stepConfig.mixIn(row.mergeData, []string{}, metadata)
+
+			warnings := []string{}
+			for _, entry := range hook.AllEntries() {
+				warnings = append(warnings, entry.Message)
+			}
+			assert.ElementsMatch(t, row.expectedWarnings, warnings)
+			assert.Equal(t, row.mergeData, stepConfig.Config)
+		})
+	}
+}
+
+func TestStepConfig_mixInHookConfig(t *testing.T) {
+	type fields struct {
+		Config     map[string]interface{}
+		HookConfig map[string]interface{}
+	}
+	type args struct {
+		mergeData map[string]interface{}
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   map[string]interface{}
+	}{
+		{name: "Splunk only",
+			fields: fields{
+				Config:     nil,
+				HookConfig: nil,
+			},
+			args: args{mergeData: map[string]interface{}{
+				"splunk": map[string]interface{}{
+					"dsn":      "dsn",
+					"token":    "token",
+					"sendLogs": "false",
+				},
+			}},
+			want: map[string]interface{}{
+				"splunk": map[string]interface{}{
+					"dsn":      "dsn",
+					"token":    "token",
+					"sendLogs": "false",
+				},
+			},
+		},
+		{name: "Sentry only",
+			fields: fields{
+				Config:     nil,
+				HookConfig: nil,
+			},
+			args: args{mergeData: map[string]interface{}{
+				"sentry": map[string]interface{}{
+					"dsn": "sentrydsn",
+				},
+			}},
+			want: map[string]interface{}{
+				"sentry": map[string]interface{}{
+					"dsn": "sentrydsn",
+				},
+			},
+		},
+		{name: "Splunk and Sentry",
+			fields: fields{
+				Config:     nil,
+				HookConfig: nil,
+			},
+			args: args{mergeData: map[string]interface{}{
+				"splunk": map[string]interface{}{
+					"dsn":      "dsn",
+					"token":    "token",
+					"sendLogs": "false",
+				},
+				"sentry": map[string]interface{}{
+					"dsn": "sentrydsn",
+				},
+			}},
+			want: map[string]interface{}{
+				"splunk": map[string]interface{}{
+					"dsn":      "dsn",
+					"token":    "token",
+					"sendLogs": "false",
+				},
+				"sentry": map[string]interface{}{
+					"dsn": "sentrydsn",
+				},
+			},
+		},
+		{name: "No Hook",
+			fields: fields{
+				Config:     nil,
+				HookConfig: nil,
+			},
+			args: args{mergeData: nil},
+			want: map[string]interface{}{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &StepConfig{
+				Config:     tt.fields.Config,
+				HookConfig: tt.fields.HookConfig,
+			}
+			s.mixInHookConfig(tt.args.mergeData, StepData{})
+			if !reflect.DeepEqual(s.HookConfig, tt.want) {
+				t.Errorf("mixInHookConfig() = %v, want %v", s.HookConfig, tt.want)
+			}
+		})
+	}
+}
+
+func TestMixInStepDefaults(t *testing.T) {
+	tt := []struct {
+		name       string
+		stepConfig *StepConfig
+		stepParams []StepParameters
+		expected   map[string]interface{}
+	}{
+		{name: "empty", stepConfig: &StepConfig{}, stepParams: []StepParameters{}, expected: map[string]interface{}{}},
+		{name: "no condition", stepConfig: &StepConfig{}, stepParams: []StepParameters{{Name: "noCondition", Default: "noCondition_default"}}, expected: map[string]interface{}{"noCondition": "noCondition_default"}},
+		{
+			name:       "with multiple conditions",
+			stepConfig: &StepConfig{},
+			stepParams: []StepParameters{
+				{Name: "dependentParam1", Default: "dependentParam1_value"},
+				{Name: "dependentParam2", Default: "dependentParam2_value"},
+				{
+					Name:    "withConditionParameter",
+					Default: "withCondition_default_a",
+					Conditions: []Condition{
+						{ConditionRef: "strings-equal", Params: []Param{{Name: "dependentParam1", Value: "dependentParam1_value1"}}},
+						{ConditionRef: "strings-equal", Params: []Param{{Name: "dependentParam2", Value: "dependentParam2_value1"}}},
+					},
+				},
+				{
+					Name:    "withConditionParameter",
+					Default: "withCondition_default_b",
+					Conditions: []Condition{
+						{ConditionRef: "strings-equal", Params: []Param{{Name: "dependentParam1", Value: "dependentParam1_value2"}}},
+						{ConditionRef: "strings-equal", Params: []Param{{Name: "dependentParam2", Value: "dependentParam2_value2"}}},
+					},
+				},
+			},
+			expected: map[string]interface{}{
+				"dependentParam1":        "dependentParam1_value",
+				"dependentParam2":        "dependentParam2_value",
+				"dependentParam1_value1": map[string]interface{}{"withConditionParameter": "withCondition_default_a"},
+				"dependentParam2_value1": map[string]interface{}{"withConditionParameter": "withCondition_default_a"},
+				"dependentParam1_value2": map[string]interface{}{"withConditionParameter": "withCondition_default_b"},
+				"dependentParam2_value2": map[string]interface{}{"withConditionParameter": "withCondition_default_b"},
+			},
+		},
+	}
+
+	for _, test := range tt {
+		test.stepConfig.mixInStepDefaults(test.stepParams)
+		assert.Equal(t, test.expected, test.stepConfig.Config, test.name)
+	}
+}
+
+func TestCloneConfig(t *testing.T) {
+	testConfig := &Config{
+		General: map[string]interface{}{
+			"p0": "p0_general",
+		},
+		Stages: map[string]map[string]interface{}{
+			"stage1": {
+				"p1": "p1_stage",
+			},
+		},
+		Steps: map[string]map[string]interface{}{
+			"step1": {
+				"p2": "p2_step",
+			},
+		},
+	}
+	clone, err := cloneConfig(testConfig)
+	assert.NoError(t, err)
+	assert.Equal(t, testConfig, clone)
+	testConfig.General["p0"] = "new_value"
+	assert.NotEqual(t, testConfig.General, clone.General)
 }

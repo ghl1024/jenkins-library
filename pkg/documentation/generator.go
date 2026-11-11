@@ -4,13 +4,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
 
 	generator "github.com/SAP/jenkins-library/pkg/documentation/generator"
 	"github.com/SAP/jenkins-library/pkg/generator/helper"
-	"github.com/ghodss/yaml"
+	"github.com/SAP/jenkins-library/pkg/piperutils"
+
+	"go.yaml.in/yaml/v3"
 )
 
 type sliceFlags struct {
@@ -27,40 +28,68 @@ func (f *sliceFlags) Set(value string) error {
 }
 
 func main() {
+	// flags for step documentation
 	var metadataPath string
 	var docTemplatePath string
 	var customLibraryStepFile string
 	var customDefaultFiles sliceFlags
-
+	var includeAzure, includeGHA bool
 	flag.StringVar(&metadataPath, "metadataDir", "./resources/metadata", "The directory containing the step metadata. Default points to \\'resources/metadata\\'.")
 	flag.StringVar(&docTemplatePath, "docuDir", "./documentation/docs/steps/", "The directory containing the docu stubs. Default points to \\'documentation/docs/steps/\\'.")
 	flag.StringVar(&customLibraryStepFile, "customLibraryStepFile", "", "")
 	flag.Var(&customDefaultFiles, "customDefaultFile", "Path to a custom default configuration file.")
+	flag.BoolVar(&includeAzure, "includeAzure", false, "Include Azure-specifics in step documentation.")
+	flag.BoolVar(&includeGHA, "includeGHA", false, "Include GitHub Actions-specifics in step documentation.")
+
+	// flags for stage documentation
+	var generateStageConfig bool
+	var stageMetadataPath string
+	var stageTargetPath string
+	var relativeStepsPath string
+	flag.BoolVar(&generateStageConfig, "generateStageConfig", false, "Create stage documentation instead of step documentation.")
+	flag.StringVar(&stageMetadataPath, "stageMetadataPath", "./resources/com.sap.piper/pipeline/stageDefaults.yml", "The file containing the stage metadata. Default points to \\'./resources/com.sap.piper/pipeline/stageDefaults.yml\\'.")
+	flag.StringVar(&stageTargetPath, "stageTargetPath", "./documentation/docs/stages/", "The target path for the generated stage documentation. Default points to \\'./documentation/docs/stages/\\'.")
+	flag.StringVar(&relativeStepsPath, "relativeStepsPath", "../../steps", "The relative path from stages to steps")
 
 	flag.Parse()
 
-	fmt.Println("using Metadata Directory:", metadataPath)
-	fmt.Println("using Documentation Directory:", docTemplatePath)
-	fmt.Println("using Custom Default Files:", strings.Join(customDefaultFiles.list, ", "))
+	if generateStageConfig {
+		// generating stage documentation
+		fmt.Println("Generating STAGE documentation")
+		fmt.Println("using Metadata:", stageMetadataPath)
+		fmt.Println("using stage target directory:", stageTargetPath)
+		fmt.Println("using relative steps path:", relativeStepsPath)
 
-	if len(customLibraryStepFile) > 0 {
-		fmt.Println("Reading custom library step mapping..")
-		content, err := ioutil.ReadFile(customLibraryStepFile)
+		utils := &piperutils.Files{}
+		err := generator.GenerateStageDocumentation(stageMetadataPath, stageTargetPath, relativeStepsPath, utils)
 		checkError(err)
-		err = yaml.Unmarshal(content, &generator.CustomLibrarySteps)
+
+	} else {
+		// generating step documentation
+		fmt.Println("Generating STEP documentation")
+		fmt.Println("using Metadata Directory:", metadataPath)
+		fmt.Println("using Documentation Directory:", docTemplatePath)
+		fmt.Println("using Custom Default Files:", strings.Join(customDefaultFiles.list, ", "))
+
+		if len(customLibraryStepFile) > 0 {
+			fmt.Println("Reading custom library step mapping..")
+			content, err := os.ReadFile(customLibraryStepFile)
+			checkError(err)
+			err = yaml.Unmarshal(content, &generator.CustomLibrarySteps)
+			checkError(err)
+			fmt.Println(generator.CustomLibrarySteps)
+		}
+
+		metadataFiles, err := helper.MetadataFiles(metadataPath)
 		checkError(err)
-		fmt.Println(generator.CustomLibrarySteps)
+		err = generator.GenerateStepDocumentation(metadataFiles, customDefaultFiles.list, generator.DocuHelperData{
+			DocTemplatePath:     docTemplatePath,
+			OpenDocTemplateFile: openDocTemplateFile,
+			DocFileWriter:       writeFile,
+			OpenFile:            openFile,
+		}, includeAzure, includeGHA)
+		checkError(err)
 	}
-
-	metadataFiles, err := helper.MetadataFiles(metadataPath)
-	checkError(err)
-	err = generator.GenerateStepDocumentation(metadataFiles, customDefaultFiles.list, generator.DocuHelperData{
-		DocTemplatePath:     docTemplatePath,
-		OpenDocTemplateFile: openDocTemplateFile,
-		DocFileWriter:       writeFile,
-		OpenFile:            openFile,
-	})
-	checkError(err)
 }
 
 func openDocTemplateFile(docTemplateFilePath string) (io.ReadCloser, error) {
@@ -74,7 +103,7 @@ func openDocTemplateFile(docTemplateFilePath string) (io.ReadCloser, error) {
 }
 
 func writeFile(filename string, data []byte, perm os.FileMode) error {
-	return ioutil.WriteFile(filename, data, perm)
+	return os.WriteFile(filename, data, perm)
 }
 
 func openFile(name string) (io.ReadCloser, error) {

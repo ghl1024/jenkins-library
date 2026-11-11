@@ -1,19 +1,21 @@
+//go:build unit
+// +build unit
+
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"testing"
 
 	"github.com/SAP/jenkins-library/pkg/mock"
-	"github.com/pkg/errors"
+
 	"github.com/stretchr/testify/assert"
 )
 
 type containerStructureTestsMockUtils struct {
-	shouldFail     bool
-	requestedUrls  []string
-	requestedFiles []string
+	shouldFail bool
 	*mock.FilesMock
 	*mock.ExecMockRunner
 }
@@ -41,7 +43,6 @@ func newContainerStructureTestsMockUtils() containerStructureTestsMockUtils {
 }
 
 func TestRunContainerExecuteStructureTests(t *testing.T) {
-
 	t.Run("success case", func(t *testing.T) {
 		config := &containerExecuteStructureTestsOptions{
 			PullImage:          true,
@@ -68,7 +69,7 @@ func TestRunContainerExecuteStructureTests(t *testing.T) {
 
 		assert.NoError(t, err)
 		if assert.Equal(t, 1, len(mockUtils.Calls)) {
-			assert.Equal(t, "container-structure-test", mockUtils.Calls[0].Exec)
+			assert.Equal(t, "./container-structure-test", mockUtils.Calls[0].Exec)
 			assert.Equal(t, expectedParams, mockUtils.Calls[0].Params)
 		}
 	})
@@ -97,7 +98,7 @@ func TestRunContainerExecuteStructureTests(t *testing.T) {
 
 		assert.NoError(t, err)
 		if assert.Equal(t, 1, len(mockUtils.Calls)) {
-			assert.Equal(t, "container-structure-test", mockUtils.Calls[0].Exec)
+			assert.Equal(t, "./container-structure-test", mockUtils.Calls[0].Exec)
 			assert.Equal(t, expectedParams, mockUtils.Calls[0].Params)
 		}
 	})
@@ -128,7 +129,7 @@ func TestRunContainerExecuteStructureTests(t *testing.T) {
 
 		assert.NoError(t, err)
 		if assert.Equal(t, 1, len(mockUtils.Calls)) {
-			assert.Equal(t, "container-structure-test", mockUtils.Calls[0].Exec)
+			assert.Equal(t, "./container-structure-test", mockUtils.Calls[0].Exec)
 			assert.Equal(t, expectedParams, mockUtils.Calls[0].Params)
 		}
 		GeneralConfig.Verbose = false
@@ -160,7 +161,7 @@ func TestRunContainerExecuteStructureTests(t *testing.T) {
 
 		assert.NoError(t, err)
 		if assert.Equal(t, 1, len(mockUtils.Calls)) {
-			assert.Equal(t, "container-structure-test", mockUtils.Calls[0].Exec)
+			assert.Equal(t, "./container-structure-test", mockUtils.Calls[0].Exec)
 			assert.Equal(t, expectedParams, mockUtils.Calls[0].Params)
 		}
 		os.Unsetenv("ON_K8S")
@@ -182,7 +183,7 @@ func TestRunContainerExecuteStructureTests(t *testing.T) {
 		// test
 		err := runContainerExecuteStructureTests(config, &mockUtils)
 		// assert
-		assert.EqualError(t, err, "failed to run executable, command: '[container-structure-test test --config config1.yaml --config config2.yaml --driver docker --pull --image reg/image:tag --test-report report.json]', error: container-structure-test run failed: container-structure-test run failed")
+		assert.EqualError(t, err, "failed to run executable, command: '[./container-structure-test test --config config1.yaml --config config2.yaml --driver docker --pull --image reg/image:tag --test-report report.json]', error: container-structure-test run failed: container-structure-test run failed")
 	})
 
 	t.Run("error case - configuration is missing", func(t *testing.T) {

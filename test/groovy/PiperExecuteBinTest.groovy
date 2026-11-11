@@ -1,4 +1,5 @@
 import com.sap.piper.DebugReport
+import com.sap.piper.DefaultValueCache
 import com.sap.piper.JenkinsUtils
 import groovy.json.JsonSlurper
 import hudson.AbortException
@@ -53,6 +54,8 @@ class PiperExecuteBinTest extends BasePiperTest {
             return closure()
         })
 
+        helper.registerAllowedMethod("writePipelineEnv", [Map.class], {m -> return })
+        helper.registerAllowedMethod("readPipelineEnv", [Map.class], {m -> return })
         helper.registerAllowedMethod('fileExists', [Map.class], {m ->
             if (m.file == 'noDetailsStep_errorDetails.json') {
                 return false
@@ -119,6 +122,7 @@ class PiperExecuteBinTest extends BasePiperTest {
 
     @Test
     void testPiperExecuteBinDefault() {
+        shellCallRule.setReturnValue('[ -x ./piper ]', 1)
         shellCallRule.setReturnValue('./piper getConfig --contextConfig --stepMetadata \'.pipeline/tmp/metadata/test.yaml\'', '{"fileCredentialsId":"credFile", "tokenCredentialsId":"credToken", "credentialsId":"credUsernamePassword", "dockerImage":"my.Registry/my/image:latest"}')
 
         List stepCredentials = [
@@ -140,7 +144,7 @@ class PiperExecuteBinTest extends BasePiperTest {
         // asserts
         assertThat(writeFileRule.files['.pipeline/tmp/metadata/test.yaml'], containsString('name: testStep'))
         assertThat(withEnvArgs[0], allOf(startsWith('PIPER_parametersJSON'), containsString('"testParam":"This is test content"')))
-        assertThat(shellCallRule.shell[1], is('./piper testStep'))
+        assertThat(shellCallRule.shell[2], is('./piper testStep'))
         assertThat(credentials.size(), is(3))
         assertThat(credentials[0], allOf(hasEntry('credentialsId', 'credFile'), hasEntry('variable', 'PIPER_credFile')))
         assertThat(credentials[1], allOf(hasEntry('credentialsId', 'credToken'), hasEntry('variable', 'PIPER_credToken')))
@@ -153,11 +157,38 @@ class PiperExecuteBinTest extends BasePiperTest {
     }
 
     @Test
+    void testPiperExecuteBinANSCredentialsFromHooksSection() {
+        shellCallRule.setReturnValue('[ -x ./piper ]', 1)
+        shellCallRule.setReturnValue('./piper getConfig --contextConfig --stepMetadata \'.pipeline/tmp/metadata/test.yaml\'', '{"fileCredentialsId":"credFile", "tokenCredentialsId":"credToken", "credentialsId":"credUsernamePassword", "dockerImage":"my.Registry/my/image:latest"}')
+
+        def newScript = nullScript
+        DefaultValueCache.createInstance([hooks: [ans: [serviceKeyCredentialsId: "ansServiceKeyID"]]])
+
+        List stepCredentials = []
+        stepRule.step.piperExecuteBin(
+                [
+                        juStabUtils: utils,
+                        jenkinsUtilsStub: jenkinsUtils,
+                        testParam: "This is test content",
+                        script: newScript
+                ],
+                'testStep',
+                'metadata/test.yaml',
+                stepCredentials
+        )
+        // asserts
+        assertThat(credentials.size(), is(1))
+        assertThat(credentials[0], allOf(hasEntry('credentialsId', 'ansServiceKeyID'), hasEntry('variable', 'PIPER_ansHookServiceKey')))
+        DefaultValueCache.reset()
+    }
+
+    @Test
     void testPiperExecuteBinDontResolveCredentialsAndNoCredId() {
 
         // In case we have a credential entry without Id we drop that silenty.
         // Maybe we should revisit that and fail in this case.
 
+        shellCallRule.setReturnValue('[ -x ./piper ]', 1)
         shellCallRule.setReturnValue('./piper getConfig --contextConfig --stepMetadata \'.pipeline/tmp/metadata/test.yaml\'', '{"dockerImage":"my.Registry/my/image:latest"}')
 
         List stepCredentials = [
@@ -180,6 +211,7 @@ class PiperExecuteBinTest extends BasePiperTest {
 
     @Test
     void testPiperExecuteBinSomeCredentials() {
+        shellCallRule.setReturnValue('[ -x ./piper ]', 1)
         shellCallRule.setReturnValue('./piper getConfig --contextConfig --stepMetadata \'.pipeline/tmp/metadata/test.yaml\'', '{"fileCredentialsId":"credFile", "tokenCredentialsId":"credToken", "dockerImage":"my.Registry/my/image:latest"}')
 
         List stepCredentials = [
@@ -210,6 +242,7 @@ class PiperExecuteBinTest extends BasePiperTest {
 
     @Test
     void testPiperExecuteBinSSHCredentials() {
+        shellCallRule.setReturnValue('[ -x ./piper ]', 1)
         shellCallRule.setReturnValue('./piper getConfig --contextConfig --stepMetadata \'.pipeline/tmp/metadata/test.yaml\'', '{"sshCredentialsId":"sshKey", "tokenCredentialsId":"credToken"}')
 
         List sshKey = []
@@ -241,6 +274,7 @@ class PiperExecuteBinTest extends BasePiperTest {
 
     @Test
     void testPiperExecuteBinNoDockerNoCredentials() {
+        shellCallRule.setReturnValue('[ -x ./piper ]', 1)
         shellCallRule.setReturnValue('./piper getConfig --contextConfig --stepMetadata \'.pipeline/tmp/metadata/test.yaml\'', '{}')
 
         stepRule.step.piperExecuteBin(
@@ -257,7 +291,7 @@ class PiperExecuteBinTest extends BasePiperTest {
 
         assertThat(writeFileRule.files['.pipeline/tmp/metadata/test.yaml'], containsString('name: testStep'))
         assertThat(withEnvArgs[0], allOf(startsWith('PIPER_parametersJSON'), containsString('"testParam":"This is test content"')))
-        assertThat(shellCallRule.shell[1], is('./piper testStep'))
+        assertThat(shellCallRule.shell[2], is('./piper testStep'))
         assertThat(credentials.size(), is(0))
 
         assertThat(dockerExecuteRule.dockerParams.size(), is(0))
@@ -268,6 +302,7 @@ class PiperExecuteBinTest extends BasePiperTest {
 
     @Test
     void testPiperExecuteBinNoReportFound() {
+        shellCallRule.setReturnValue('[ -x ./piper ]', 1)
         shellCallRule.setReturnValue('./piper getConfig --contextConfig --stepMetadata \'.pipeline/tmp/metadata/test.yaml\'', '{}')
         helper.registerAllowedMethod('fileExists', [Map], {
             return false
@@ -294,6 +329,7 @@ class PiperExecuteBinTest extends BasePiperTest {
 
     @Test
     void testErrorWithCategory() {
+        shellCallRule.setReturnValue('[ -x ./piper ]', 1)
         shellCallRule.setReturnValue('./piper getConfig --contextConfig --stepMetadata \'.pipeline/tmp/metadata/test.yaml\'', '{}')
         helper.registerAllowedMethod('sh', [String.class], {s -> throw new AbortException('exit code 1')})
 
@@ -321,6 +357,7 @@ class PiperExecuteBinTest extends BasePiperTest {
 
     @Test
     void testErrorWithoutCategory() {
+        shellCallRule.setReturnValue('[ -x ./piper ]', 1)
         shellCallRule.setReturnValue('./piper getConfig --contextConfig --stepMetadata \'.pipeline/tmp/metadata/test.yaml\'', '{}')
         helper.registerAllowedMethod('sh', [String.class], {s -> throw new AbortException('exit code 1')})
 
@@ -342,6 +379,7 @@ class PiperExecuteBinTest extends BasePiperTest {
 
     @Test
     void testErrorNoDetails() {
+        shellCallRule.setReturnValue('[ -x ./piper ]', 1)
         shellCallRule.setReturnValue('./piper getConfig --contextConfig --stepMetadata \'.pipeline/tmp/metadata/test.yaml\'', '{}')
         helper.registerAllowedMethod('sh', [String.class], {s -> throw new AbortException('exit code 1')})
 
@@ -363,6 +401,7 @@ class PiperExecuteBinTest extends BasePiperTest {
 
     @Test
     void testRespectPipelineResilienceSetting() {
+        shellCallRule.setReturnValue('[ -x ./piper ]', 1)
         shellCallRule.setReturnValue('./piper getConfig --contextConfig --stepMetadata \'.pipeline/tmp/metadata/test.yaml\'', '{}')
         helper.registerAllowedMethod('sh', [String.class], {s -> throw new AbortException('exit code 1')})
 
@@ -393,6 +432,7 @@ class PiperExecuteBinTest extends BasePiperTest {
 
     @Test
     void testProperStashHandling() {
+        shellCallRule.setReturnValue('[ -x ./piper ]', 1)
         shellCallRule.setReturnValue('./piper getConfig --contextConfig --stepMetadata \'.pipeline/tmp/metadata/test.yaml\'', '{"dockerImage":"test","stashContent":["buildDescriptor"]}')
 
         stepRule.step.piperExecuteBin(

@@ -1,14 +1,37 @@
+//go:build unit
+// +build unit
+
 package cmd
 
 import (
-	"io/ioutil"
+	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/SAP/jenkins-library/pkg/abaputils"
-	"github.com/pkg/errors"
+	"github.com/SAP/jenkins-library/pkg/piperutils"
+
 	"github.com/stretchr/testify/assert"
 )
+
+var executionLogStringCheckout string
+
+func init() {
+	executionLog := abaputils.LogProtocolResults{
+		Results: []abaputils.LogProtocol{
+			{
+				ProtocolLine:  1,
+				OverviewIndex: 1,
+				Type:          "LogEntry",
+				Description:   "S",
+				Timestamp:     "/Date(1644332299000+0000)/",
+			},
+		},
+	}
+	executionLogResponse, _ := json.Marshal(executionLog)
+	executionLogStringCheckout = string(executionLogResponse)
+}
 
 func TestCheckoutBranchStep(t *testing.T) {
 	t.Run("Run Step Successful - repositoryName and branchName config", func(t *testing.T) {
@@ -30,10 +53,15 @@ func TestCheckoutBranchStep(t *testing.T) {
 			Password:          "testPassword",
 			RepositoryName:    "testRepo1",
 			BranchName:        "testBranch",
+			LogOutput:         "STANDARD",
 		}
 
+		logResultSuccess := `{"d": { "sc_name": "/DMO/SWC", "status": "S", "to_Log_Overview": { "results": [ { "log_index": 1, "log_name": "Main Import", "type_of_found_issues": "Success", "timestamp": "/Date(1644332299000+0000)/", "to_Log_Protocol": { "results": [ { "log_index": 1, "index_no": "1", "log_name": "", "type": "Info", "descr": "Main import", "timestamp": null, "criticality": 0 } ] } } ] } } }`
 		client := &abaputils.ClientMock{
 			BodyList: []string{
+				`{"d" : [] }`,
+				`{"d" : ` + executionLogStringCheckout + `}`,
+				logResultSuccess,
 				`{"d" : { "status" : "S" } }`,
 				`{"d" : { "status" : "S" } }`,
 				`{"d" : { "status" : "S" } }`,
@@ -42,11 +70,20 @@ func TestCheckoutBranchStep(t *testing.T) {
 			StatusCode: 200,
 		}
 
-		err := runAbapEnvironmentCheckoutBranch(&config, nil, &autils, client)
+		var reports []piperutils.Path
+		logOutputManager := abaputils.LogOutputManager{
+			LogOutput:    config.LogOutput,
+			PiperStep:    "checkoutBranch",
+			FileNameStep: "checkoutBranch",
+			StepReports:  reports,
+		}
+
+		apiManager = &abaputils.SoftwareComponentApiManager{Client: client, PollIntervall: 1 * time.Nanosecond, Force0510: true}
+		err := runAbapEnvironmentCheckoutBranch(&config, &autils, apiManager, &logOutputManager)
 		assert.NoError(t, err, "Did not expect error")
 	})
 	t.Run("Run Step Failure - empty config", func(t *testing.T) {
-		expectedErrorMessage := "Something failed during the checkout: Checking configuration failed: You have not specified any repository or branch configuration to be checked out in the ABAP Environment System. Please make sure that you specified the repositories with their branches that should be checked out either in a dedicated file or via the parameters 'repositoryName' and 'branchName'. For more information please read the User documentation"
+		expectedErrorMessage := "Configuration is not consistent: You have not specified any repository or branch configuration to be checked out in the ABAP Environment System. Please make sure that you specified the repositories with their branches that should be checked out either in a dedicated file or via the parameters 'repositoryName' and 'branchName'. For more information please read the user documentation"
 
 		var autils = abaputils.AUtilsMock{}
 		defer autils.Cleanup()
@@ -57,8 +94,11 @@ func TestCheckoutBranchStep(t *testing.T) {
 
 		config := abapEnvironmentCheckoutBranchOptions{}
 
+		logResultError := `{"d": { "sc_name": "/DMO/SWC", "status": "S", "to_Log_Overview": { "results": [ { "log_index": 1, "log_name": "Main Import", "type_of_found_issues": "Error", "timestamp": "/Date(1644332299000+0000)/", "to_Log_Protocol": { "results": [ { "log_index": 1, "index_no": "1", "log_name": "", "type": "Info", "descr": "Main import", "timestamp": null, "criticality": 0 } ] } } ] } } }`
 		client := &abaputils.ClientMock{
 			BodyList: []string{
+				`{"d" : ` + executionLogStringCheckout + `}`,
+				logResultError,
 				`{"d" : { "status" : "E" } }`,
 				`{"d" : { "status" : "E" } }`,
 				`{"d" : { "status" : "E" } }`,
@@ -67,7 +107,16 @@ func TestCheckoutBranchStep(t *testing.T) {
 			StatusCode: 200,
 		}
 
-		err := runAbapEnvironmentCheckoutBranch(&config, nil, &autils, client)
+		var reports []piperutils.Path
+		logOutputManager := abaputils.LogOutputManager{
+			LogOutput:    "STANDARD",
+			PiperStep:    "checkoutBranch",
+			FileNameStep: "checkoutBranch",
+			StepReports:  reports,
+		}
+
+		apiManager = &abaputils.SoftwareComponentApiManager{Client: client, PollIntervall: 1 * time.Nanosecond, Force0510: true}
+		err := runAbapEnvironmentCheckoutBranch(&config, &autils, apiManager, &logOutputManager)
 		assert.EqualError(t, err, expectedErrorMessage)
 	})
 	t.Run("Run Step Failure - wrong status", func(t *testing.T) {
@@ -90,10 +139,15 @@ func TestCheckoutBranchStep(t *testing.T) {
 			Password:          "testPassword",
 			RepositoryName:    "testRepo1",
 			BranchName:        "testBranch",
+			LogOutput:         "STANDARD",
 		}
 
+		logResultError := `{"d": { "sc_name": "/DMO/SWC", "status": "S", "to_Log_Overview": { "results": [ { "log_index": 1, "log_name": "Main Import", "type_of_found_issues": "Error", "timestamp": "/Date(1644332299000+0000)/", "to_Log_Protocol": { "results": [ { "log_index": 1, "index_no": "1", "log_name": "", "type": "Info", "descr": "Main import", "timestamp": null, "criticality": 0 } ] } } ] } } }`
 		client := &abaputils.ClientMock{
 			BodyList: []string{
+				`{"d" : ` + executionLogStringCheckout + `}`,
+				logResultError,
+				`{"d" : { "status" : "E" } }`,
 				`{"d" : { "status" : "E" } }`,
 				`{"d" : { "status" : "E" } }`,
 				`{"d" : { "status" : "E" } }`,
@@ -102,7 +156,16 @@ func TestCheckoutBranchStep(t *testing.T) {
 			StatusCode: 200,
 		}
 
-		err := runAbapEnvironmentCheckoutBranch(&config, nil, &autils, client)
+		var reports []piperutils.Path
+		logOutputManager := abaputils.LogOutputManager{
+			LogOutput:    config.LogOutput,
+			PiperStep:    "checkoutBranch",
+			FileNameStep: "checkoutBranch",
+			StepReports:  reports,
+		}
+
+		apiManager = &abaputils.SoftwareComponentApiManager{Client: client, PollIntervall: 1 * time.Nanosecond, Force0510: true}
+		err := runAbapEnvironmentCheckoutBranch(&config, &autils, apiManager, &logOutputManager)
 		assert.EqualError(t, err, expectedErrorMessage)
 	})
 	t.Run("Success case: checkout Branches from file config", func(t *testing.T) {
@@ -120,17 +183,13 @@ func TestCheckoutBranchStep(t *testing.T) {
 			StatusCode: 200,
 		}
 
-		dir, err := ioutil.TempDir("", "test checkout branches")
-		if err != nil {
-			t.Fatal("Failed to create temporary directory")
-		}
+		dir := t.TempDir()
 		oldCWD, _ := os.Getwd()
 		_ = os.Chdir(dir)
 		// clean up tmp dir
 
 		defer func() {
 			_ = os.Chdir(oldCWD)
-			_ = os.RemoveAll(dir)
 		}()
 
 		manifestFileString := `
@@ -142,7 +201,7 @@ repositories:
 - name: 'testRepo3'
   branch: 'testBranch3'`
 
-		err = ioutil.WriteFile("repositoriesTest.yml", []byte(manifestFileString), 0644)
+		err := os.WriteFile("repositoriesTest.yml", []byte(manifestFileString), 0644)
 
 		config := abapEnvironmentCheckoutBranchOptions{
 			CfAPIEndpoint:     "https://api.endpoint.com",
@@ -153,12 +212,23 @@ repositories:
 			Username:          "testUser",
 			Password:          "testPassword",
 			Repositories:      "repositoriesTest.yml",
+			LogOutput:         "STANDARD",
 		}
-		err = runAbapEnvironmentCheckoutBranch(&config, nil, &autils, client)
+
+		var reports []piperutils.Path
+		logOutputManager := abaputils.LogOutputManager{
+			LogOutput:    config.LogOutput,
+			PiperStep:    "checkoutBranch",
+			FileNameStep: "checkoutBranch",
+			StepReports:  reports,
+		}
+
+		apiManager = &abaputils.SoftwareComponentApiManager{Client: client, PollIntervall: 1 * time.Nanosecond, Force0510: true}
+		err = runAbapEnvironmentCheckoutBranch(&config, &autils, apiManager, &logOutputManager)
 		assert.NoError(t, err)
 	})
 	t.Run("Failure case: checkout Branches from empty file config", func(t *testing.T) {
-		expectedErrorMessage := "Something failed during the checkout: Error in config file repositoriesTest.yml, AddonDescriptor doesn't contain any repositories"
+		expectedErrorMessage := "Could not read repositories: Error in config file repositoriesTest.yml, AddonDescriptor doesn't contain any repositories"
 
 		var autils = abaputils.AUtilsMock{}
 		defer autils.Cleanup()
@@ -174,22 +244,18 @@ repositories:
 			StatusCode: 200,
 		}
 
-		dir, err := ioutil.TempDir("", "test checkout branches")
-		if err != nil {
-			t.Fatal("Failed to create temporary directory")
-		}
+		dir := t.TempDir()
 		oldCWD, _ := os.Getwd()
 		_ = os.Chdir(dir)
 		// clean up tmp dir
 		defer func() {
 			_ = os.Chdir(oldCWD)
-			_ = os.RemoveAll(dir)
 		}()
 
 		manifestFileString := ``
 
 		manifestFileStringBody := []byte(manifestFileString)
-		err = ioutil.WriteFile("repositoriesTest.yml", manifestFileStringBody, 0644)
+		err := os.WriteFile("repositoriesTest.yml", manifestFileStringBody, 0644)
 
 		config := abapEnvironmentCheckoutBranchOptions{
 			CfAPIEndpoint:     "https://api.endpoint.com",
@@ -200,12 +266,23 @@ repositories:
 			Username:          "testUser",
 			Password:          "testPassword",
 			Repositories:      "repositoriesTest.yml",
+			LogOutput:         "STANDARD",
 		}
-		err = runAbapEnvironmentCheckoutBranch(&config, nil, &autils, client)
+
+		var reports []piperutils.Path
+		logOutputManager := abaputils.LogOutputManager{
+			LogOutput:    config.LogOutput,
+			PiperStep:    "checkoutBranch",
+			FileNameStep: "checkoutBranch",
+			StepReports:  reports,
+		}
+
+		apiManager = &abaputils.SoftwareComponentApiManager{Client: client, PollIntervall: 1 * time.Nanosecond, Force0510: true}
+		err = runAbapEnvironmentCheckoutBranch(&config, &autils, apiManager, &logOutputManager)
 		assert.EqualError(t, err, expectedErrorMessage)
 	})
 	t.Run("Failure case: checkout Branches from wrong file config", func(t *testing.T) {
-		expectedErrorMessage := "Something failed during the checkout: Could not unmarshal repositoriesTest.yml"
+		expectedErrorMessage := "Could not read repositories: Could not unmarshal repositoriesTest.yml"
 
 		var autils = abaputils.AUtilsMock{}
 		defer autils.Cleanup()
@@ -224,16 +301,12 @@ repositories:
 			StatusCode: 200,
 		}
 
-		dir, err := ioutil.TempDir("", "test checkout branches")
-		if err != nil {
-			t.Fatal("Failed to create temporary directory")
-		}
+		dir := t.TempDir()
 		oldCWD, _ := os.Getwd()
 		_ = os.Chdir(dir)
 		// clean up tmp dir
 		defer func() {
 			_ = os.Chdir(oldCWD)
-			_ = os.RemoveAll(dir)
 		}()
 
 		manifestFileString := `
@@ -241,7 +314,7 @@ repositories:
 - repo: 'testRepo2'`
 
 		manifestFileStringBody := []byte(manifestFileString)
-		err = ioutil.WriteFile("repositoriesTest.yml", manifestFileStringBody, 0644)
+		err := os.WriteFile("repositoriesTest.yml", manifestFileStringBody, 0644)
 
 		config := abapEnvironmentCheckoutBranchOptions{
 			CfAPIEndpoint:     "https://api.endpoint.com",
@@ -252,86 +325,20 @@ repositories:
 			Username:          "testUser",
 			Password:          "testPassword",
 			Repositories:      "repositoriesTest.yml",
+			LogOutput:         "STANDARD",
 		}
-		err = runAbapEnvironmentCheckoutBranch(&config, nil, &autils, client)
+
+		var reports []piperutils.Path
+		logOutputManager := abaputils.LogOutputManager{
+			LogOutput:    config.LogOutput,
+			PiperStep:    "checkoutBranch",
+			FileNameStep: "checkoutBranch",
+			StepReports:  reports,
+		}
+
+		apiManager = &abaputils.SoftwareComponentApiManager{Client: client, PollIntervall: 1 * time.Nanosecond, Force0510: true}
+		err = runAbapEnvironmentCheckoutBranch(&config, &autils, apiManager, &logOutputManager)
 		assert.EqualError(t, err, expectedErrorMessage)
-	})
-}
-
-func TestTriggerCheckout(t *testing.T) {
-	t.Run("Test trigger checkout: success case", func(t *testing.T) {
-
-		// given
-		receivedURI := "example.com/Branches"
-		uriExpected := receivedURI + "?$expand=to_Execution_log,to_Transport_log"
-		tokenExpected := "myToken"
-
-		client := &abaputils.ClientMock{
-			Body:       `{"d" : { "__metadata" : { "uri" : "` + receivedURI + `" } } }`,
-			Token:      tokenExpected,
-			StatusCode: 200,
-		}
-		config := abapEnvironmentCheckoutBranchOptions{
-			CfAPIEndpoint:     "https://api.endpoint.com",
-			CfOrg:             "testOrg",
-			CfSpace:           "testSpace",
-			CfServiceInstance: "testInstance",
-			CfServiceKeyName:  "testServiceKey",
-			Username:          "testUser",
-			Password:          "testPassword",
-			RepositoryName:    "testRepo1",
-			BranchName:        "feature-unit-test",
-		}
-		con := abaputils.ConnectionDetailsHTTP{
-			User:     "MY_USER",
-			Password: "MY_PW",
-			URL:      "https://api.endpoint.com/Branches",
-		}
-		// when
-		entityConnection, err := triggerCheckout(config.RepositoryName, config.BranchName, con, client)
-
-		// then
-		assert.NoError(t, err)
-		assert.Equal(t, uriExpected, entityConnection.URL)
-		assert.Equal(t, tokenExpected, entityConnection.XCsrfToken)
-	})
-
-	t.Run("Test trigger checkout: ABAP Error case", func(t *testing.T) {
-
-		// given
-		errorMessage := "ABAP Error Message"
-		errorCode := "ERROR/001"
-		HTTPErrorMessage := "HTTP Error Message"
-		combinedErrorMessage := "HTTP Error Message: ERROR/001 - ABAP Error Message"
-
-		client := &abaputils.ClientMock{
-			Body:       `{"error" : { "code" : "` + errorCode + `", "message" : { "lang" : "en", "value" : "` + errorMessage + `" } } }`,
-			Token:      "myToken",
-			StatusCode: 400,
-			Error:      errors.New(HTTPErrorMessage),
-		}
-		config := abapEnvironmentCheckoutBranchOptions{
-			CfAPIEndpoint:     "https://api.endpoint.com",
-			CfOrg:             "testOrg",
-			CfSpace:           "testSpace",
-			CfServiceInstance: "testInstance",
-			CfServiceKeyName:  "testServiceKey",
-			Username:          "testUser",
-			Password:          "testPassword",
-			RepositoryName:    "testRepo1",
-			BranchName:        "feature-unit-test",
-		}
-		con := abaputils.ConnectionDetailsHTTP{
-			User:     "MY_USER",
-			Password: "MY_PW",
-			URL:      "https://api.endpoint.com/Branches",
-		}
-
-		// when
-		_, err := triggerCheckout(config.RepositoryName, config.BranchName, con, client)
-
-		// then
-		assert.Equal(t, combinedErrorMessage, err.Error(), "Different error message expected")
 	})
 }
 
@@ -353,7 +360,7 @@ func TestCheckoutConfigChecker(t *testing.T) {
 		assert.NoError(t, err)
 	})
 	t.Run("Failure case: check empty config", func(t *testing.T) {
-		expectedErrorMessage := "Checking configuration failed: You have not specified any repository or branch configuration to be checked out in the ABAP Environment System. Please make sure that you specified the repositories with their branches that should be checked out either in a dedicated file or via the parameters 'repositoryName' and 'branchName'. For more information please read the User documentation"
+		expectedErrorMessage := "You have not specified any repository or branch configuration to be checked out in the ABAP Environment System. Please make sure that you specified the repositories with their branches that should be checked out either in a dedicated file or via the parameters 'repositoryName' and 'branchName'. For more information please read the user documentation"
 
 		config := abapEnvironmentCheckoutBranchOptions{}
 		err := checkCheckoutBranchRepositoryConfiguration(config)

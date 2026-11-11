@@ -5,16 +5,25 @@ import com.sap.piper.ConfigurationHelper
 import static com.sap.piper.Prerequisites.checkScript
 
 @Field String STEP_NAME = getClass().getName()
-@Field Set GENERAL_CONFIG_KEYS = []
-@Field STAGE_STEP_KEYS = [
-    /** Creates a SAP Cloud Platform ABAP Environment system via the cloud foundry command line interface */
+@Field Set GENERAL_CONFIG_KEYS = [
+    /** Creates a SAP BTP ABAP Environment system via the cloud foundry command line interface */
     'abapEnvironmentCreateSystem',
-    /** Deletes a SAP Cloud Platform ABAP Environment system via the cloud foundry command line interface */
+    /** Creates a BTP service instance for ABAP Environment */
+    'btpCreateServiceInstance',
+    /** Creates a BTP service binding for ABAP Environment */
+    'btpCreateServiceBinding',
+    /** Deletes a SAP BTP ABAP Environment system via the cloud foundry command line interface */
     'cloudFoundryDeleteService',
+    /** Deletes a BTP service instance */
+    'btpDeleteServiceInstance',
     /** If set to true, a confirmation is required to delete the system */
-    'confirmDeletion'
+    'confirmDeletion',
+    'debug', // If set to true, the system is never deleted
+    'testBuild', // Parameter for test execution mode, if true stage will be skipped
+    'integrationTestOption' // Integration test option
 ]
-@Field Set STEP_CONFIG_KEYS = GENERAL_CONFIG_KEYS.plus(STAGE_STEP_KEYS)
+@Field Set STAGE_STEP_KEYS = GENERAL_CONFIG_KEYS
+@Field Set STEP_CONFIG_KEYS = STAGE_STEP_KEYS
 @Field Set PARAMETER_KEYS = STEP_CONFIG_KEYS
 /**
  * This stage creates a system for Integration Tests. The (custom) tests themselves can be added via a stage extension.
@@ -29,18 +38,57 @@ void call(Map parameters = [:]) {
         .mixinStageConfig(script.commonPipelineEnvironment, stageName, STEP_CONFIG_KEYS)
         .mixin(parameters, PARAMETER_KEYS)
         .addIfEmpty('confirmDeletion', true)
+        .addIfEmpty('debug', false)
+        .addIfEmpty('testBuild', false)
+        .addIfEmpty('integrationTestOption', 'systemProvisioning')
         .use()
 
-    piperStageWrapper (script: script, stageName: stageName, stashContent: [], stageLocking: false) {
-        try {
-            abapEnvironmentCreateSystem(script: parameters.script, includeAddon: true)
-        } catch (Exception e) {
-            script.currentBuild.result = 'UNSTABLE'
-        }
-        if (config.confirmDeletion) {
-            input message: "Add-on product was installed successfully? Once you proceed, the test system will be deleted."
-        }
-        cloudFoundryDeleteService script: parameters.script
+    if (config.testBuild) {
+        echo "Stage 'Integration Tests' skipped as parameter 'testBuild' is active"
+        return null;
     }
+    piperStageWrapper (script: script, stageName: stageName, stashContent: [], stageLocking: false) {
+        if (config.integrationTestOption == 'systemProvisioning') {
+            try {
+                if (config.btpSubdomain && config.btpSubaccount) {
+                    // BTP path: Create BTP service instance and binding
+                    btpCreateServiceInstance(script: parameters.script, includeAddon: true)
+                    btpCreateServiceBinding script: parameters.script
+                } else {
+                    // Cloud Foundry path: Use existing approach
+                    abapEnvironmentCreateSystem(script: parameters.script, includeAddon: true)
+                    cloudFoundryCreateServiceKey(script: parameters.script)
+                }
+                abapEnvironmentBuild(script: parameters.script, phase: 'GENERATION', downloadAllResultFiles: true, useFieldsOfAddonDescriptor: '[{"use":"Name","renameTo":"SWC"}]')
+            } catch (Exception e) {
+                echo "Deployment test of add-on product failed."
+                throw e
+            } finally {
+                if (config.confirmDeletion) {
+                    input message: "Deployment test has been executed. Once you proceed, the test system will be deleted."
+                }
 
+                if (!config.debug) {
+                    if (config.btpSubdomain && config.btpSubaccount) {
+                        // BTP path: Clean up BTP resources
+                        btpDeleteServiceInstance script: parameters.script
+                    } else {
+                        // Cloud Foundry path: Use existing cleanup
+                        cloudFoundryDeleteService script: parameters.script
+                    }
+                }
+            }
+        } else if (config.integrationTestOption == 'addOnDeployment') {
+            try {
+                abapLandscapePortalUpdateAddOnProduct(script: parameters.script)
+                abapEnvironmentBuild(script: parameters.script, phase: 'GENERATION', downloadAllResultFiles: true, useFieldsOfAddonDescriptor: '[{"use":"Name","renameTo":"SWC"}]')
+            } catch (Exception e) {
+                echo "Deployment test of add-on product failed."
+                throw e
+            }
+        } else {
+            e = new Error('Unsupoorted integration test option.')
+            throw e
+        }
+    }
 }

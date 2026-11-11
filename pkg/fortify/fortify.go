@@ -3,39 +3,25 @@ package fortify
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
-	ff "github.com/piper-validation/fortify-client-go/fortify"
-	"github.com/piper-validation/fortify-client-go/fortify/artifact_of_project_version_controller"
-	"github.com/piper-validation/fortify-client-go/fortify/attribute_of_project_version_controller"
-	"github.com/piper-validation/fortify-client-go/fortify/auth_entity_of_project_version_controller"
-	"github.com/piper-validation/fortify-client-go/fortify/file_token_controller"
-	"github.com/piper-validation/fortify-client-go/fortify/filter_set_of_project_version_controller"
-	"github.com/piper-validation/fortify-client-go/fortify/issue_group_of_project_version_controller"
-	"github.com/piper-validation/fortify-client-go/fortify/issue_selector_set_of_project_version_controller"
-	"github.com/piper-validation/fortify-client-go/fortify/issue_statistics_of_project_version_controller"
-	"github.com/piper-validation/fortify-client-go/fortify/project_controller"
-	"github.com/piper-validation/fortify-client-go/fortify/project_version_controller"
-	"github.com/piper-validation/fortify-client-go/fortify/project_version_of_project_controller"
-	"github.com/piper-validation/fortify-client-go/fortify/saved_report_controller"
-	"github.com/piper-validation/fortify-client-go/models"
-
 	piperHttp "github.com/SAP/jenkins-library/pkg/http"
 	"github.com/SAP/jenkins-library/pkg/log"
-	"github.com/SAP/jenkins-library/pkg/piperutils"
 
-	"github.com/go-openapi/runtime"
-	"github.com/go-openapi/strfmt"
-	"github.com/pkg/errors"
+	"github.com/SAP/jenkins-library/pkg/fortify/models"
 	"github.com/sirupsen/logrus"
 )
+
+// ReportsDirectory defines the subfolder for the Fortify reports which are generated
+const ReportsDirectory = "fortify"
 
 // System is the interface abstraction of a specific SystemInstance
 type System interface {
@@ -60,6 +46,9 @@ type System interface {
 	GetIssueStatisticsOfProjectVersion(id int64) ([]*models.IssueStatistics, error)
 	GenerateQGateReport(projectID, projectVersionID, reportTemplateID int64, projectName, projectVersionName, reportFormat string) (*models.SavedReport, error)
 	GetReportDetails(id int64) (*models.SavedReport, error)
+	GetIssueDetails(projectVersionId int64, issueInstanceId string) ([]*models.ProjectVersionIssue, error)
+	GetAllIssueDetails(projectVersionId int64) ([]*models.ProjectVersionIssue, error)
+	GetIssueComments(parentId int64) ([]*models.IssueAuditComment, error)
 	UploadResultFile(endpoint, file string, projectVersionID int64) error
 	DownloadReportFile(endpoint string, reportID int64) ([]byte, error)
 	DownloadResultFile(endpoint string, projectVersionID int64) ([]byte, error)
@@ -70,46 +59,61 @@ type SystemInstance struct {
 	timeout    time.Duration
 	token      string
 	serverURL  string
-	client     *ff.Fortify
+	apiBaseURL string
+	// apiClient issues the REST API requests without retries, matching the behavior
+	// of the formerly used generated swagger client, while httpClient serves the
+	// file upload and download endpoints with the default retry handling
+	apiClient  *piperHttp.Client
 	httpClient *piperHttp.Client
 	logger     *logrus.Entry
 }
 
 // NewSystemInstance - creates an returns a new SystemInstance
-func NewSystemInstance(serverURL, apiEndpoint, authToken string, timeout time.Duration) *SystemInstance {
+func NewSystemInstance(serverURL, apiEndpoint, authToken, proxyUrl string, timeout time.Duration) *SystemInstance {
 	// If serverURL ends in a trailing slash, UploadResultFile() will construct a URL with two or more
 	// consecutive slashes and actually fail with a 503. https://github.com/SAP/jenkins-library/issues/1826
 	// Also, since the step outputs a lot of URLs to the log, those will look nicer without redundant slashes.
 	serverURL = strings.TrimRight(serverURL, "/")
-	format := strfmt.Default
-	dateTimeFormat := models.Iso8601MilliDateTime{}
-	format.Add("datetime", &dateTimeFormat, models.IsDateTime)
-	clientInstance := ff.NewHTTPClientWithConfig(format, createTransportConfig(serverURL, apiEndpoint))
 	encodedAuthToken := base64EndodePlainToken(authToken)
 	httpClientInstance := &piperHttp.Client{}
 	httpClientOptions := piperHttp.ClientOptions{Token: "FortifyToken " + encodedAuthToken, TransportTimeout: timeout}
-	httpClientInstance.SetOptions(httpClientOptions)
 
-	return NewSystemInstanceForClient(clientInstance, httpClientInstance, serverURL, encodedAuthToken, timeout)
+	if proxyUrl != "" {
+		transportProxy, err := url.Parse(proxyUrl)
+		if err != nil {
+			log.Entry().Warningf("Failed to parse proxy url %v", proxyUrl)
+		} else {
+			httpClientOptions.TransportProxy = transportProxy
+		}
+	}
+
+	httpClientInstance.SetOptions(httpClientOptions)
+	return NewSystemInstanceForClient(httpClientInstance, serverURL, createAPIBaseURL(serverURL, apiEndpoint), encodedAuthToken, timeout)
 }
 
-func createTransportConfig(serverURL, apiEndpoint string) *ff.TransportConfig {
+// createAPIBaseURL constructs the base URL of the SSC REST API from the server URL and
+// the API endpoint, defaulting to the https scheme and cleaning up redundant slashes.
+func createAPIBaseURL(serverURL, apiEndpoint string) string {
 	scheme, host := splitSchemeAndHost(serverURL)
 	host, hostEndpoint := splitHostAndEndpoint(host)
 	// Cleaning up any slashes here is mostly for cleaner log-output.
 	hostEndpoint = strings.TrimRight(hostEndpoint, "/")
 	apiEndpoint = strings.Trim(apiEndpoint, "/")
-	return &ff.TransportConfig{
-		Host:     host,
-		Schemes:  []string{scheme},
-		BasePath: fmt.Sprintf("%v/%v", hostEndpoint, apiEndpoint)}
+	baseURL := fmt.Sprintf("%v://%v", scheme, host)
+	if len(hostEndpoint) > 0 {
+		baseURL = fmt.Sprintf("%v/%v", baseURL, hostEndpoint)
+	}
+	if len(apiEndpoint) > 0 {
+		baseURL = fmt.Sprintf("%v/%v", baseURL, apiEndpoint)
+	}
+	return baseURL
 }
 
 func splitSchemeAndHost(url string) (scheme, host string) {
-	schemeEnd := strings.Index(url, "://")
-	if schemeEnd >= 0 {
-		scheme = url[0:schemeEnd]
-		host = url[schemeEnd+3:]
+	before, after, ok := strings.Cut(url, "://")
+	if ok {
+		scheme = before
+		host = after
 	} else {
 		scheme = "https"
 		host = url
@@ -118,10 +122,10 @@ func splitSchemeAndHost(url string) (scheme, host string) {
 }
 
 func splitHostAndEndpoint(urlWithoutScheme string) (host, endpoint string) {
-	hostEnd := strings.Index(urlWithoutScheme, "/")
-	if hostEnd >= 0 {
-		host = urlWithoutScheme[0:hostEnd]
-		endpoint = urlWithoutScheme[hostEnd+1:]
+	before, after, ok := strings.Cut(urlWithoutScheme, "/")
+	if ok {
+		host = before
+		endpoint = after
 	} else {
 		host = urlWithoutScheme
 		endpoint = ""
@@ -138,34 +142,73 @@ func base64EndodePlainToken(authToken string) (encodedAuthToken string) {
 }
 
 // NewSystemInstanceForClient - creates a new SystemInstance
-func NewSystemInstanceForClient(clientInstance *ff.Fortify, httpClientInstance *piperHttp.Client, serverURL, authToken string, requestTimeout time.Duration) *SystemInstance {
+func NewSystemInstanceForClient(httpClientInstance *piperHttp.Client, serverURL, apiBaseURL, authToken string, requestTimeout time.Duration) *SystemInstance {
+	apiClientInstance := &piperHttp.Client{}
+	apiClientInstance.SetOptions(piperHttp.ClientOptions{
+		Token:            "FortifyToken " + authToken,
+		TransportTimeout: requestTimeout,
+		MaxRetries:       -1,
+	})
 	return &SystemInstance{
 		timeout:    requestTimeout,
 		token:      authToken,
 		serverURL:  serverURL,
-		client:     clientInstance,
+		apiBaseURL: apiBaseURL,
+		apiClient:  apiClientInstance,
 		httpClient: httpClientInstance,
 		logger:     log.Entry().WithField("package", "SAP/jenkins-library/pkg/fortify"),
 	}
 }
 
-// AuthenticateRequest authenticates the request
-func (sys *SystemInstance) AuthenticateRequest(req runtime.ClientRequest, formats strfmt.Registry) error {
-	req.SetHeaderParam("Authorization", fmt.Sprintf("FortifyToken %v", sys.token))
-	return nil
+// apiResponsePayload is the generic response envelope of the SSC REST API
+type apiResponsePayload[T any] struct {
+	Data  T     `json:"data"`
+	Count int32 `json:"count"`
+}
+
+// sendAPIRequest issues a request against the SSC REST API and decodes the enveloped response payload
+func sendAPIRequest[T any](sys *SystemInstance, method, endpoint string, query url.Values, requestBody any) (*apiResponsePayload[T], error) {
+	requestURL := sys.apiBaseURL + endpoint
+	if len(query) > 0 {
+		requestURL += "?" + query.Encode()
+	}
+	header := http.Header{}
+	header.Set("Accept", "application/json")
+	var bodyReader io.Reader
+	if requestBody != nil {
+		// a json.Encoder appends a trailing newline, producing the same request
+		// bodies as the formerly used generated swagger client
+		body := &bytes.Buffer{}
+		if err := json.NewEncoder(body).Encode(requestBody); err != nil {
+			return nil, err
+		}
+		bodyReader = body
+		header.Set("Content-Type", "application/json")
+	}
+	response, err := sys.apiClient.SendRequest(method, requestURL, bodyReader, header, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	result := &apiResponsePayload[T]{}
+	// a json.Decoder decodes the first JSON value and tolerates an empty body as
+	// well as trailing content, matching the behavior of the formerly used
+	// generated swagger client
+	if err := json.NewDecoder(response.Body).Decode(result); err != nil && err != io.EOF {
+		return nil, err
+	}
+	return result, nil
 }
 
 // GetProjectByName returns the project identified by the name provided
 // autoCreate and projectVersion parameters only used if autoCreate=true
 func (sys *SystemInstance) GetProjectByName(projectName string, autoCreate bool, projectVersionName string) (*models.Project, error) {
-	nameParam := fmt.Sprintf("name=%v", projectName)
-	params := &project_controller.ListProjectParams{Q: &nameParam}
-	params.WithTimeout(sys.timeout)
-	result, err := sys.client.ProjectController.ListProject(params, sys)
+	query := url.Values{"q": {fmt.Sprintf(`name:"%v"`, projectName)}}
+	result, err := sendAPIRequest[[]*models.Project](sys, http.MethodGet, "/projects", query, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
-	for _, project := range result.GetPayload().Data {
+	for _, project := range result.Data {
 		if *project.Name == projectName {
 			return project, nil
 		}
@@ -189,28 +232,26 @@ func (sys *SystemInstance) GetProjectByName(projectName string, autoCreate bool,
 // GetProjectVersionDetailsByProjectIDAndVersionName returns the project version details of the project version identified by the id and project versionname
 // projectName parameter is only used if autoCreate=true
 func (sys *SystemInstance) GetProjectVersionDetailsByProjectIDAndVersionName(id int64, versionName string, autoCreate bool, projectName string) (*models.ProjectVersion, error) {
-	nameParam := fmt.Sprintf("name=%v", versionName)
-	params := &project_version_of_project_controller.ListProjectVersionOfProjectParams{ParentID: id, Q: &nameParam}
-	params.WithTimeout(sys.timeout)
-	result, err := sys.client.ProjectVersionOfProjectController.ListProjectVersionOfProject(params, sys)
+	query := url.Values{"q": {fmt.Sprintf(`name:"%v"`, versionName)}}
+	result, err := sendAPIRequest[[]*models.ProjectVersion](sys, http.MethodGet, fmt.Sprintf("/projects/%v/versions", id), query, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
-	for _, projectVersion := range result.GetPayload().Data {
-		if *projectVersion.Name == versionName {
-			return projectVersion, nil
-		}
+
+	if result.Count > 0 && len(result.Data) > 0 {
+		projectVersion := result.Data[0]
+		return projectVersion, nil
 	}
 	// projectVersion not found for specified project id and name, check if autoCreate is enabled
 	if !autoCreate {
 		log.SetErrorCategory(log.ErrorConfiguration)
-		return nil, errors.New(fmt.Sprintf("Project version with name %v not found in project with ID %v and automatic creation not enabled", versionName, id))
+		return nil, fmt.Errorf("Project version with name %v not found in project with ID %v and automatic creation not enabled", versionName, id)
 	}
 
 	log.Entry().Debugf("Could not find project version with name %v under project %v auto-creating one now...", versionName, projectName)
 	version, err := sys.CreateProjectVersionIfNotExist(projectName, versionName, "Created by Go script")
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to auto-create project version: %v for project %v", versionName, projectName)
+		return nil, fmt.Errorf("failed to auto-create project version: %v for project %v: %w", versionName, projectName, err)
 	}
 	log.Entry().Debugf("Successfully created project version %v for project %v", versionName, projectName)
 	return version, nil
@@ -249,11 +290,11 @@ func (sys *SystemInstance) CreateProjectVersionIfNotExist(projectName, projectVe
 	}
 	projectVersion, err := sys.CreateProjectVersion(projectVersionDto)
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to create new project version %v for projectName %v", projectVersionName, projectName)
+		return nil, fmt.Errorf("Failed to create new project version %v for projectName %v: %w", projectVersionName, projectName, err)
 	}
 	_, err = sys.CommitProjectVersion(projectVersion.ID)
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to commit project version %v: %v", projectVersion.ID, err)
+		return nil, fmt.Errorf("Failed to commit project version %v: %v: %w", projectVersion.ID, err, err)
 	}
 	return projectVersion, nil
 }
@@ -278,69 +319,63 @@ func (sys *SystemInstance) LookupOrCreateProjectVersionDetailsForPullRequest(pro
 
 	projectVersion, err := sys.CreateProjectVersion(newVersion)
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to create new project version for pull request %v", pullRequestName)
+		return nil, fmt.Errorf("Failed to create new project version for pull request %v: %w", pullRequestName, err)
 	}
 	attributes, err := sys.GetProjectVersionAttributesByProjectVersionID(masterProjectVersion.ID)
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to load project version attributes for master project version %v", masterProjectVersion.ID)
+		return nil, fmt.Errorf("Failed to load project version attributes for master project version %v: %w", masterProjectVersion.ID, err)
 	}
 	for _, attribute := range attributes {
 		attribute.ID = 0
 	}
 	_, err = sys.SetProjectVersionAttributesByProjectVersionID(projectVersion.ID, attributes)
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to update project version attributes for pull request project version %v", projectVersion.ID)
+		return nil, fmt.Errorf("Failed to update project version attributes for pull request project version %v: %w", projectVersion.ID, err)
 	}
 	err = sys.ProjectVersionCopyFromPartial(masterProjectVersion.ID, projectVersion.ID)
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to copy from partial of project version %v to %v", masterProjectVersion.ID, projectVersion.ID)
+		return nil, fmt.Errorf("Failed to copy from partial of project version %v to %v: %w", masterProjectVersion.ID, projectVersion.ID, err)
 	}
 	_, err = sys.CommitProjectVersion(projectVersion.ID)
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to commit project version %v: %v", projectVersion.ID, err)
+		return nil, fmt.Errorf("Failed to commit project version %v: %v: %w", projectVersion.ID, err, err)
 	}
 	err = sys.ProjectVersionCopyCurrentState(masterProjectVersion.ID, projectVersion.ID)
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to copy current state of project version %v to %v", masterProjectVersion.ID, projectVersion.ID)
+		return nil, fmt.Errorf("Failed to copy current state of project version %v to %v: %w", masterProjectVersion.ID, projectVersion.ID, err)
 	}
 	err = sys.ProjectVersionCopyPermissions(masterProjectVersion.ID, projectVersion.ID)
 	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to copy permissions of project version %v to %v", masterProjectVersion.ID, projectVersion.ID)
+		return nil, fmt.Errorf("Failed to copy permissions of project version %v to %v: %w", masterProjectVersion.ID, projectVersion.ID, err)
 	}
 	return projectVersion, nil
 }
 
 // GetProjectVersionAttributesByProjectVersionID returns the project version attributes of the project version identified by the id
 func (sys *SystemInstance) GetProjectVersionAttributesByProjectVersionID(id int64) ([]*models.Attribute, error) {
-	params := &attribute_of_project_version_controller.ListAttributeOfProjectVersionParams{ParentID: id}
-	params.WithTimeout(sys.timeout)
-	result, err := sys.client.AttributeOfProjectVersionController.ListAttributeOfProjectVersion(params, sys)
+	result, err := sendAPIRequest[[]*models.Attribute](sys, http.MethodGet, fmt.Sprintf("/projectVersions/%v/attributes", id), nil, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
-	return result.GetPayload().Data, nil
+	return result.Data, nil
 }
 
 // SetProjectVersionAttributesByProjectVersionID sets the project version attributes of the project version identified by the id
 func (sys *SystemInstance) SetProjectVersionAttributesByProjectVersionID(id int64, attributes []*models.Attribute) ([]*models.Attribute, error) {
-	params := &attribute_of_project_version_controller.UpdateCollectionAttributeOfProjectVersionParams{ParentID: id, Data: attributes}
-	params.WithTimeout(sys.timeout)
-	result, err := sys.client.AttributeOfProjectVersionController.UpdateCollectionAttributeOfProjectVersion(params, sys)
+	result, err := sendAPIRequest[[]*models.Attribute](sys, http.MethodPut, fmt.Sprintf("/projectVersions/%v/attributes", id), nil, attributes)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
-	return result.GetPayload().Data, nil
+	return result.Data, nil
 }
 
 // CreateProjectVersion creates the project version with the provided details
 func (sys *SystemInstance) CreateProjectVersion(version *models.ProjectVersion) (*models.ProjectVersion, error) {
-	params := &project_version_controller.CreateProjectVersionParams{Resource: version}
-	params.WithTimeout(sys.timeout)
-	result, err := sys.client.ProjectVersionController.CreateProjectVersion(params, sys)
+	result, err := sendAPIRequest[*models.ProjectVersion](sys, http.MethodPost, "/projectVersions", nil, version)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
-	return result.GetPayload().Data, nil
+	return result.Data, nil
 }
 
 // ProjectVersionCopyFromPartial copies parts of the source project version to the target project version identified by their ids
@@ -353,11 +388,9 @@ func (sys *SystemInstance) ProjectVersionCopyFromPartial(sourceID, targetID int6
 		CopyBugTrackerConfiguration: &enable,
 		CopyCustomTags:              &enable,
 	}
-	params := &project_version_controller.CopyProjectVersionParams{Resource: &settings}
-	params.WithTimeout(sys.timeout)
-	_, err := sys.client.ProjectVersionController.CopyProjectVersion(params, sys)
+	_, err := sendAPIRequest[json.RawMessage](sys, http.MethodPost, "/projectVersions/action/copyFromPartial", nil, &settings)
 	if err != nil {
-		return err
+		return fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
 	return nil
 }
@@ -368,32 +401,26 @@ func (sys *SystemInstance) ProjectVersionCopyCurrentState(sourceID, targetID int
 		ProjectVersionID:         &targetID,
 		PreviousProjectVersionID: &sourceID,
 	}
-	params := &project_version_controller.CopyCurrentStateForProjectVersionParams{Resource: &settings}
-	params.WithTimeout(sys.timeout)
-	_, err := sys.client.ProjectVersionController.CopyCurrentStateForProjectVersion(params, sys)
+	_, err := sendAPIRequest[json.RawMessage](sys, http.MethodPost, "/projectVersions/action/copyCurrentState", nil, &settings)
 	if err != nil {
-		return err
+		return fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
 	return nil
 }
 
 func (sys *SystemInstance) getAuthEntityOfProjectVersion(id int64) ([]*models.AuthenticationEntity, error) {
-	embed := "roles"
-	params := &auth_entity_of_project_version_controller.ListAuthEntityOfProjectVersionParams{Embed: &embed, ParentID: id}
-	params.WithTimeout(sys.timeout)
-	result, err := sys.client.AuthEntityOfProjectVersionController.ListAuthEntityOfProjectVersion(params, sys)
+	query := url.Values{"embed": {"roles"}}
+	result, err := sendAPIRequest[[]*models.AuthenticationEntity](sys, http.MethodGet, fmt.Sprintf("/projectVersions/%v/authEntities", id), query, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
-	return result.GetPayload().Data, nil
+	return result.Data, nil
 }
 
 func (sys *SystemInstance) updateCollectionAuthEntityOfProjectVersion(id int64, data []*models.AuthenticationEntity) error {
-	params := &auth_entity_of_project_version_controller.UpdateCollectionAuthEntityOfProjectVersionParams{ParentID: id, Data: data}
-	params.WithTimeout(sys.timeout)
-	_, err := sys.client.AuthEntityOfProjectVersionController.UpdateCollectionAuthEntityOfProjectVersion(params, sys)
+	_, err := sendAPIRequest[json.RawMessage](sys, http.MethodPut, fmt.Sprintf("/projectVersions/%v/authEntities", id), nil, data)
 	if err != nil {
-		return err
+		return fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
 	return nil
 }
@@ -412,13 +439,11 @@ func (sys *SystemInstance) ProjectVersionCopyPermissions(sourceID, targetID int6
 }
 
 func (sys *SystemInstance) updateProjectVersionDetails(id int64, details *models.ProjectVersion) (*models.ProjectVersion, error) {
-	params := &project_version_controller.UpdateProjectVersionParams{ID: id, Resource: details}
-	params.WithTimeout(sys.timeout)
-	result, err := sys.client.ProjectVersionController.UpdateProjectVersion(params, sys)
+	result, err := sendAPIRequest[*models.ProjectVersion](sys, http.MethodPut, fmt.Sprintf("/projectVersions/%v", id), nil, details)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
-	return result.GetPayload().Data, nil
+	return result.Data, nil
 }
 
 // CommitProjectVersion commits the project version with the provided id
@@ -437,14 +462,12 @@ func (sys *SystemInstance) inactivateProjectVersion(id int64) (*models.ProjectVe
 
 // GetArtifactsOfProjectVersion returns the list of artifacts related to the project version addressed with id
 func (sys *SystemInstance) GetArtifactsOfProjectVersion(id int64) ([]*models.Artifact, error) {
-	scans := "scans"
-	params := &artifact_of_project_version_controller.ListArtifactOfProjectVersionParams{ParentID: id, Embed: &scans}
-	params.WithTimeout(sys.timeout)
-	result, err := sys.client.ArtifactOfProjectVersionController.ListArtifactOfProjectVersion(params, sys)
+	query := url.Values{"embed": {"scans"}}
+	result, err := sendAPIRequest[[]*models.Artifact](sys, http.MethodGet, fmt.Sprintf("/projectVersions/%v/artifacts", id), query, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
-	return result.GetPayload().Data, nil
+	return result.Data, nil
 }
 
 // MergeProjectVersionStateOfPRIntoMaster merges the PR project version's fpr result file into the master project version
@@ -455,11 +478,11 @@ func (sys *SystemInstance) MergeProjectVersionStateOfPRIntoMaster(downloadEndpoi
 		log.Entry().Debugf("Found project version with ID '%v', starting transfer", prProjectVersion.ID)
 		data, err := sys.DownloadResultFile(downloadEndpoint, prProjectVersion.ID)
 		if err != nil {
-			return errors.Wrapf(err, "Failed to download current state FPR of PR project version %v", prProjectVersion.ID)
+			return fmt.Errorf("Failed to download current state FPR of PR project version %v: %w", prProjectVersion.ID, err)
 		}
 		err = sys.uploadResultFileContent(uploadEndpoint, "prMergeTransfer.fpr", bytes.NewReader(data), masterProjectVersionID)
 		if err != nil {
-			return errors.Wrapf(err, "Failed to upload PR project version state to master project version %v", masterProjectVersionID)
+			return fmt.Errorf("Failed to upload PR project version state to master project version %v: %w", masterProjectVersionID, err)
 		}
 		_, err = sys.inactivateProjectVersion(prProjectVersion.ID)
 		if err != nil {
@@ -473,14 +496,12 @@ func (sys *SystemInstance) MergeProjectVersionStateOfPRIntoMaster(downloadEndpoi
 
 // GetFilterSetOfProjectVersionByTitle returns the filter set with the given title related to the project version addressed with id, if no title is provided the default filter set will be returned
 func (sys *SystemInstance) GetFilterSetOfProjectVersionByTitle(id int64, title string) (*models.FilterSet, error) {
-	params := &filter_set_of_project_version_controller.ListFilterSetOfProjectVersionParams{ParentID: id}
-	params.WithTimeout(sys.timeout)
-	result, err := sys.client.FilterSetOfProjectVersionController.ListFilterSetOfProjectVersion(params, sys)
+	result, err := sendAPIRequest[[]*models.FilterSet](sys, http.MethodGet, fmt.Sprintf("/projectVersions/%v/filterSets", id), nil, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
 	var defaultFilterSet *models.FilterSet
-	for _, filterSet := range result.GetPayload().Data {
+	for _, filterSet := range result.Data {
 		if len(title) > 0 && filterSet.Title == title {
 			return filterSet, nil
 		}
@@ -499,13 +520,11 @@ func (sys *SystemInstance) GetFilterSetOfProjectVersionByTitle(id int64, title s
 
 // GetIssueFilterSelectorOfProjectVersionByName returns the groupings with the given names related to the project version addressed with id
 func (sys *SystemInstance) GetIssueFilterSelectorOfProjectVersionByName(id int64, names []string, options []string) (*models.IssueFilterSelectorSet, error) {
-	params := &issue_selector_set_of_project_version_controller.GetIssueSelectorSetOfProjectVersionParams{ParentID: id}
-	params.WithTimeout(sys.timeout)
-	result, err := sys.client.IssueSelectorSetOfProjectVersionController.GetIssueSelectorSetOfProjectVersion(params, sys)
+	result, err := sendAPIRequest[*models.IssueFilterSelectorSet](sys, http.MethodGet, fmt.Sprintf("/projectVersions/%v/issueSelectorSet", id), nil, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
-	return sys.ReduceIssueFilterSelectorSet(result.GetPayload().Data, names, options), nil
+	return sys.ReduceIssueFilterSelectorSet(result.Data, names, options), nil
 }
 
 // ReduceIssueFilterSelectorSet filters the set to the relevant filter display names
@@ -513,7 +532,7 @@ func (sys *SystemInstance) ReduceIssueFilterSelectorSet(issueFilterSelectorSet *
 	groupingList := []*models.IssueSelector{}
 	if issueFilterSelectorSet.GroupBySet != nil {
 		for _, group := range issueFilterSelectorSet.GroupBySet {
-			if piperutils.ContainsString(names, *group.DisplayName) {
+			if slices.Contains(names, *group.DisplayName) {
 				log.Entry().Debugf("adding new grouping '%v' to reduced list", *group.DisplayName)
 				groupingList = append(groupingList, group)
 			}
@@ -522,7 +541,7 @@ func (sys *SystemInstance) ReduceIssueFilterSelectorSet(issueFilterSelectorSet *
 	filterList := []*models.IssueFilterSelector{}
 	if issueFilterSelectorSet.FilterBySet != nil {
 		for _, filter := range issueFilterSelectorSet.FilterBySet {
-			if piperutils.ContainsString(names, filter.DisplayName) {
+			if slices.Contains(names, filter.DisplayName) {
 				newFilter := &models.IssueFilterSelector{}
 				newFilter.DisplayName = filter.DisplayName
 				newFilter.Description = filter.Description
@@ -532,7 +551,7 @@ func (sys *SystemInstance) ReduceIssueFilterSelectorSet(issueFilterSelectorSet *
 				newFilter.Value = filter.Value
 				newFilter.SelectorOptions = []*models.SelectorOption{}
 				for _, option := range filter.SelectorOptions {
-					if (nil != options && piperutils.ContainsString(options, option.DisplayName)) || options == nil || len(options) == 0 {
+					if (nil != options && slices.Contains(options, option.DisplayName)) || options == nil || len(options) == 0 {
 						log.Entry().Debugf("adding selector option '%v' to list for filter selector '%v'", option.DisplayName, newFilter.DisplayName)
 						newFilter.SelectorOptions = append(newFilter.SelectorOptions, option)
 					}
@@ -545,7 +564,7 @@ func (sys *SystemInstance) ReduceIssueFilterSelectorSet(issueFilterSelectorSet *
 	return &models.IssueFilterSelectorSet{GroupBySet: groupingList, FilterBySet: filterList}
 }
 
-//GetFilterSetByDisplayName returns the set identified by the provided name or nil
+// GetFilterSetByDisplayName returns the set identified by the provided name or nil
 func (sys *SystemInstance) GetFilterSetByDisplayName(issueFilterSelectorSet *models.IssueFilterSelectorSet, name string) *models.IssueFilterSelector {
 	if issueFilterSelectorSet.FilterBySet != nil {
 		for _, filter := range issueFilterSelectorSet.FilterBySet {
@@ -558,17 +577,19 @@ func (sys *SystemInstance) GetFilterSetByDisplayName(issueFilterSelectorSet *mod
 }
 
 func (sys *SystemInstance) getIssuesOfProjectVersion(id int64, filter, filterset, groupingtype string) ([]*models.ProjectVersionIssueGroup, error) {
-	enable := true
-	params := &issue_group_of_project_version_controller.ListIssueGroupOfProjectVersionParams{ParentID: id, Showsuppressed: &enable, Filterset: &filterset, Groupingtype: &groupingtype}
-	params.WithTimeout(sys.timeout)
+	query := url.Values{
+		"showsuppressed": {"true"},
+		"filterset":      {filterset},
+		"groupingtype":   {groupingtype},
+	}
 	if len(filter) > 0 {
-		params.WithFilter(&filter)
+		query.Set("filter", filter)
 	}
-	result, err := sys.client.IssueGroupOfProjectVersionController.ListIssueGroupOfProjectVersion(params, sys)
+	result, err := sendAPIRequest[[]*models.ProjectVersionIssueGroup](sys, http.MethodGet, fmt.Sprintf("/projectVersions/%v/issueGroups", id), query, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
-	return result.GetPayload().Data, nil
+	return result.Data, nil
 }
 
 // GetProjectIssuesByIDAndFilterSetGroupedBySelector returns issues of the project version addressed with id filtered with the respective set and grouped by the issue filter selector grouping
@@ -587,13 +608,11 @@ func (sys *SystemInstance) GetProjectIssuesByIDAndFilterSetGroupedBySelector(id 
 
 // GetIssueStatisticsOfProjectVersion returns the issue statistics related to the project version addressed with id
 func (sys *SystemInstance) GetIssueStatisticsOfProjectVersion(id int64) ([]*models.IssueStatistics, error) {
-	params := &issue_statistics_of_project_version_controller.ListIssueStatisticsOfProjectVersionParams{ParentID: id}
-	params.WithTimeout(sys.timeout)
-	result, err := sys.client.IssueStatisticsOfProjectVersionController.ListIssueStatisticsOfProjectVersion(params, sys)
+	result, err := sendAPIRequest[[]*models.IssueStatistics](sys, http.MethodGet, fmt.Sprintf("/projectVersions/%v/issueStatistics", id), nil, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
-	return result.GetPayload().Data, nil
+	return result.Data, nil
 }
 
 // GenerateQGateReport returns the issue statistics related to the project version addressed with id
@@ -606,51 +625,82 @@ func (sys *SystemInstance) GenerateQGateReport(projectID, projectVersionID, repo
 	reportProjectVersions := []*models.ReportProjectVersion{{ID: projectVersionID, Name: projectVersionName}}
 	reportProjects := []*models.ReportProject{{ID: projectID, Name: projectName, Versions: reportProjectVersions}}
 	report := models.SavedReport{Name: fmt.Sprintf("FortifyReport: %v:%v", projectName, projectVersionName), Type: &reportType, ReportDefinitionID: &reportTemplateID, Format: &reportFormat, Projects: reportProjects, InputReportParameters: inputReportParameters}
-	params := &saved_report_controller.CreateSavedReportParams{Resource: &report}
-	params.WithTimeout(sys.timeout)
-	result, err := sys.client.SavedReportController.CreateSavedReport(params, sys)
+	result, err := sendAPIRequest[*models.SavedReport](sys, http.MethodPost, "/reports", nil, &report)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
-	return result.GetPayload().Data, nil
+	return result.Data, nil
 }
 
 // GetReportDetails returns the details of the report addressed with id
 func (sys *SystemInstance) GetReportDetails(id int64) (*models.SavedReport, error) {
-	params := &saved_report_controller.ReadSavedReportParams{ID: id}
-	params.WithTimeout(sys.timeout)
-	result, err := sys.client.SavedReportController.ReadSavedReport(params, sys)
+	result, err := sendAPIRequest[*models.SavedReport](sys, http.MethodGet, fmt.Sprintf("/reports/%v", id), nil, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
-	return result.GetPayload().Data, nil
+	return result.Data, nil
+}
+
+// GetIssueDetails returns the details of an issue with its issueInstanceId and projectVersionId
+func (sys *SystemInstance) GetIssueDetails(projectVersionId int64, issueInstanceId string) ([]*models.ProjectVersionIssue, error) {
+	query := url.Values{
+		"q":              {issueInstanceId},
+		"qm":             {"issues"},
+		"showsuppressed": {"true"},
+	}
+	result, err := sendAPIRequest[[]*models.ProjectVersionIssue](sys, http.MethodGet, fmt.Sprintf("/projectVersions/%v/issues", projectVersionId), query, nil)
+	if err != nil {
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
+	}
+	return result.Data, nil
+}
+
+// GetAllIssueDetails returns the details of all issues of the project with id projectVersionId
+func (sys *SystemInstance) GetAllIssueDetails(projectVersionId int64) ([]*models.ProjectVersionIssue, error) {
+	query := url.Values{
+		"limit":          {"-1"},
+		"showsuppressed": {"true"},
+	}
+	result, err := sendAPIRequest[[]*models.ProjectVersionIssue](sys, http.MethodGet, fmt.Sprintf("/projectVersions/%v/issues", projectVersionId), query, nil)
+	if err != nil {
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
+	}
+	return result.Data, nil
+}
+
+// GetIssueComments returns the details of an issue comments with its unique parentId
+func (sys *SystemInstance) GetIssueComments(parentId int64) ([]*models.IssueAuditComment, error) {
+	result, err := sendAPIRequest[[]*models.IssueAuditComment](sys, http.MethodGet, fmt.Sprintf("/issues/%v/comments", parentId), nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
+	}
+	return result.Data, nil
 }
 
 func (sys *SystemInstance) invalidateFileTokens() error {
 	log.Entry().Debug("invalidating file tokens")
-	params := &file_token_controller.MultiDeleteFileTokenParams{}
-	params.WithTimeout(sys.timeout)
-	_, err := sys.client.FileTokenController.MultiDeleteFileToken(params, sys)
-	return err
+	_, err := sendAPIRequest[json.RawMessage](sys, http.MethodDelete, "/fileTokens", nil, nil)
+	if err != nil {
+		return fmt.Errorf("Error from url %s %w", sys.serverURL, err)
+	}
+	return nil
 }
 
 func (sys *SystemInstance) getFileToken(tokenType string) (*models.FileToken, error) {
 	log.Entry().Debugf("fetching file token of type %v", tokenType)
 	token := models.FileToken{FileTokenType: &tokenType}
-	params := &file_token_controller.CreateFileTokenParams{Resource: &token}
-	params.WithTimeout(sys.timeout)
-	result, err := sys.client.FileTokenController.CreateFileToken(params, sys)
+	result, err := sendAPIRequest[*models.FileToken](sys, http.MethodPost, "/fileTokens", nil, &token)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Error from url %s %w", sys.serverURL, err)
 	}
-	return result.GetPayload().Data, nil
+	return result.Data, nil
 }
 
 // UploadResultFile uploads a fpr file to the fortify backend
 func (sys *SystemInstance) UploadResultFile(endpoint, file string, projectVersionID int64) error {
 	fileHandle, err := os.Open(file)
 	if err != nil {
-		return errors.Wrapf(err, "Unable to locate file %v", file)
+		return fmt.Errorf("Unable to locate file %v: %w", file, err)
 	}
 	defer fileHandle.Close()
 
@@ -687,7 +737,7 @@ func (sys *SystemInstance) uploadResultFileContent(endpoint, file string, fileCo
 func (sys *SystemInstance) downloadFile(endpoint, method, acceptType, tokenType string, fileID int64) ([]byte, error) {
 	token, err := sys.getFileToken(tokenType)
 	if err != nil {
-		return nil, errors.Wrap(err, "Error fetching file token")
+		return nil, fmt.Errorf("Error fetching file token: %w", err)
 	}
 	defer sys.invalidateFileTokens()
 
@@ -709,10 +759,10 @@ func (sys *SystemInstance) downloadFile(endpoint, method, acceptType, tokenType 
 	if err != nil {
 		return nil, err
 	}
-	data, err := ioutil.ReadAll(response.Body)
+	data, err := io.ReadAll(response.Body)
 	defer response.Body.Close()
 	if err != nil {
-		return nil, errors.Wrap(err, "Error reading the response data")
+		return nil, fmt.Errorf("Error reading the response data: %w", err)
 	}
 	return data, nil
 }
@@ -721,7 +771,7 @@ func (sys *SystemInstance) downloadFile(endpoint, method, acceptType, tokenType 
 func (sys *SystemInstance) DownloadReportFile(endpoint string, reportID int64) ([]byte, error) {
 	data, err := sys.downloadFile(endpoint, http.MethodGet, "application/octet-stream", "REPORT_FILE", reportID)
 	if err != nil {
-		return nil, errors.Wrap(err, "Error downloading report file")
+		return nil, fmt.Errorf("Error downloading report file: %w", err)
 	}
 	return data, nil
 }
@@ -730,7 +780,7 @@ func (sys *SystemInstance) DownloadReportFile(endpoint string, reportID int64) (
 func (sys *SystemInstance) DownloadResultFile(endpoint string, projectVersionID int64) ([]byte, error) {
 	data, err := sys.downloadFile(endpoint, http.MethodGet, "application/zip", "DOWNLOAD", projectVersionID)
 	if err != nil {
-		return nil, errors.Wrap(err, "Error downloading result file")
+		return nil, fmt.Errorf("Error downloading result file: %w", err)
 	}
 	return data, nil
 }

@@ -1,3 +1,6 @@
+//go:build unit
+// +build unit
+
 package versioning
 
 import (
@@ -5,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/SAP/jenkins-library/pkg/maven"
+
 	"github.com/stretchr/testify/assert"
 )
 
@@ -21,7 +25,7 @@ func (m *mavenMockRunner) Evaluate(opts *maven.EvaluateOptions, expression strin
 	m.opts = opts
 	m.expression = expression
 	if len(m.evaluateErrorString) > 0 {
-		return "", fmt.Errorf(m.evaluateErrorString)
+		return "", fmt.Errorf("%s", m.evaluateErrorString)
 	}
 	return m.stdout, nil
 }
@@ -29,7 +33,7 @@ func (m *mavenMockRunner) Evaluate(opts *maven.EvaluateOptions, expression strin
 func (m *mavenMockRunner) Execute(opts *maven.ExecuteOptions, utils maven.Utils) (string, error) {
 	m.execOpts = opts
 	if len(m.executeErrorString) > 0 {
-		return "", fmt.Errorf(m.executeErrorString)
+		return "", fmt.Errorf("%s", m.executeErrorString)
 	}
 	if opts.ReturnStdout {
 		return m.stdout, nil

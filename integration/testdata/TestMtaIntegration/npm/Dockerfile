@@ -1,3 +1,3 @@
-FROM devxci/mbtci:1.1.1
+FROM devxci/mbtci-java21-node22
 
 COPY run-in-container.sh /test.sh

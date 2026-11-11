@@ -9,6 +9,7 @@ import groovy.transform.Field
 import static com.sap.piper.Prerequisites.checkScript
 
 @Field String STEP_NAME = getClass().getName()
+@Field String METADATA_FILE = 'metadata/tmsUpload.yaml'
 
 @Field Set GENERAL_CONFIG_KEYS = [
     /**
@@ -49,17 +50,22 @@ import static com.sap.piper.Prerequisites.checkScript
     /**
      * Proxy which should be used for the communication with the Transport Management Service Backend.
      */
-    'proxy'
+    'proxy',
+    /**
+     * The new Golang implementation of the step is used now by default. Utilizing this toggle with value true is therefore redundant and can be omitted. If used with value false, the toggle deactivates the new Golang implementation and instructs the step to use the old Groovy one. Note that possibility to switch to the old Groovy implementation will be completely removed and this toggle will be deprecated after February 29th, 2024.
+     * @possibleValues true, false
+     */
+    'useGoStep'
 ])
 @Field Set PARAMETER_KEYS = STEP_CONFIG_KEYS + GENERAL_CONFIG_KEYS
 
 /**
- * This step allows you to upload an MTA file (multi-target application archive) and multiple MTA extension descriptors into a TMS (SAP Cloud Platform Transport Management Service) landscape for further TMS-controlled distribution through a TMS-configured landscape.
- * TMS lets you manage transports between SAP Cloud Platform accounts in Neo and Cloud Foundry, such as from DEV to TEST and PROD accounts.
+ * This step allows you to upload an MTA file (multi-target application archive) and multiple MTA extension descriptors into a TMS (SAP BTP Transport Management Service) landscape for further TMS-controlled distribution through a TMS-configured landscape.
+ * TMS lets you manage transports between SAP BTP accounts in Neo and Cloud Foundry, such as from DEV to TEST and PROD accounts.
  * For more information, see [official documentation of Transport Management Service](https://help.sap.com/viewer/p/TRANSPORT_MANAGEMENT_SERVICE)
  *
  * !!! note "Prerequisites"
- *     * You have subscribed to and set up TMS, as described in [Setup and Configuration of SAP Cloud Platform Transport Management](https://help.sap.com/viewer/7f7160ec0d8546c6b3eab72fb5ad6fd8/Cloud/en-US/66fd7283c62f48adb23c56fb48c84a60.html), which includes the configuration of a node to be used for uploading an MTA file.
+ *     * You have subscribed to and set up TMS, as described in [Setup and Configuration of SAP BTP Transport Management](https://help.sap.com/viewer/7f7160ec0d8546c6b3eab72fb5ad6fd8/Cloud/en-US/66fd7283c62f48adb23c56fb48c84a60.html), which includes the configuration of a node to be used for uploading an MTA file.
  *     * A corresponding service key has been created, as described in [Set Up the Environment to Transport Content Archives directly in an Application](https://help.sap.com/viewer/7f7160ec0d8546c6b3eab72fb5ad6fd8/Cloud/en-US/8d9490792ed14f1bbf8a6ac08a6bca64.html). This service key (JSON) must be stored as a secret text within the Jenkins secure store.
  *
  */
@@ -86,12 +92,24 @@ void call(Map parameters = [:]) {
             .withMandatoryProperty('credentialsId')
             .use()
 
-        // telemetry reporting
-        new Utils().pushToSWA([
-            step         : STEP_NAME,
-            stepParamKey1: 'scriptMissing',
-            stepParam1   : parameters?.script == null
-        ], config)
+        def namedUser = jenkinsUtils.getJobStartedByUserId()
+
+        if (config.useGoStep != false) {
+            List credentials = [
+                [type: 'token', id: 'credentialsId', env: ['PIPER_serviceKey']]
+            ]
+
+            if (namedUser) {
+                parameters.namedUser = namedUser
+            }
+
+            utils.unstashAll(config.stashContent)
+            piperExecuteBin(parameters, STEP_NAME, METADATA_FILE, credentials)
+            return
+        }
+
+        echo "[TransportManagementService] Using deprecated Groovy implementation of '${STEP_NAME}' step instead of the default Golang one, since 'useGoStep' toggle parameter is explicitly set to 'false'."
+        echo "[TransportManagementService] WARNING: Note that the deprecated Groovy implementation will be completely removed after February 29th, 2024. Consider using the Golang implementation by not setting the 'useGoStep' toggle parameter to 'false'."
 
         def jsonUtilsObject = new JsonUtils()
 
@@ -103,7 +121,9 @@ void call(Map parameters = [:]) {
         def customDescription = config.customDescription ? "${config.customDescription}" : "Git CommitId: ${script.commonPipelineEnvironment.getGitCommitId()}"
         def description = customDescription
 
-        def namedUser = jenkinsUtils.getJobStartedByUserId() ?: config.namedUser
+        if (!namedUser) {
+            namedUser = config.namedUser
+        }
 
         def nodeName = config.nodeName
         def mtaPath = config.mtaPath
@@ -146,7 +166,7 @@ void call(Map parameters = [:]) {
                 // so that user can get them in one pipeline run
                 // put the validation here, because we need uri and token to call tms get nodes api
                 List nodes = tms.getNodes(uri, token).getAt("nodes");
-                Map mtaYaml = getMtaYaml();
+                Map mtaYaml = getMtaYaml(script.commonPipelineEnvironment.getValue('mtaBuildToolDesc'));
                 Map nodeIdExtDesMap = validateNodeExtDescriptorMapping(nodeExtDescriptorMapping, nodes, mtaYaml, mtaVersion)
 
                 if(nodeIdExtDesMap) {
@@ -181,22 +201,23 @@ def String getMtaId(String extDescriptorFilePath){
     return mtaId
 }
 
-def Map getMtaYaml() {
-    if(fileExists("mta.yaml")) {
-        def mtaYaml = readYaml file: "mta.yaml"
+def Map getMtaYaml(String mtaBuildToolDesc) {
+    mtaBuildToolDesc = mtaBuildToolDesc?:"mta.yaml"
+    if(fileExists(mtaBuildToolDesc)) {
+        def mtaYaml = readYaml file: mtaBuildToolDesc
         if (!mtaYaml.ID || !mtaYaml.version) {
             def errorMsg
             if (!mtaYaml.ID) {
-                errorMsg = "Property 'ID' is not found in mta.yaml."
+                errorMsg = "Property 'ID' is not found in ${mtaBuildToolDesc}."
             }
             if (!mtaYaml.version) {
-                errorMsg += "Property 'version' is not found in mta.yaml."
+                errorMsg += "Property 'version' is not found in ${mtaBuildToolDesc}."
             }
             error errorMsg
         }
         return mtaYaml
     } else {
-        error "mta.yaml is not found in the root folder of the project."
+        error "${mtaBuildToolDesc} is not found in the root folder of the project."
     }
 }
 

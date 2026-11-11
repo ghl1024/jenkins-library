@@ -3,20 +3,21 @@ package abaputils
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/SAP/jenkins-library/pkg/btp"
 	"github.com/SAP/jenkins-library/pkg/cloudfoundry"
 	"github.com/SAP/jenkins-library/pkg/command"
 	piperhttp "github.com/SAP/jenkins-library/pkg/http"
 	"github.com/SAP/jenkins-library/pkg/log"
-	"github.com/pkg/errors"
 )
 
 // AbapUtils Struct
@@ -40,29 +41,48 @@ func (abaputils *AbapUtils) GetAbapCommunicationArrangementInfo(options AbapEnvi
 	var error error
 
 	if options.Host != "" {
-		// Host, User and Password are directly provided -> check for host schema (double https)
+		// PATH 1: Host, User and Password are directly provided -> check for host schema (double https)
 		match, err := regexp.MatchString(`^(https|HTTPS):\/\/.*`, options.Host)
 		if err != nil {
-			return connectionDetails, errors.Wrap(err, "Schema validation for host parameter failed. Check for https.")
+			log.SetErrorCategory(log.ErrorConfiguration)
+			return connectionDetails, fmt.Errorf("Schema validation for host parameter failed. Check for https.: %w", err)
 		}
 		var hostOdataURL = options.Host + oDataURL
 		if match {
 			connectionDetails.URL = hostOdataURL
+			connectionDetails.Host = options.Host
 		} else {
 			connectionDetails.URL = "https://" + hostOdataURL
+			connectionDetails.Host = "https://" + options.Host
 		}
 		connectionDetails.User = options.Username
 		connectionDetails.Password = options.Password
+	} else if options.Subdomain != "" && options.Subaccount != "" {
+		// PATH 3: BTP service binding (NEW)
+		abapServiceBinding, error := ReadServiceBindingAbapEnvironment(options, c)
+		if error != nil {
+			return connectionDetails, fmt.Errorf("Read BTP service binding failed: %w", error)
+		}
+		connectionDetails.Host = abapServiceBinding.Credentials.URL
+		connectionDetails.URL = abapServiceBinding.Credentials.URL + oDataURL
+		connectionDetails.User = abapServiceBinding.Credentials.Abap.Username
+		connectionDetails.Password = abapServiceBinding.Credentials.Abap.Password
 	} else {
+		// PATH 2: Cloud Foundry service key (existing)
 		if options.CfAPIEndpoint == "" || options.CfOrg == "" || options.CfSpace == "" || options.CfServiceInstance == "" || options.CfServiceKeyName == "" {
-			var err = errors.New("Parameters missing. Please provide EITHER the Host of the ABAP server OR the Cloud Foundry ApiEndpoint, Organization, Space, Service Instance and a corresponding Service Key for the Communication Scenario SAP_COM_0510")
+			var err = errors.New("Parameters missing. Please provide EITHER: " +
+				"1. Host of the ABAP server OR " +
+				"2. BTP parameters (subdomain, subaccount) OR " +
+				"3. Cloud Foundry API Endpoint, Organization, Space, Service Instance and Service Key")
+			log.SetErrorCategory(log.ErrorConfiguration)
 			return connectionDetails, err
 		}
 		// Url, User and Password should be read from a cf service key
 		var abapServiceKey, error = ReadServiceKeyAbapEnvironment(options, c)
 		if error != nil {
-			return connectionDetails, errors.Wrap(error, "Read service key failed")
+			return connectionDetails, fmt.Errorf("Read CF service key failed: %w", error)
 		}
+		connectionDetails.Host = abapServiceKey.URL
 		connectionDetails.URL = abapServiceKey.URL + oDataURL
 		connectionDetails.User = abapServiceKey.Abap.Username
 		connectionDetails.Password = abapServiceKey.Abap.Password
@@ -73,6 +93,7 @@ func (abaputils *AbapUtils) GetAbapCommunicationArrangementInfo(options AbapEnvi
 // ReadServiceKeyAbapEnvironment from Cloud Foundry and returns it. Depending on user/developer requirements if he wants to perform further Cloud Foundry actions
 func ReadServiceKeyAbapEnvironment(options AbapEnvironmentOptions, c command.ExecRunner) (AbapServiceKey, error) {
 
+	var abapServiceKeyV8 AbapServiceKeyV8
 	var abapServiceKey AbapServiceKey
 	var serviceKeyJSON string
 	var err error
@@ -87,23 +108,75 @@ func ReadServiceKeyAbapEnvironment(options AbapEnvironmentOptions, c command.Exe
 		Password:          options.Password,
 	}
 
-	cf := cloudfoundry.CFUtils{Exec: c}
-
-	serviceKeyJSON, err = cf.ReadServiceKey(cfconfig)
+	serviceKeyJSON, err = cloudfoundry.ReadServiceKey(c, cfconfig)
 
 	if err != nil {
 		// Executing cfReadServiceKeyScript failed
-		return abapServiceKey, err
+		return abapServiceKeyV8.Credentials, err
 	}
 
-	// parse
-	json.Unmarshal([]byte(serviceKeyJSON), &abapServiceKey)
+	// Depending on the cf cli version, the service key may be returned in a different format. For compatibility reason, both formats are supported
+	unmarshalErrorV8 := json.Unmarshal([]byte(serviceKeyJSON), &abapServiceKeyV8)
+	if abapServiceKeyV8 == (AbapServiceKeyV8{}) {
+		if unmarshalErrorV8 != nil {
+			log.Entry().Debug(unmarshalErrorV8.Error())
+		}
+		log.Entry().Debug("Could not parse the service key in the cf cli v8 format.")
+	} else {
+		log.Entry().Info("Service Key read successfully")
+		return abapServiceKeyV8.Credentials, nil
+	}
+
+	unmarshalError := json.Unmarshal([]byte(serviceKeyJSON), &abapServiceKey)
 	if abapServiceKey == (AbapServiceKey{}) {
-		return abapServiceKey, errors.New("Parsing the service key failed. Service key is empty")
+		if unmarshalError != nil {
+			log.Entry().Debug(unmarshalError.Error())
+		}
+		log.Entry().Debug("Could not parse the service key in the cf cli v7 format.")
+	} else {
+		log.Entry().Info("Service Key read successfully")
+		return abapServiceKey, nil
+	}
+	log.SetErrorCategory(log.ErrorInfrastructure)
+	return abapServiceKeyV8.Credentials, errors.New("Parsing the service key failed for all supported formats. Service key is empty")
+}
+
+// ReadServiceBindingAbapEnvironment reads a BTP service binding and returns the ABAP credentials
+func ReadServiceBindingAbapEnvironment(options AbapEnvironmentOptions, c command.ExecRunner) (btp.ServiceBindingData, error) {
+	var bindingData btp.ServiceBindingData
+
+	// Create BTP executor (BTP utilities use a different executor interface than command.ExecRunner)
+	btpExecutor := &btp.Executor{}
+	btpUtils := btp.NewBTPUtils(btpExecutor)
+
+	// Prepare options for BTP service binding retrieval
+	getBindingOptions := btp.GetServiceBindingOptions{
+		Url:              options.URL,
+		Subdomain:        options.Subdomain,
+		User:             options.Username,
+		Password:         options.Password,
+		IdentityProvider: options.Idp,
+		Subaccount:       options.Subaccount,
+		BindingName:      options.ServiceBindingName,
+		ServiceInstance:  options.ServiceInstanceName,
 	}
 
-	log.Entry().Info("Service Key read successfully")
-	return abapServiceKey, nil
+	// Get service binding from BTP
+	bindingJSON, err := btpUtils.GetServiceBinding(getBindingOptions)
+	if err != nil {
+		log.SetErrorCategory(log.ErrorInfrastructure)
+		return bindingData, fmt.Errorf("Failed to retrieve BTP service binding: %w", err)
+	}
+
+	// Parse the JSON response into ServiceBindingData struct
+	err = json.Unmarshal([]byte(bindingJSON), &bindingData)
+	if err != nil {
+		log.SetErrorCategory(log.ErrorInfrastructure)
+		return bindingData, fmt.Errorf("Failed to parse BTP service binding JSON: %w", err)
+	}
+
+	log.Entry().Info("BTP Service Binding read successfully")
+	return bindingData, nil
 }
 
 /*
@@ -116,8 +189,35 @@ func (abaputils *AbapUtils) GetPollIntervall() time.Duration {
 	return 10 * time.Second
 }
 
+/*
+ReadCOnfigFile reads a file from a specific path and returns the json string as []byte
+*/
+func ReadConfigFile(path string) (file []byte, err error) {
+	filelocation, err := filepath.Glob(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(filelocation) == 0 {
+		return nil, errors.New("Could not find " + path)
+	}
+	filename, err := filepath.Abs(filelocation[0])
+	if err != nil {
+		return nil, err
+	}
+	yamlFile, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	var jsonFile []byte
+	jsonFile, err = YAMLToJSON(yamlFile)
+	return jsonFile, err
+}
+
 // GetHTTPResponse wraps the SendRequest function of piperhttp
 func GetHTTPResponse(requestType string, connectionDetails ConnectionDetailsHTTP, body []byte, client piperhttp.Sender) (*http.Response, error) {
+
+	log.Entry().Debugf("Request body: %s", string(body))
+	log.Entry().Debugf("Request user: %s", connectionDetails.User)
 
 	header := make(map[string][]string)
 	header["Content-Type"] = []string{"application/json"}
@@ -128,68 +228,82 @@ func GetHTTPResponse(requestType string, connectionDetails ConnectionDetailsHTTP
 	return httpResponse, err
 }
 
-// HandleHTTPError handles ABAP error messages which can occur when using OData services
+// HandleHTTPError handles ABAP error messages which can occur when using OData V2 services
 //
 // The point of this function is to enrich the error received from a HTTP Request (which is passed as a parameter to this function).
 // Further error details may be present in the response body of the HTTP response.
 // If the response body is parseable, the included details are wrapped around the original error from the HTTP repsponse.
 // If this is not possible, the original error is returned.
-func HandleHTTPError(resp *http.Response, err error, message string, connectionDetails ConnectionDetailsHTTP) error {
+func HandleHTTPError(resp *http.Response, err error, message string, connectionDetails ConnectionDetailsHTTP) (string, error) {
+
+	var errorText string
+	var errorCode string
+	var parsingError error
 	if resp == nil {
 		// Response is nil in case of a timeout
 		log.Entry().WithError(err).WithField("ABAP Endpoint", connectionDetails.URL).Error("Request failed")
+
+		match, _ := regexp.MatchString(".*EOF$", err.Error())
+		if match {
+			AddDefaultDashedLine(1)
+			log.Entry().Info("A connection could not be established to the ABAP system. The typical root cause is the network configuration (firewall, IP allowlist, etc.)")
+			AddDefaultDashedLine(1)
+		}
+
+		log.Entry().Infof("Error message: %s,", err.Error())
 	} else {
 
 		defer resp.Body.Close()
 
-		log.Entry().WithField("StatusCode", resp.Status).Error(message)
+		log.Entry().WithField("StatusCode", resp.Status).WithField("User", connectionDetails.User).WithField("URL", connectionDetails.URL).Error(message)
 
-		errorDetails, parsingError := getErrorDetailsFromResponse(resp)
+		errorText, errorCode, parsingError = GetErrorDetailsFromResponse(resp)
 		if parsingError != nil {
-			return err
+			return "", err
 		}
-		abapError := errors.New(errorDetails)
-		err = errors.Wrap(abapError, err.Error())
+		abapError := fmt.Errorf("%s - %s", errorCode, errorText)
+		err = fmt.Errorf("%s: %w", err.Error(), abapError)
 
 	}
-	return err
+	return errorCode, err
 }
 
-func getErrorDetailsFromResponse(resp *http.Response) (errorString string, err error) {
+// GetErrorDetailsFromResponse parses OData V2 Responses containing ABAP Error messages
+func GetErrorDetailsFromResponse(resp *http.Response) (errorString string, errorCode string, err error) {
 
 	// Include the error message of the ABAP Environment system, if available
-	var abapErrorResponse AbapError
-	bodyText, readError := ioutil.ReadAll(resp.Body)
+	var abapErrorResponse AbapErrorODataV2
+	bodyText, readError := io.ReadAll(resp.Body)
 	if readError != nil {
-		return errorString, readError
+		return "", "", readError
 	}
 	var abapResp map[string]*json.RawMessage
 	errUnmarshal := json.Unmarshal(bodyText, &abapResp)
 	if errUnmarshal != nil {
-		return errorString, errUnmarshal
+		return "", "", errUnmarshal
 	}
 	if _, ok := abapResp["error"]; ok {
 		json.Unmarshal(*abapResp["error"], &abapErrorResponse)
-		if (AbapError{}) != abapErrorResponse {
-			log.Entry().WithField("ErrorCode", abapErrorResponse.Code).Error(abapErrorResponse.Message.Value)
-			errorString = fmt.Sprintf("%s - %s", abapErrorResponse.Code, abapErrorResponse.Message.Value)
-			return errorString, nil
+		if (AbapErrorODataV2{}) != abapErrorResponse {
+			log.Entry().WithField("ErrorCode", abapErrorResponse.Code).Debug(abapErrorResponse.Message.Value)
+			return abapErrorResponse.Message.Value, abapErrorResponse.Code, nil
 		}
 	}
 
-	return errorString, errors.New("Could not parse the JSON error response")
+	return "", "", errors.New("Could not parse the JSON error response")
 
 }
 
-// ConvertTime formats an ABAP timestamp string from format /Date(1585576807000+0000)/ into a UNIX timestamp and returns it
-func ConvertTime(logTimeStamp string) time.Time {
-	seconds := strings.TrimPrefix(strings.TrimSuffix(logTimeStamp, "000+0000)/"), "/Date(")
-	n, error := strconv.ParseInt(seconds, 10, 64)
-	if error != nil {
-		return time.Unix(0, 0).UTC()
+// AddDefaultDashedLine adds 25 dashes
+func AddDefaultDashedLine(j int) {
+	for i := 1; i <= j; i++ {
+		log.Entry().Info(strings.Repeat("-", 25))
 	}
-	t := time.Unix(n, 0).UTC()
-	return t
+}
+
+// AddDefaultDebugLine adds 25 dashes in debug
+func AddDebugDashedLine() {
+	log.Entry().Debug(strings.Repeat("-", 25))
 }
 
 /*******************************
@@ -218,16 +332,26 @@ type AbapEnvironmentRunATCCheckOptions struct {
  *	Structs for ABAP in general *
  ********************************/
 
-//AbapEnvironmentOptions contains cloud foundry fields and the host parameter for connections to ABAP Environment instances
+// AbapEnvironmentOptions contains cloud foundry fields and the host parameter for connections to ABAP Environment instances
 type AbapEnvironmentOptions struct {
 	Username          string `json:"username,omitempty"`
 	Password          string `json:"password,omitempty"`
+	ByogUsername      string `json:"byogUsername,omitempty"`
+	ByogPassword      string `json:"byogPassword,omitempty"`
+	ByogAuthMethod    string `json:"byogAuthMethod,omitempty"`
 	Host              string `json:"host,omitempty"`
 	CfAPIEndpoint     string `json:"cfApiEndpoint,omitempty"`
 	CfOrg             string `json:"cfOrg,omitempty"`
 	CfSpace           string `json:"cfSpace,omitempty"`
 	CfServiceInstance string `json:"cfServiceInstance,omitempty"`
 	CfServiceKeyName  string `json:"cfServiceKeyName,omitempty"`
+	// BTP Configuration
+	URL                 string `json:"url,omitempty"`
+	Subdomain           string `json:"subdomain,omitempty"`
+	Subaccount          string `json:"subaccount,omitempty"`
+	Idp                 string `json:"idp,omitempty"`
+	ServiceInstanceName string `json:"serviceInstanceName,omitempty"`
+	ServiceBindingName  string `json:"serviceBindingName,omitempty"`
 }
 
 // AbapMetadata contains the URI of metadata files
@@ -237,22 +361,36 @@ type AbapMetadata struct {
 
 // ConnectionDetailsHTTP contains fields for HTTP connections including the XCSRF token
 type ConnectionDetailsHTTP struct {
-	User       string `json:"user"`
-	Password   string `json:"password"`
-	URL        string `json:"url"`
-	XCsrfToken string `json:"xcsrftoken"`
+	Host             string
+	User             string   `json:"user"`
+	Password         string   `json:"password"`
+	URL              string   `json:"url"`
+	XCsrfToken       string   `json:"xcsrftoken"`
+	CertificateNames []string `json:"-"`
 }
 
-// AbapError contains the error code and the error message for ABAP errors
-type AbapError struct {
+// AbapErrorODataV2 contains the error code and the error message for ABAP errors
+type AbapErrorODataV2 struct {
 	Code    string           `json:"code"`
 	Message AbapErrorMessage `json:"message"`
+}
+
+// AbapErrorODataV4 contains the error code and the error message for ABAP errors
+type AbapErrorODataV4 struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 // AbapErrorMessage contains the lanuage and value fields for ABAP errors
 type AbapErrorMessage struct {
 	Lang  string `json:"lang"`
 	Value string `json:"value"`
+}
+
+// AbapServiceKeyV8 contains the new format of an ABAP service key
+
+type AbapServiceKeyV8 struct {
+	Credentials AbapServiceKey `json:"credentials"`
 }
 
 // AbapServiceKey contains information about an ABAP service key
@@ -290,11 +428,15 @@ type AbapBinding struct {
 
 // ClientMock contains information about the client mock
 type ClientMock struct {
-	Token      string
-	Body       string
-	BodyList   []string
-	StatusCode int
-	Error      error
+	Token              string
+	Body               string
+	BodyList           []string
+	StatusCode         int
+	Error              error
+	NilResponse        bool
+	ErrorInsteadOfDump bool
+	ErrorList          []error
+	RequestedURLs      []string
 }
 
 // SetOptions sets clientOptions for a client mock
@@ -303,21 +445,41 @@ func (c *ClientMock) SetOptions(opts piperhttp.ClientOptions) {}
 // SendRequest sets a HTTP response for a client mock
 func (c *ClientMock) SendRequest(method, url string, bdy io.Reader, hdr http.Header, cookies []*http.Cookie) (*http.Response, error) {
 
+	if c.NilResponse {
+		return nil, c.Error
+	}
+	c.RequestedURLs = append(c.RequestedURLs, url)
 	var body []byte
+	var responseError error
 	if c.Body != "" {
 		body = []byte(c.Body)
+		responseError = c.Error
 	} else {
+		if c.ErrorInsteadOfDump && len(c.BodyList) == 0 {
+			return nil, errors.New("No more bodies in the list")
+		}
 		bodyString := c.BodyList[len(c.BodyList)-1]
 		c.BodyList = c.BodyList[:len(c.BodyList)-1]
 		body = []byte(bodyString)
+		if len(c.ErrorList) == 0 {
+			responseError = c.Error
+		} else {
+			responseError = c.ErrorList[len(c.ErrorList)-1]
+			c.ErrorList = c.ErrorList[:len(c.ErrorList)-1]
+		}
 	}
 	header := http.Header{}
 	header.Set("X-Csrf-Token", c.Token)
 	return &http.Response{
 		StatusCode: c.StatusCode,
 		Header:     header,
-		Body:       ioutil.NopCloser(bytes.NewReader(body)),
-	}, c.Error
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}, responseError
+}
+
+// DownloadFile : Empty file download
+func (c *ClientMock) DownloadFile(url, filename string, header http.Header, cookies []*http.Cookie) error {
+	return nil
 }
 
 // AUtilsMock mock

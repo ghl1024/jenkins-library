@@ -1,3 +1,6 @@
+//go:build unit
+// +build unit
+
 package versioning
 
 import (
@@ -5,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/SAP/jenkins-library/pkg/mock"
+
 	"github.com/stretchr/testify/assert"
 )
 

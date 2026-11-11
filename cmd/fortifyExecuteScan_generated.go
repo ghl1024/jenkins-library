@@ -6,18 +6,29 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/SAP/jenkins-library/pkg/config"
+	"github.com/SAP/jenkins-library/pkg/eventing"
+	"github.com/SAP/jenkins-library/pkg/gcs"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/piperenv"
+	"github.com/SAP/jenkins-library/pkg/piperutils"
+	"github.com/SAP/jenkins-library/pkg/splunk"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
+	"github.com/SAP/jenkins-library/pkg/validation"
+
 	"github.com/spf13/cobra"
 )
 
 type fortifyExecuteScanOptions struct {
 	AdditionalScanParameters        []string `json:"additionalScanParameters,omitempty"`
+	AdditionalMvnParameters         []string `json:"additionalMvnParameters,omitempty"`
+	Assignees                       []string `json:"assignees,omitempty"`
 	AuthToken                       string   `json:"authToken,omitempty"`
+	BuildDescriptorExcludeList      []string `json:"buildDescriptorExcludeList,omitempty"`
 	CustomScanVersion               string   `json:"customScanVersion,omitempty"`
 	GithubToken                     string   `json:"githubToken,omitempty"`
 	AutoCreate                      bool     `json:"autoCreate,omitempty"`
@@ -27,7 +38,7 @@ type fortifyExecuteScanOptions struct {
 	MustAuditIssueGroups            string   `json:"mustAuditIssueGroups,omitempty"`
 	SpotAuditIssueGroups            string   `json:"spotAuditIssueGroups,omitempty"`
 	PythonRequirementsInstallSuffix string   `json:"pythonRequirementsInstallSuffix,omitempty"`
-	PythonVersion                   string   `json:"pythonVersion,omitempty"`
+	PythonVersion                   string   `json:"pythonVersion,omitempty" validate:"possible-values=python3 python2"`
 	UploadResults                   bool     `json:"uploadResults,omitempty"`
 	Version                         string   `json:"version,omitempty"`
 	BuildDescriptorFile             string   `json:"buildDescriptorFile,omitempty"`
@@ -49,6 +60,7 @@ type fortifyExecuteScanOptions struct {
 	PythonAdditionalPath            []string `json:"pythonAdditionalPath,omitempty"`
 	ArtifactURL                     string   `json:"artifactUrl,omitempty"`
 	ConsiderSuspicious              bool     `json:"considerSuspicious,omitempty"`
+	ConvertToSarif                  bool     `json:"convertToSarif,omitempty"`
 	FprUploadEndpoint               string   `json:"fprUploadEndpoint,omitempty"`
 	ProjectName                     string   `json:"projectName,omitempty"`
 	Reporting                       bool     `json:"reporting,omitempty"`
@@ -56,8 +68,10 @@ type fortifyExecuteScanOptions struct {
 	PullRequestMessageRegexGroup    int      `json:"pullRequestMessageRegexGroup,omitempty"`
 	DeltaMinutes                    int      `json:"deltaMinutes,omitempty"`
 	SpotCheckMinimum                int      `json:"spotCheckMinimum,omitempty"`
+	SpotCheckMinimumUnit            string   `json:"spotCheckMinimumUnit,omitempty" validate:"possible-values=number percentage"`
+	SpotCheckMaximum                int      `json:"spotCheckMaximum,omitempty"`
 	FprDownloadEndpoint             string   `json:"fprDownloadEndpoint,omitempty"`
-	VersioningModel                 string   `json:"versioningModel,omitempty"`
+	VersioningModel                 string   `json:"versioningModel,omitempty" validate:"possible-values=major major-minor semantic full"`
 	PythonInstallCommand            string   `json:"pythonInstallCommand,omitempty"`
 	ReportTemplateID                int      `json:"reportTemplateId,omitempty"`
 	FilterSetTitle                  string   `json:"filterSetTitle,omitempty"`
@@ -65,10 +79,12 @@ type fortifyExecuteScanOptions struct {
 	PullRequestMessageRegex         string   `json:"pullRequestMessageRegex,omitempty"`
 	BuildTool                       string   `json:"buildTool,omitempty"`
 	ProjectSettingsFile             string   `json:"projectSettingsFile,omitempty"`
+	Proxy                           string   `json:"proxy,omitempty"`
 	GlobalSettingsFile              string   `json:"globalSettingsFile,omitempty"`
 	M2Path                          string   `json:"m2Path,omitempty"`
 	VerifyOnly                      bool     `json:"verifyOnly,omitempty"`
 	InstallArtifacts                bool     `json:"installArtifacts,omitempty"`
+	CreateResultIssue               bool     `json:"createResultIssue,omitempty"`
 }
 
 type fortifyExecuteScanInflux struct {
@@ -81,8 +97,10 @@ type fortifyExecuteScanInflux struct {
 	}
 	fortify_data struct {
 		fields struct {
+			projectID         int64
 			projectName       string
 			projectVersion    string
+			projectVersionID  int64
 			violations        int
 			corporateTotal    int
 			corporateAudited  int
@@ -105,11 +123,13 @@ func (i *fortifyExecuteScanInflux) persist(path, resourceName string) {
 		measurement string
 		valType     string
 		name        string
-		value       interface{}
+		value       any
 	}{
 		{valType: config.InfluxField, measurement: "step_data", name: "fortify", value: i.step_data.fields.fortify},
+		{valType: config.InfluxField, measurement: "fortify_data", name: "projectID", value: i.fortify_data.fields.projectID},
 		{valType: config.InfluxField, measurement: "fortify_data", name: "projectName", value: i.fortify_data.fields.projectName},
 		{valType: config.InfluxField, measurement: "fortify_data", name: "projectVersion", value: i.fortify_data.fields.projectVersion},
+		{valType: config.InfluxField, measurement: "fortify_data", name: "projectVersionId", value: i.fortify_data.fields.projectVersionID},
 		{valType: config.InfluxField, measurement: "fortify_data", name: "violations", value: i.fortify_data.fields.violations},
 		{valType: config.InfluxField, measurement: "fortify_data", name: "corporateTotal", value: i.fortify_data.fields.corporateTotal},
 		{valType: config.InfluxField, measurement: "fortify_data", name: "corporateAudited", value: i.fortify_data.fields.corporateAudited},
@@ -132,7 +152,46 @@ func (i *fortifyExecuteScanInflux) persist(path, resourceName string) {
 		}
 	}
 	if errCount > 0 {
-		log.Entry().Fatal("failed to persist Influx environment")
+		log.Entry().Error("failed to persist Influx environment")
+	}
+}
+
+type fortifyExecuteScanReports struct {
+}
+
+func (p *fortifyExecuteScanReports) persist(stepConfig fortifyExecuteScanOptions, gcpJsonKeyFilePath string, gcsBucketId string, gcsFolderPath string, gcsSubFolder string) {
+	if gcsBucketId == "" {
+		log.Entry().Info("persisting reports to GCS is disabled, because gcsBucketId is empty")
+		return
+	}
+	log.Entry().Info("Uploading reports to Google Cloud Storage...")
+	content := []gcs.ReportOutputParam{
+		{FilePattern: "**/*.PDF", ParamRef: "", StepResultType: "fortify"},
+		{FilePattern: "**/*.fpr", ParamRef: "", StepResultType: "fortify"},
+		{FilePattern: "**/fortify-scan.*", ParamRef: "", StepResultType: "fortify"},
+		{FilePattern: "**/toolrun_fortify_*.json", ParamRef: "", StepResultType: "fortify"},
+		{FilePattern: "**/piper_fortify_report.json", ParamRef: "", StepResultType: "fortify"},
+		{FilePattern: "**/piper_fortify_report.html", ParamRef: "", StepResultType: "fortify"},
+	}
+
+	gcsClient, err := gcs.NewClient(gcpJsonKeyFilePath, "")
+	if err != nil {
+		log.Entry().Errorf("creation of GCS client failed: %v", err)
+		return
+	}
+	defer gcsClient.Close()
+	structVal := reflect.ValueOf(&stepConfig).Elem()
+	inputParameters := map[string]string{}
+	for i := 0; i < structVal.NumField(); i++ {
+		field := structVal.Type().Field(i)
+		if field.Type.String() == "string" {
+			paramName := strings.Split(field.Tag.Get("json"), ",")
+			paramValue, _ := structVal.Field(i).Interface().(string)
+			inputParameters[paramName[0]] = paramValue
+		}
+	}
+	if err := gcs.PersistReportsToGCS(gcsClient, content, inputParameters, gcsFolderPath, gcsBucketId, gcsSubFolder, piperutils.Glob, os.Stat); err != nil {
+		log.Entry().Errorf("failed to persist reports: %v", err)
 	}
 }
 
@@ -144,6 +203,10 @@ func FortifyExecuteScanCommand() *cobra.Command {
 	var stepConfig fortifyExecuteScanOptions
 	var startTime time.Time
 	var influx fortifyExecuteScanInflux
+	var reports fortifyExecuteScanReports
+	var logCollector *log.CollectorHook
+	var splunkClient *splunk.Splunk
+	telemetryClient := &telemetry.Telemetry{}
 
 	var createFortifyExecuteScanCmd = &cobra.Command{
 		Use:   STEP_NAME,
@@ -151,21 +214,45 @@ func FortifyExecuteScanCommand() *cobra.Command {
 		Long: `This step executes a Fortify scan on the specified project to perform static code analysis and check the source code for security flaws.
 
 The Fortify step triggers a scan locally on your Jenkins within a docker container so finally you have to supply a docker image with a Fortify SCA
-and Java plus Maven or alternatively Python installed into it for being able to perform any scans.`,
+and Java plus Maven / Gradle or alternatively Python installed into it for being able to perform any scans.
+!!! hint "Scanning MTA projects"
+    Build type ` + "`" + `maven` + "`" + ` requires a so called aggregator pom which includes all modules to be scanned. If used in a mta-project which includes non-java submodules as maven dependency (e.g. node via frontend-maven-plugin), exclude those by specifying java path explicitly, e.g. ` + "`" + `java/**/src/main/java/**/*` + "`" + `.
+
+Besides triggering a scan the step verifies the results after they have been uploaded and processed by the Fortify SSC. By default the following KPIs are enforced:
+* All issues must be audited from the Corporate Security Requirements folder.
+* All issues must be audited from the Audit All folder.
+* At least one issue per category must be audited from the Spot Checks of Each Category folder.
+* Nothing needs to be audited from the Optional folder.`,
 		PreRunE: func(cmd *cobra.Command, _ []string) error {
 			startTime = time.Now()
 			log.SetStepName(STEP_NAME)
 			log.SetVerbose(GeneralConfig.Verbose)
 
-			path, _ := os.Getwd()
+			GeneralConfig.GitHubAccessTokens = ResolveAccessTokens(GeneralConfig.GitHubTokens)
+
+			path, err := os.Getwd()
+			if err != nil {
+				return err
+			}
 			fatalHook := &log.FatalHook{CorrelationID: GeneralConfig.CorrelationID, Path: path}
 			log.RegisterHook(fatalHook)
 
-			err := PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
+			err = PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
 			if err != nil {
 				log.SetErrorCategory(log.ErrorConfiguration)
 				return err
 			}
+
+			// Set step error patterns for improved error detection
+			stepErrors := make([]log.StepError, len(metadata.Metadata.Errors))
+			for i, err := range metadata.Metadata.Errors {
+				stepErrors[i] = log.StepError{
+					Pattern:  err.Pattern,
+					Message:  err.Message,
+					Category: err.Category,
+				}
+			}
+			log.SetStepErrors(stepErrors)
 			log.RegisterSecret(stepConfig.AuthToken)
 			log.RegisterSecret(stepConfig.GithubToken)
 
@@ -174,23 +261,83 @@ and Java plus Maven or alternatively Python installed into it for being able to 
 				log.RegisterHook(&sentryHook)
 			}
 
+			if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 || len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+				splunkClient = &splunk.Splunk{}
+				logCollector = &log.CollectorHook{CorrelationID: GeneralConfig.CorrelationID}
+				log.RegisterHook(logCollector)
+			}
+
+			if err = log.RegisterANSHookIfConfigured(GeneralConfig.CorrelationID); err != nil {
+				log.Entry().WithError(err).Warn("failed to set up SAP Alert Notification Service log hook")
+			}
+
+			validation, err := validation.New(validation.WithJSONNamesForStructFields(), validation.WithPredefinedErrorMessages())
+			if err != nil {
+				return err
+			}
+			if err = validation.ValidateStruct(stepConfig); err != nil {
+				log.SetErrorCategory(log.ErrorConfiguration)
+				return err
+			}
+
 			return nil
 		},
 		Run: func(_ *cobra.Command, _ []string) {
-			telemetryData := telemetry.CustomData{}
-			telemetryData.ErrorCode = "1"
+			vaultClient := config.GlobalVaultClient()
+			var oidcTokenProvider func(string) (string, error)
+			if vaultClient != nil {
+				defer vaultClient.MustRevokeToken()
+				oidcTokenProvider = vaultClient.GetOIDCTokenByValidation
+			}
+
+			stepTelemetryData := telemetry.CustomData{
+				ErrorCode: "1",
+			}
 			handler := func() {
-				config.RemoveVaultSecretFiles()
 				influx.persist(GeneralConfig.EnvRootPath, "influx")
-				telemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
-				telemetryData.ErrorCategory = log.GetErrorCategory().String()
-				telemetry.Send(&telemetryData)
+				reports.persist(stepConfig, GeneralConfig.GCPJsonKeyFilePath, GeneralConfig.GCSBucketId, GeneralConfig.GCSFolderPath, GeneralConfig.GCSSubFolder)
+				config.RemoveVaultSecretFiles()
+				stepTelemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
+				stepTelemetryData.ErrorCategory = log.GetErrorCategory().String()
+				stepTelemetryData.PiperCommitHash = GitCommit
+				telemetryClient.SetData(&stepTelemetryData)
+				telemetryClient.LogStepTelemetryData()
+				if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.Dsn,
+						GeneralConfig.HookConfig.SplunkConfig.Token,
+						GeneralConfig.HookConfig.SplunkConfig.Index,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblToken,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblIndex,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.GCPPubSubConfig.ProjectNumber) > 0 {
+					if err := eventing.PublishTaskRunFinishedEvent(
+						oidcTokenProvider,
+						&GeneralConfig,
+						eventing.EventContext{
+							StepName:   STEP_NAME,
+							StageName:  telemetryClient.GetData().StageName,
+							ErrorCode:  stepTelemetryData.ErrorCode,
+							PipelineID: telemetryClient.GetBuildURL(),
+						},
+					); err != nil {
+						log.Entry().WithError(err).Warn("failed to publish GCP Pub/Sub event")
+					}
+				}
 			}
 			log.DeferExitHandler(handler)
 			defer handler()
-			telemetry.Initialize(GeneralConfig.NoTelemetry, STEP_NAME)
-			fortifyExecuteScan(stepConfig, &telemetryData, &influx)
-			telemetryData.ErrorCode = "0"
+			telemetryClient.Initialize(STEP_NAME)
+			fortifyExecuteScan(stepConfig, &stepTelemetryData, &influx)
+			stepTelemetryData.ErrorCode = "0"
 			log.Entry().Info("SUCCESS")
 		},
 	}
@@ -201,7 +348,10 @@ and Java plus Maven or alternatively Python installed into it for being able to 
 
 func addFortifyExecuteScanFlags(cmd *cobra.Command, stepConfig *fortifyExecuteScanOptions) {
 	cmd.Flags().StringSliceVar(&stepConfig.AdditionalScanParameters, "additionalScanParameters", []string{}, "List of additional scan parameters to be used for Fortify sourceanalyzer command execution.")
+	cmd.Flags().StringSliceVar(&stepConfig.AdditionalMvnParameters, "additionalMvnParameters", []string{}, "List of additional maven parameters to be used for Fortify mvn command execution.")
+	cmd.Flags().StringSliceVar(&stepConfig.Assignees, "assignees", []string{``}, "Defines the assignees for the Github Issue created/updated with the results of the scan as a list of login names.")
 	cmd.Flags().StringVar(&stepConfig.AuthToken, "authToken", os.Getenv("PIPER_authToken"), "The FortifyToken to use for authentication")
+	cmd.Flags().StringSliceVar(&stepConfig.BuildDescriptorExcludeList, "buildDescriptorExcludeList", []string{`unit-tests/pom.xml`, `integration-tests/pom.xml`}, "List of build descriptors and therefore modules to exclude from the scan and assessment activities.")
 	cmd.Flags().StringVar(&stepConfig.CustomScanVersion, "customScanVersion", os.Getenv("PIPER_customScanVersion"), "Custom version of the Fortify project used as source.")
 	cmd.Flags().StringVar(&stepConfig.GithubToken, "githubToken", os.Getenv("PIPER_githubToken"), "GitHub personal access token as per https://help.github.com/en/github/authenticating-to-github/creating-a-personal-access-token-for-the-command-line")
 	cmd.Flags().BoolVar(&stepConfig.AutoCreate, "autoCreate", false, "Whether Fortify project and project version shall be implicitly auto created in case they cannot be found in the backend")
@@ -213,7 +363,7 @@ func addFortifyExecuteScanFlags(cmd *cobra.Command, stepConfig *fortifyExecuteSc
 	cmd.Flags().StringVar(&stepConfig.PythonRequirementsInstallSuffix, "pythonRequirementsInstallSuffix", os.Getenv("PIPER_pythonRequirementsInstallSuffix"), "The suffix for the command used to install the requirements file in `buildTool: 'pip'` to populate the build environment with the necessary dependencies")
 	cmd.Flags().StringVar(&stepConfig.PythonVersion, "pythonVersion", `python3`, "Python version to be used in `buildTool: 'pip'`")
 	cmd.Flags().BoolVar(&stepConfig.UploadResults, "uploadResults", true, "Whether results shall be uploaded or not")
-	cmd.Flags().StringVar(&stepConfig.Version, "version", os.Getenv("PIPER_version"), "Version used in conjunction with [`versioningModel`](#versioningModel) to identify the Fortify project to be created and used for results aggregation.")
+	cmd.Flags().StringVar(&stepConfig.Version, "version", os.Getenv("PIPER_version"), "Version used in conjunction with [`versioningModel`](#versioningmodel) to identify the Fortify project to be created and used for results aggregation.")
 	cmd.Flags().StringVar(&stepConfig.BuildDescriptorFile, "buildDescriptorFile", `./pom.xml`, "Path to the build descriptor file addressing the module/folder to be scanned.")
 	cmd.Flags().StringVar(&stepConfig.CommitID, "commitId", os.Getenv("PIPER_commitId"), "Set the Git commit ID for identifying artifacts throughout the scan.")
 	cmd.Flags().StringVar(&stepConfig.CommitMessage, "commitMessage", os.Getenv("PIPER_commitMessage"), "Set the Git commit message for identifying pull request merges throughout the scan.")
@@ -226,20 +376,23 @@ func addFortifyExecuteScanFlags(cmd *cobra.Command, stepConfig *fortifyExecuteSc
 	cmd.Flags().IntVar(&stepConfig.PollingMinutes, "pollingMinutes", 30, "The number of minutes for which an uploaded FPR artifact''s status is being polled to finish queuing/processing, if exceeded polling will be stopped and an error will be thrown")
 	cmd.Flags().BoolVar(&stepConfig.QuickScan, "quickScan", false, "Whether a quick scan should be performed, please consult the related Fortify documentation on JAM on the impact of this setting")
 	cmd.Flags().StringVar(&stepConfig.Translate, "translate", os.Getenv("PIPER_translate"), "Options for translate phase of Fortify. Most likely, you do not need to set this parameter. See src, exclude. If `'src'` and `'exclude'` are set they are automatically used. Technical details: It has to be a JSON string of list of maps with required key `'src'`, and optional keys `'exclude'`, `'libDirs'`, `'aspnetcore'`, and `'dotNetCoreVersion'`")
-	cmd.Flags().StringSliceVar(&stepConfig.Src, "src", []string{}, "A list of source directories to scan. Wildcards can be used, e.g., `'src/main/java/**/*'`. If `'translate'` is set, this will ignored. The default value for `buildTool: 'maven'` is `['**/*.xml', '**/*.html', '**/*.jsp', '**/*.js', '**/src/main/resources/**/*', '**/src/main/java/**/*']`, for `buildTool: 'pip'` it is `['./**/*']`.")
-	cmd.Flags().StringSliceVar(&stepConfig.Exclude, "exclude", []string{}, "A list of directories/files to be excluded from the scan. Wildcards can be used, e.g., `'**/Test.java'`. If `translate` is set, this will ignored.")
+	cmd.Flags().StringSliceVar(&stepConfig.Src, "src", []string{}, "A list of source directories to scan. Wildcards can be used, e.g., `'src/main/java/**/*'`. If `'translate'` is set, this will ignored. The default value for `buildTool: 'maven'` is `['**/*.xml', '**/*.html', '**/*.jsp', '**/*.js', '**/src/main/resources/**/*', '**/src/main/java/**/*', '**/src/gen/java/cds/**/*', '**/target/main/java/**/*', '**/target/main/resources/**/*', '**/target/generated-sources/**/*']`, for `buildTool: 'pip'` it is `['./**/*']`.")
+	cmd.Flags().StringSliceVar(&stepConfig.Exclude, "exclude", []string{}, "A list of directories/files to be excluded from the scan. Wildcards can be used, e.g., `'**/Test.java'`. If `translate` is set, this will ignored. The default value for `buildTool: 'maven'` is `['**/src/test/**/*']`, for `buildTool: 'pip'` it is `['./**/tests/**/*', './**/setup.py']`.")
 	cmd.Flags().StringVar(&stepConfig.APIEndpoint, "apiEndpoint", `/api/v1`, "Fortify SSC endpoint used for uploading the scan results and checking the audit state")
 	cmd.Flags().StringVar(&stepConfig.ReportType, "reportType", `PDF`, "The type of report to be generated")
 	cmd.Flags().StringSliceVar(&stepConfig.PythonAdditionalPath, "pythonAdditionalPath", []string{`./lib`, `.`}, "A list of additional paths which can be used in `buildTool: 'pip'` for customization purposes")
 	cmd.Flags().StringVar(&stepConfig.ArtifactURL, "artifactUrl", os.Getenv("PIPER_artifactUrl"), "Path/URL pointing to an additional artifact repository for resolution of additional artifacts during the build")
 	cmd.Flags().BoolVar(&stepConfig.ConsiderSuspicious, "considerSuspicious", true, "Whether suspicious issues should trigger the check to fail or not")
+	cmd.Flags().BoolVar(&stepConfig.ConvertToSarif, "convertToSarif", true, "Convert the proprietary format of Fortify scan results to the open SARIF standard.")
 	cmd.Flags().StringVar(&stepConfig.FprUploadEndpoint, "fprUploadEndpoint", `/upload/resultFileUpload.html`, "Fortify SSC endpoint for FPR uploads")
 	cmd.Flags().StringVar(&stepConfig.ProjectName, "projectName", `{{list .GroupID .ArtifactID | join "-" | trimAll "-"}}`, "The project used for reporting results in SSC")
 	cmd.Flags().BoolVar(&stepConfig.Reporting, "reporting", false, "Influences whether a report is generated or not")
 	cmd.Flags().StringVar(&stepConfig.ServerURL, "serverUrl", os.Getenv("PIPER_serverUrl"), "Fortify SSC Url to be used for accessing the APIs")
 	cmd.Flags().IntVar(&stepConfig.PullRequestMessageRegexGroup, "pullRequestMessageRegexGroup", 1, "The group number for extracting the pull request id in `'pullRequestMessageRegex'`")
 	cmd.Flags().IntVar(&stepConfig.DeltaMinutes, "deltaMinutes", 5, "The number of minutes for which an uploaded FPR artifact is considered to be recent and healthy, if exceeded an error will be thrown")
-	cmd.Flags().IntVar(&stepConfig.SpotCheckMinimum, "spotCheckMinimum", 1, "The minimum number of issues that must be audited per category in the `Spot Checks of each Category` folder to avoid an error being thrown")
+	cmd.Flags().IntVar(&stepConfig.SpotCheckMinimum, "spotCheckMinimum", 1, "The minimum number/percentage of issues that must be audited per category in the `Spot Checks of each Category` folder to avoid an error being thrown")
+	cmd.Flags().StringVar(&stepConfig.SpotCheckMinimumUnit, "spotCheckMinimumUnit", `number`, "The unit for the spotCheckMinimum to apply.")
+	cmd.Flags().IntVar(&stepConfig.SpotCheckMaximum, "spotCheckMaximum", 0, "The maximum number of issues that must be audited per category in the `Spot Checks of each Category` folder to avoid an error being thrown. Note that this flag depends on the result of spotCheckMinimum. For example if spotCheckMinimum percentage value exceeds spotCheckMaximum then spotCheckMaximum will be considerd else spotCheckMinimum is considered. If value is less than one, this flag will be ignored.")
 	cmd.Flags().StringVar(&stepConfig.FprDownloadEndpoint, "fprDownloadEndpoint", `/download/currentStateFprDownload.html`, "Fortify SSC endpoint for FPR downloads")
 	cmd.Flags().StringVar(&stepConfig.VersioningModel, "versioningModel", `major`, "The default project versioning model used for creating the version based on the build descriptor version to report results in SSC, can be one of `'major'`, `'major-minor'`, `'semantic'`, `'full'`")
 	cmd.Flags().StringVar(&stepConfig.PythonInstallCommand, "pythonInstallCommand", `{{.Pip}} install --user .`, "Additional install command that can be run when `buildTool: 'pip'` is used which allows further customizing the execution environment of the scan")
@@ -247,14 +400,17 @@ func addFortifyExecuteScanFlags(cmd *cobra.Command, stepConfig *fortifyExecuteSc
 	cmd.Flags().StringVar(&stepConfig.FilterSetTitle, "filterSetTitle", `SAP`, "Title of the filter set to use for analysing the results")
 	cmd.Flags().StringVar(&stepConfig.PullRequestName, "pullRequestName", os.Getenv("PIPER_pullRequestName"), "The name of the pull request branch which will trigger creation of a new version in Fortify SSC based on the master branch version")
 	cmd.Flags().StringVar(&stepConfig.PullRequestMessageRegex, "pullRequestMessageRegex", `.*Merge pull request #(\\d+) from.*`, "Regex used to identify the PR-XXX reference within the merge commit message")
-	cmd.Flags().StringVar(&stepConfig.BuildTool, "buildTool", `maven`, "Scan type used for the step which can be `'maven'`, `'pip'`")
+	cmd.Flags().StringVar(&stepConfig.BuildTool, "buildTool", `maven`, "Scan type used for the step which can be `'maven'`, `'pip'` or `'gradle'`")
 	cmd.Flags().StringVar(&stepConfig.ProjectSettingsFile, "projectSettingsFile", os.Getenv("PIPER_projectSettingsFile"), "Path to the mvn settings file that should be used as project settings file.")
+	cmd.Flags().StringVar(&stepConfig.Proxy, "proxy", os.Getenv("PIPER_proxy"), "Proxy URL to be used for communication with the Fortify instance.")
 	cmd.Flags().StringVar(&stepConfig.GlobalSettingsFile, "globalSettingsFile", os.Getenv("PIPER_globalSettingsFile"), "Path to the mvn settings file that should be used as global settings file.")
 	cmd.Flags().StringVar(&stepConfig.M2Path, "m2Path", os.Getenv("PIPER_m2Path"), "Path to the location of the local repository that should be used.")
 	cmd.Flags().BoolVar(&stepConfig.VerifyOnly, "verifyOnly", false, "Whether the step shall only apply verification checks or whether it does a full scan and check cycle")
 	cmd.Flags().BoolVar(&stepConfig.InstallArtifacts, "installArtifacts", false, "If enabled, it will install all artifacts to the local maven repository to make them available before running Fortify. This is required if any maven module has dependencies to other modules in the repository and they were not installed before.")
+	cmd.Flags().BoolVar(&stepConfig.CreateResultIssue, "createResultIssue", false, "Activate creation of a result issue in GitHub.")
 
 	cmd.MarkFlagRequired("authToken")
+	cmd.Flags().MarkDeprecated("pythonAdditionalPath", "this is deprecated")
 	cmd.MarkFlagRequired("serverUrl")
 }
 
@@ -268,6 +424,10 @@ func fortifyExecuteScanMetadata() config.StepData {
 		},
 		Spec: config.StepSpec{
 			Inputs: config.StepInputs{
+				Secrets: []config.StepSecrets{
+					{Name: "fortifyCredentialsId", Description: "Jenkins 'Secret text' credentials ID containing token to authenticate to Fortify SSC.", Type: "jenkins"},
+					{Name: "githubTokenCredentialsId", Description: "Jenkins 'Secret text' credentials ID containing token to authenticate to GitHub.", Type: "jenkins"},
+				},
 				Resources: []config.StepResources{
 					{Name: "commonPipelineEnvironment"},
 					{Name: "buildDescriptor", Type: "stash"},
@@ -283,6 +443,25 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "[]string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     []string{},
+					},
+					{
+						Name:        "additionalMvnParameters",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:        "[]string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     []string{},
+					},
+					{
+						Name:        "assignees",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:        "[]string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     []string{``},
 					},
 					{
 						Name: "authToken",
@@ -293,15 +472,25 @@ func fortifyExecuteScanMetadata() config.StepData {
 							},
 
 							{
-								Name:  "",
-								Paths: []string{"$(vaultPath)/fortify", "$(vaultBasePath)/$(vaultPipelineName)/fortify", "$(vaultBasePath)/GROUP-SECRETS/fortify"},
-								Type:  "vaultSecret",
+								Name:    "fortifyVaultSecretName",
+								Type:    "vaultSecret",
+								Default: "fortify",
 							},
 						},
 						Scope:     []string{"PARAMETERS", "STAGES", "STEPS"},
 						Type:      "string",
 						Mandatory: true,
 						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_authToken"),
+					},
+					{
+						Name:        "buildDescriptorExcludeList",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:        "[]string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     []string{`unit-tests/pom.xml`, `integration-tests/pom.xml`},
 					},
 					{
 						Name:        "customScanVersion",
@@ -310,6 +499,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_customScanVersion"),
 					},
 					{
 						Name: "githubToken",
@@ -320,15 +510,16 @@ func fortifyExecuteScanMetadata() config.StepData {
 							},
 
 							{
-								Name:  "",
-								Paths: []string{"$(vaultPath)/github", "$(vaultBasePath)/$(vaultPipelineName)/github", "$(vaultBasePath)/GROUP-SECRETS/github"},
-								Type:  "vaultSecret",
+								Name:    "githubVaultSecretName",
+								Type:    "vaultSecret",
+								Default: "github",
 							},
 						},
 						Scope:     []string{"GENERAL", "PARAMETERS", "STAGES", "STEPS"},
 						Type:      "string",
 						Mandatory: false,
 						Aliases:   []config.Alias{{Name: "access_token"}},
+						Default:   os.Getenv("PIPER_githubToken"),
 					},
 					{
 						Name:        "autoCreate",
@@ -337,6 +528,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     false,
 					},
 					{
 						Name:        "modulePath",
@@ -345,6 +537,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `./`,
 					},
 					{
 						Name:        "pythonRequirementsFile",
@@ -353,6 +546,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_pythonRequirementsFile"),
 					},
 					{
 						Name:        "autodetectClasspath",
@@ -361,6 +555,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     true,
 					},
 					{
 						Name:        "mustAuditIssueGroups",
@@ -369,6 +564,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `Corporate Security Requirements, Audit All`,
 					},
 					{
 						Name:        "spotAuditIssueGroups",
@@ -377,6 +573,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `Spot Checks of Each Category`,
 					},
 					{
 						Name:        "pythonRequirementsInstallSuffix",
@@ -385,6 +582,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_pythonRequirementsInstallSuffix"),
 					},
 					{
 						Name:        "pythonVersion",
@@ -393,6 +591,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `python3`,
 					},
 					{
 						Name:        "uploadResults",
@@ -401,6 +600,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     true,
 					},
 					{
 						Name: "version",
@@ -413,7 +613,8 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Scope:     []string{"GENERAL", "PARAMETERS", "STAGES", "STEPS"},
 						Type:      "string",
 						Mandatory: false,
-						Aliases:   []config.Alias{{Name: "fortifyProjectVersion"}},
+						Aliases:   []config.Alias{{Name: "fortifyProjectVersion", Deprecated: true}},
+						Default:   os.Getenv("PIPER_version"),
 					},
 					{
 						Name:        "buildDescriptorFile",
@@ -422,6 +623,8 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `./pom.xml`,
+						Conditions:  []config.Condition{{ConditionRef: "strings-equal", Params: []config.Param{{Name: "buildTool", Value: "maven"}}}},
 					},
 					{
 						Name:        "buildDescriptorFile",
@@ -430,6 +633,18 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `./setup.py`,
+						Conditions:  []config.Condition{{ConditionRef: "strings-equal", Params: []config.Param{{Name: "buildTool", Value: "pip"}}}},
+					},
+					{
+						Name:        "buildDescriptorFile",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:        "string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     `./build.gradle`,
+						Conditions:  []config.Condition{{ConditionRef: "strings-equal", Params: []config.Param{{Name: "buildTool", Value: "gradle"}}}},
 					},
 					{
 						Name: "commitId",
@@ -443,6 +658,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:      "string",
 						Mandatory: false,
 						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_commitId"),
 					},
 					{
 						Name: "commitMessage",
@@ -456,6 +672,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:      "string",
 						Mandatory: false,
 						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_commitMessage"),
 					},
 					{
 						Name:        "githubApiUrl",
@@ -464,6 +681,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `https://api.github.com`,
 					},
 					{
 						Name: "owner",
@@ -473,10 +691,11 @@ func fortifyExecuteScanMetadata() config.StepData {
 								Param: "github/owner",
 							},
 						},
-						Scope:     []string{"PARAMETERS", "STAGES", "STEPS"},
+						Scope:     []string{"GENERAL", "PARAMETERS", "STAGES", "STEPS"},
 						Type:      "string",
 						Mandatory: false,
 						Aliases:   []config.Alias{{Name: "githubOrg"}},
+						Default:   os.Getenv("PIPER_owner"),
 					},
 					{
 						Name: "repository",
@@ -486,10 +705,11 @@ func fortifyExecuteScanMetadata() config.StepData {
 								Param: "github/repository",
 							},
 						},
-						Scope:     []string{"PARAMETERS", "STAGES", "STEPS"},
+						Scope:     []string{"GENERAL", "PARAMETERS", "STAGES", "STEPS"},
 						Type:      "string",
 						Mandatory: false,
 						Aliases:   []config.Alias{{Name: "githubRepo"}},
+						Default:   os.Getenv("PIPER_repository"),
 					},
 					{
 						Name:        "memory",
@@ -498,6 +718,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `-Xmx4G -Xms512M`,
 					},
 					{
 						Name:        "updateRulePack",
@@ -506,6 +727,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     true,
 					},
 					{
 						Name:        "reportDownloadEndpoint",
@@ -514,6 +736,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "fortifyReportDownloadEndpoint"}},
+						Default:     `/transfer/reportDownload.html`,
 					},
 					{
 						Name:        "pollingMinutes",
@@ -522,6 +745,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "int",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     30,
 					},
 					{
 						Name:        "quickScan",
@@ -530,6 +754,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     false,
 					},
 					{
 						Name:        "translate",
@@ -538,6 +763,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_translate"),
 					},
 					{
 						Name:        "src",
@@ -546,6 +772,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "[]string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     []string{},
 					},
 					{
 						Name:        "exclude",
@@ -554,6 +781,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "[]string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     []string{},
 					},
 					{
 						Name:        "apiEndpoint",
@@ -562,6 +790,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "fortifyApiEndpoint"}},
+						Default:     `/api/v1`,
 					},
 					{
 						Name:        "reportType",
@@ -570,14 +799,17 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `PDF`,
 					},
 					{
-						Name:        "pythonAdditionalPath",
-						ResourceRef: []config.ResourceReference{},
-						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
-						Type:        "[]string",
-						Mandatory:   false,
-						Aliases:     []config.Alias{},
+						Name:               "pythonAdditionalPath",
+						ResourceRef:        []config.ResourceReference{},
+						Scope:              []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:               "[]string",
+						Mandatory:          false,
+						Aliases:            []config.Alias{},
+						Default:            []string{`./lib`, `.`},
+						DeprecationMessage: "this is deprecated",
 					},
 					{
 						Name:        "artifactUrl",
@@ -586,6 +818,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_artifactUrl"),
 					},
 					{
 						Name:        "considerSuspicious",
@@ -594,6 +827,16 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     true,
+					},
+					{
+						Name:        "convertToSarif",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:        "bool",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     true,
 					},
 					{
 						Name:        "fprUploadEndpoint",
@@ -602,6 +845,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "fortifyFprUploadEndpoint"}},
+						Default:     `/upload/resultFileUpload.html`,
 					},
 					{
 						Name:        "projectName",
@@ -610,6 +854,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "fortifyProjectName"}},
+						Default:     `{{list .GroupID .ArtifactID | join "-" | trimAll "-"}}`,
 					},
 					{
 						Name:        "reporting",
@@ -618,6 +863,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     false,
 					},
 					{
 						Name:        "serverUrl",
@@ -625,7 +871,8 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Scope:       []string{"GENERAL", "PARAMETERS", "STAGES", "STEPS"},
 						Type:        "string",
 						Mandatory:   true,
-						Aliases:     []config.Alias{{Name: "fortifyServerUrl"}, {Name: "sscUrl"}},
+						Aliases:     []config.Alias{{Name: "fortifyServerUrl"}, {Name: "sscUrl", Deprecated: true}},
+						Default:     os.Getenv("PIPER_serverUrl"),
 					},
 					{
 						Name:        "pullRequestMessageRegexGroup",
@@ -634,6 +881,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "int",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     1,
 					},
 					{
 						Name:        "deltaMinutes",
@@ -642,6 +890,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "int",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     5,
 					},
 					{
 						Name:        "spotCheckMinimum",
@@ -650,6 +899,25 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "int",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     1,
+					},
+					{
+						Name:        "spotCheckMinimumUnit",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:        "string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     `number`,
+					},
+					{
+						Name:        "spotCheckMaximum",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:        "int",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     0,
 					},
 					{
 						Name:        "fprDownloadEndpoint",
@@ -658,6 +926,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "fortifyFprDownloadEndpoint"}},
+						Default:     `/download/currentStateFprDownload.html`,
 					},
 					{
 						Name:        "versioningModel",
@@ -665,7 +934,8 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Scope:       []string{"PARAMETERS", "GENERAL", "STAGES", "STEPS"},
 						Type:        "string",
 						Mandatory:   false,
-						Aliases:     []config.Alias{{Name: "defaultVersioningModel"}},
+						Aliases:     []config.Alias{{Name: "defaultVersioningModel", Deprecated: true}},
+						Default:     `major`,
 					},
 					{
 						Name:        "pythonInstallCommand",
@@ -674,6 +944,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `{{.Pip}} install --user .`,
 					},
 					{
 						Name:        "reportTemplateId",
@@ -682,6 +953,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "int",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     18,
 					},
 					{
 						Name:        "filterSetTitle",
@@ -690,6 +962,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `SAP`,
 					},
 					{
 						Name:        "pullRequestName",
@@ -698,6 +971,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_pullRequestName"),
 					},
 					{
 						Name:        "pullRequestMessageRegex",
@@ -706,6 +980,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `.*Merge pull request #(\\d+) from.*`,
 					},
 					{
 						Name:        "buildTool",
@@ -714,6 +989,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     `maven`,
 					},
 					{
 						Name:        "projectSettingsFile",
@@ -722,6 +998,16 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "maven/projectSettingsFile"}},
+						Default:     os.Getenv("PIPER_projectSettingsFile"),
+					},
+					{
+						Name:        "proxy",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"STEPS", "STAGES", "PARAMETERS"},
+						Type:        "string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_proxy"),
 					},
 					{
 						Name:        "globalSettingsFile",
@@ -730,6 +1016,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "maven/globalSettingsFile"}},
+						Default:     os.Getenv("PIPER_globalSettingsFile"),
 					},
 					{
 						Name:        "m2Path",
@@ -738,6 +1025,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{{Name: "maven/m2Path"}},
+						Default:     os.Getenv("PIPER_m2Path"),
 					},
 					{
 						Name:        "verifyOnly",
@@ -746,6 +1034,7 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     false,
 					},
 					{
 						Name:        "installArtifacts",
@@ -754,6 +1043,21 @@ func fortifyExecuteScanMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     false,
+					},
+					{
+						Name: "createResultIssue",
+						ResourceRef: []config.ResourceReference{
+							{
+								Name:  "commonPipelineEnvironment",
+								Param: "custom/isOptimizedAndScheduled",
+							},
+						},
+						Scope:     []string{"GENERAL", "PARAMETERS", "STAGES", "STEPS"},
+						Type:      "bool",
+						Mandatory: false,
+						Aliases:   []config.Alias{},
+						Default:   false,
 					},
 				},
 			},
@@ -765,9 +1069,21 @@ func fortifyExecuteScanMetadata() config.StepData {
 					{
 						Name: "influx",
 						Type: "influx",
-						Parameters: []map[string]interface{}{
-							{"Name": "step_data"}, {"fields": []map[string]string{{"name": "fortify"}}},
-							{"Name": "fortify_data"}, {"fields": []map[string]string{{"name": "projectName"}, {"name": "projectVersion"}, {"name": "violations"}, {"name": "corporateTotal"}, {"name": "corporateAudited"}, {"name": "auditAllTotal"}, {"name": "auditAllAudited"}, {"name": "spotChecksTotal"}, {"name": "spotChecksAudited"}, {"name": "spotChecksGap"}, {"name": "suspicious"}, {"name": "exploitable"}, {"name": "suppressed"}}},
+						Parameters: []map[string]any{
+							{"name": "step_data", "fields": []map[string]string{{"name": "fortify"}}},
+							{"name": "fortify_data", "fields": []map[string]string{{"name": "projectID"}, {"name": "projectName"}, {"name": "projectVersion"}, {"name": "projectVersionId"}, {"name": "violations"}, {"name": "corporateTotal"}, {"name": "corporateAudited"}, {"name": "auditAllTotal"}, {"name": "auditAllAudited"}, {"name": "spotChecksTotal"}, {"name": "spotChecksAudited"}, {"name": "spotChecksGap"}, {"name": "suspicious"}, {"name": "exploitable"}, {"name": "suppressed"}}},
+						},
+					},
+					{
+						Name: "reports",
+						Type: "reports",
+						Parameters: []map[string]any{
+							{"filePattern": "**/*.PDF", "type": "fortify"},
+							{"filePattern": "**/*.fpr", "type": "fortify"},
+							{"filePattern": "**/fortify-scan.*", "type": "fortify"},
+							{"filePattern": "**/toolrun_fortify_*.json", "type": "fortify"},
+							{"filePattern": "**/piper_fortify_report.json", "type": "fortify"},
+							{"filePattern": "**/piper_fortify_report.html", "type": "fortify"},
 						},
 					},
 				},

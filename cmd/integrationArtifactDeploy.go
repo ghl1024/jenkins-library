@@ -1,18 +1,19 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"time"
 
-	"github.com/Jeffail/gabs/v2"
 	"github.com/SAP/jenkins-library/pkg/command"
 	"github.com/SAP/jenkins-library/pkg/cpi"
 	piperhttp "github.com/SAP/jenkins-library/pkg/http"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/pkg/errors"
+
+	"github.com/Jeffail/gabs/v2"
 )
 
 const retryCount = 14
@@ -68,18 +69,23 @@ func runIntegrationArtifactDeploy(config *integrationArtifactDeployOptions, tele
 	clientOptions := piperhttp.ClientOptions{}
 	header := make(http.Header)
 	header.Add("Accept", "application/json")
-	deployURL := fmt.Sprintf("%s/api/v1/DeployIntegrationDesigntimeArtifact?Id='%s'&Version='%s'", config.Host, config.IntegrationFlowID, config.IntegrationFlowVersion)
-	tokenParameters := cpi.TokenParameters{TokenURL: config.OAuthTokenProviderURL, Username: config.Username, Password: config.Password, Client: httpClient}
+	serviceKey, err := cpi.ReadCpiServiceKey(config.APIServiceKey)
+	if err != nil {
+		return err
+	}
+	deployURL := fmt.Sprintf("%s/api/v1/DeployIntegrationDesigntimeArtifact?Id='%s'&Version='%s'", serviceKey.OAuth.Host, config.IntegrationFlowID, "Active")
+
+	tokenParameters := cpi.TokenParameters{TokenURL: serviceKey.OAuth.OAuthTokenProviderURL, Username: serviceKey.OAuth.ClientID, Password: serviceKey.OAuth.ClientSecret, Client: httpClient}
 	token, err := cpi.CommonUtils.GetBearerToken(tokenParameters)
 	if err != nil {
-		return errors.Wrap(err, "failed to fetch Bearer Token")
+		return fmt.Errorf("failed to fetch Bearer Token: %w", err)
 	}
 	clientOptions.Token = fmt.Sprintf("Bearer %s", token)
 	httpClient.SetOptions(clientOptions)
 	httpMethod := "POST"
 	deployResp, httpErr := httpClient.SendRequest(httpMethod, deployURL, nil, header, nil)
 	if httpErr != nil {
-		return errors.Wrapf(httpErr, "HTTP %v request to %v failed with error", httpMethod, deployURL)
+		return fmt.Errorf("HTTP %v request to %v failed with error: %w", httpMethod, deployURL, httpErr)
 	}
 
 	if deployResp != nil && deployResp.Body != nil {
@@ -87,54 +93,58 @@ func runIntegrationArtifactDeploy(config *integrationArtifactDeployOptions, tele
 	}
 
 	if deployResp == nil {
-		return errors.Errorf("did not retrieve a HTTP response")
+		return fmt.Errorf("did not retrieve a HTTP response")
 	}
 
 	if deployResp.StatusCode == http.StatusAccepted {
 		log.Entry().
 			WithField("IntegrationFlowID", config.IntegrationFlowID).
 			Info("successfully deployed into CPI runtime")
-		deploymentError := pollIFlowDeploymentStatus(retryCount, config, httpClient)
+		taskId, readErr := io.ReadAll(deployResp.Body)
+		if readErr != nil {
+			return fmt.Errorf("Task Id not found. HTTP response body could not be read.: %w", readErr)
+		}
+		deploymentError := pollIFlowDeploymentStatus(string(taskId), retryCount, config, httpClient, serviceKey.OAuth.Host)
 		return deploymentError
 	}
-	responseBody, readErr := ioutil.ReadAll(deployResp.Body)
+	responseBody, readErr := io.ReadAll(deployResp.Body)
 
 	if readErr != nil {
-		return errors.Wrapf(readErr, "HTTP response body could not be read, response status code: %v", deployResp.StatusCode)
+		return fmt.Errorf("HTTP response body could not be read, response status code: %v: %w", deployResp.StatusCode, readErr)
 	}
-	log.Entry().Errorf("a HTTP error occurred! Response body: %v, Response status code : %v", responseBody, deployResp.StatusCode)
-	return errors.Errorf("integration flow deployment failed, response Status code: %v", deployResp.StatusCode)
+	log.Entry().Errorf("a HTTP error occurred! Response body: %v, Response status code : %v", string(responseBody), deployResp.StatusCode)
+	return fmt.Errorf("integration flow deployment failed, response Status code: %v", deployResp.StatusCode)
 }
 
-//pollIFlowDeploymentStatus - Poll the integration flow deployment status, return status or error details
-func pollIFlowDeploymentStatus(retryCount int, config *integrationArtifactDeployOptions, httpClient piperhttp.Sender) error {
+// pollIFlowDeploymentStatus - Poll the integration flow deployment status, return status or error details
+func pollIFlowDeploymentStatus(taskId string, retryCount int, config *integrationArtifactDeployOptions, httpClient piperhttp.Sender, apiHost string) error {
 
 	if retryCount <= 0 {
 		return errors.New("failed to start integration artifact after retrying several times")
 	}
-	deployStatus, err := getIntegrationArtifactDeployStatus(config, httpClient)
+	deployStatus, err := getIntegrationArtifactDeployStatus(config, httpClient, apiHost, taskId)
 	if err != nil {
 		return err
 	}
 
 	//if artifact starting, then retry based on provided retry count
 	//with specific delay between each retry
-	if deployStatus == "STARTING" {
+	if deployStatus == "DEPLOYING" {
 		// Calling Sleep method
 		sleepTime := int(retryCount * 3)
 		time.Sleep(time.Duration(sleepTime) * time.Second)
 		retryCount--
-		return pollIFlowDeploymentStatus(retryCount, config, httpClient)
+		return pollIFlowDeploymentStatus(taskId, retryCount, config, httpClient, apiHost)
 	}
 
 	//if artifact started, then just return
-	if deployStatus == "STARTED" {
+	if deployStatus == "SUCCESS" {
 		return nil
 	}
 
 	//if error return immediately with error details
-	if deployStatus == "ERROR" {
-		resp, err := getIntegrationArtifactDeployError(config, httpClient)
+	if deployStatus == "FAIL" || deployStatus == "FAIL_ON_LICENSE_ERROR" {
+		resp, err := getIntegrationArtifactDeployError(config, httpClient, apiHost)
 		if err != nil {
 			return err
 		}
@@ -143,23 +153,23 @@ func pollIFlowDeploymentStatus(retryCount int, config *integrationArtifactDeploy
 	return nil
 }
 
-//GetHTTPErrorMessage - Return HTTP failure message
+// GetHTTPErrorMessage - Return HTTP failure message
 func getHTTPErrorMessage(httpErr error, response *http.Response, httpMethod, statusURL string) (string, error) {
-	responseBody, readErr := ioutil.ReadAll(response.Body)
+	responseBody, readErr := io.ReadAll(response.Body)
 	if readErr != nil {
-		return "", errors.Wrapf(readErr, "HTTP response body could not be read, response status code: %v", response.StatusCode)
+		return "", fmt.Errorf("HTTP response body could not be read, response status code: %v: %w", response.StatusCode, readErr)
 	}
 	log.Entry().Errorf("a HTTP error occurred! Response body: %v, response status code: %v", string(responseBody), response.StatusCode)
-	return "", errors.Wrapf(httpErr, "HTTP %v request to %v failed with error: %v", httpMethod, statusURL, responseBody)
+	return "", fmt.Errorf("HTTP %v request to %v failed with error: %v: %w", httpMethod, statusURL, responseBody, httpErr)
 }
 
-//getIntegrationArtifactDeployStatus - Get integration artifact Deploy Status
-func getIntegrationArtifactDeployStatus(config *integrationArtifactDeployOptions, httpClient piperhttp.Sender) (string, error) {
+// getIntegrationArtifactDeployStatus - Get integration artifact Deploy Status
+func getIntegrationArtifactDeployStatus(config *integrationArtifactDeployOptions, httpClient piperhttp.Sender, apiHost string, taskId string) (string, error) {
 	httpMethod := "GET"
 	header := make(http.Header)
 	header.Add("content-type", "application/json")
 	header.Add("Accept", "application/json")
-	deployStatusURL := fmt.Sprintf("%s/api/v1/IntegrationRuntimeArtifacts('%s')", config.Host, config.IntegrationFlowID)
+	deployStatusURL := fmt.Sprintf("%s/api/v1/BuildAndDeployStatus(TaskId='%s')", apiHost, taskId)
 	deployStatusResp, httpErr := httpClient.SendRequest(httpMethod, deployStatusURL, nil, header, nil)
 
 	if deployStatusResp != nil && deployStatusResp.Body != nil {
@@ -167,7 +177,7 @@ func getIntegrationArtifactDeployStatus(config *integrationArtifactDeployOptions
 	}
 
 	if deployStatusResp == nil {
-		return "", errors.Errorf("did not retrieve a HTTP response: %v", httpErr)
+		return "", fmt.Errorf("did not retrieve a HTTP response: %v", httpErr)
 	}
 
 	if deployStatusResp.StatusCode == http.StatusOK {
@@ -175,13 +185,13 @@ func getIntegrationArtifactDeployStatus(config *integrationArtifactDeployOptions
 			WithField("IntegrationFlowID", config.IntegrationFlowID).
 			Info("Successfully started integration flow artefact in CPI runtime")
 
-		bodyText, readErr := ioutil.ReadAll(deployStatusResp.Body)
+		bodyText, readErr := io.ReadAll(deployStatusResp.Body)
 		if readErr != nil {
-			return "", errors.Wrapf(readErr, "HTTP response body could not be read, response status code: %v", deployStatusResp.StatusCode)
+			return "", fmt.Errorf("HTTP response body could not be read, response status code: %v: %w", deployStatusResp.StatusCode, readErr)
 		}
 		jsonResponse, parsingErr := gabs.ParseJSON([]byte(bodyText))
 		if parsingErr != nil {
-			return "", errors.Wrapf(parsingErr, "HTTP response body could not be parsed as JSON: %v", string(bodyText))
+			return "", fmt.Errorf("HTTP response body could not be parsed as JSON: %v: %w", string(bodyText), parsingErr)
 		}
 		deployStatus := jsonResponse.Path("d.Status").Data().(string)
 		return deployStatus, nil
@@ -189,15 +199,15 @@ func getIntegrationArtifactDeployStatus(config *integrationArtifactDeployOptions
 	if httpErr != nil {
 		return getHTTPErrorMessage(httpErr, deployStatusResp, httpMethod, deployStatusURL)
 	}
-	return "", errors.Errorf("failed to get Integration Flow artefact runtime status, response Status code: %v", deployStatusResp.StatusCode)
+	return "", fmt.Errorf("failed to get Integration Flow artefact runtime status, response Status code: %v", deployStatusResp.StatusCode)
 }
 
-//getIntegrationArtifactDeployError - Get integration artifact deploy error details
-func getIntegrationArtifactDeployError(config *integrationArtifactDeployOptions, httpClient piperhttp.Sender) (string, error) {
+// getIntegrationArtifactDeployError - Get integration artifact deploy error details
+func getIntegrationArtifactDeployError(config *integrationArtifactDeployOptions, httpClient piperhttp.Sender, apiHost string) (string, error) {
 	httpMethod := "GET"
 	header := make(http.Header)
 	header.Add("content-type", "application/json")
-	errorStatusURL := fmt.Sprintf("%s/api/v1/IntegrationRuntimeArtifacts('%s')/ErrorInformation/$value", config.Host, config.IntegrationFlowID)
+	errorStatusURL := fmt.Sprintf("%s/api/v1/IntegrationRuntimeArtifacts('%s')/ErrorInformation/$value", apiHost, config.IntegrationFlowID)
 	errorStatusResp, httpErr := httpClient.SendRequest(httpMethod, errorStatusURL, nil, header, nil)
 
 	if errorStatusResp != nil && errorStatusResp.Body != nil {
@@ -205,23 +215,23 @@ func getIntegrationArtifactDeployError(config *integrationArtifactDeployOptions,
 	}
 
 	if errorStatusResp == nil {
-		return "", errors.Errorf("did not retrieve a HTTP response: %v", httpErr)
+		return "", fmt.Errorf("did not retrieve a HTTP response: %v", httpErr)
 	}
 
 	if errorStatusResp.StatusCode == http.StatusOK {
 		log.Entry().
 			WithField("IntegrationFlowID", config.IntegrationFlowID).
 			Info("Successfully retrieved Integration Flow artefact deploy error details")
-		responseBody, readErr := ioutil.ReadAll(errorStatusResp.Body)
+		responseBody, readErr := io.ReadAll(errorStatusResp.Body)
 		if readErr != nil {
-			return "", errors.Wrapf(readErr, "HTTP response body could not be read, response status code: %v", errorStatusResp.StatusCode)
+			return "", fmt.Errorf("HTTP response body could not be read, response status code: %v: %w", errorStatusResp.StatusCode, readErr)
 		}
-		log.Entry().Errorf("a HTTP error occurred! Response body: %v, Response status code: %v", responseBody, errorStatusResp.StatusCode)
+		log.Entry().Errorf("a HTTP error occurred! Response body: %v, Response status code: %v", string(responseBody), errorStatusResp.StatusCode)
 		errorDetails := string(responseBody)
 		return errorDetails, nil
 	}
 	if httpErr != nil {
 		return getHTTPErrorMessage(httpErr, errorStatusResp, httpMethod, errorStatusURL)
 	}
-	return "", errors.Errorf("failed to get Integration Flow artefact deploy error details, response Status code: %v", errorStatusResp.StatusCode)
+	return "", fmt.Errorf("failed to get Integration Flow artefact deploy error details, response Status code: %v", errorStatusResp.StatusCode)
 }

@@ -19,12 +19,18 @@ import static com.sap.piper.Prerequisites.checkScript
     'healthExecuteCheck',
     /** For Neo use-cases: Performs deployment to Neo landscape. */
     'neoDeploy',
+    /** For Kubernetes use-cases: Performs deployment to Kubernetes landscape. */
+    'kubernetesDeploy',
     /** For TMS use-cases: Performs upload to Transport Management Service node*/
     'tmsUpload',
+    /** For TMS use-cases: Performs export to Transport Management Service node*/
+    'tmsExport',
     /** Publishes release information to GitHub. */
     'githubPublishRelease',
     /** Executes smoke tests by running the npm script 'ci-smoke' defined in the project's package.json file. */
-    'npmExecuteEndToEndTests'
+    'npmExecuteEndToEndTests',
+    /** This step uploads SAPUI5 application to the SAPUI5 ABAP repository. */
+    'transportRequestUploadCTS'
 ]
 @Field Set STEP_CONFIG_KEYS = GENERAL_CONFIG_KEYS.plus(STAGE_STEP_KEYS)
 @Field Set PARAMETER_KEYS = STEP_CONFIG_KEYS
@@ -50,14 +56,12 @@ void call(Map parameters = [:]) {
         .addIfEmpty('healthExecuteCheck', script.commonPipelineEnvironment.configuration.runStep?.get(stageName)?.healthExecuteCheck)
         .addIfEmpty('tmsUpload', script.commonPipelineEnvironment.configuration.runStep?.get(stageName)?.tmsUpload)
         .addIfEmpty('neoDeploy', script.commonPipelineEnvironment.configuration.runStep?.get(stageName)?.neoDeploy)
+        .addIfEmpty('kubernetesDeploy', script.commonPipelineEnvironment.configuration.runStep?.get(stageName)?.kubernetesDeploy)
         .addIfEmpty('npmExecuteEndToEndTests', script.commonPipelineEnvironment.configuration.runStep?.get(stageName)?.npmExecuteEndToEndTests)
+        .addIfEmpty('transportRequestUploadCTS', script.commonPipelineEnvironment.configuration.runStep?.get(stageName)?.transportRequestUploadCTS)
         .use()
 
     piperStageWrapper (script: script, stageName: stageName) {
-
-        // telemetry reporting
-        utils.pushToSWA([step: STEP_NAME], config)
-
         // Prefer the newer multicloudDeploy step if it is configured as it is more capable
         if (config.multicloudDeploy) {
             durationMeasure(script: script, measurementName: 'deploy_release_multicloud_duration') {
@@ -75,11 +79,21 @@ void call(Map parameters = [:]) {
                     neoDeploy script: script
                 }
             }
+
+            if (config.kubernetesDeploy){
+                durationMeasure(script: script, measurementName: 'deploy_release_kubernetes_duration') {
+                    kubernetesDeploy script: script
+                }
+            }
         }
 
         if (config.tmsUpload) {
             durationMeasure(script: script, measurementName: 'upload_release_tms_duration') {
                 tmsUpload script: script
+            }
+        } else if(config.tmsExport){
+            durationMeasure(script: script, measurementName: 'export_release_tms_duration') {
+                tmsExport script: script
             }
         }
 
@@ -95,6 +109,12 @@ void call(Map parameters = [:]) {
 
         if (config.githubPublishRelease) {
             githubPublishRelease script: script
+        }
+
+        if (config.transportRequestUploadCTS) {
+            durationMeasure(script: script, measurementName: 'deploy_release_transportRequestUploadCTS_duration') {
+                transportRequestUploadCTS script: script
+            }
         }
 
     }

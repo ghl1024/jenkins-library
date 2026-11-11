@@ -1,40 +1,31 @@
+//go:build unit
+// +build unit
+
 package cmd
 
 import (
-	"io/ioutil"
-	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/SAP/jenkins-library/pkg/mock"
 	"github.com/stretchr/testify/assert"
 )
-
-type integrationArtifactDownloadMockUtils struct {
-	*mock.ExecMockRunner
-	*mock.FilesMock
-}
-
-func newIntegrationArtifactDownloadTestsUtils() integrationArtifactDownloadMockUtils {
-	utils := integrationArtifactDownloadMockUtils{
-		ExecMockRunner: &mock.ExecMockRunner{},
-		FilesMock:      &mock.FilesMock{},
-	}
-	return utils
-}
 
 func TestRunIntegrationArtifactDownload(t *testing.T) {
 	t.Parallel()
 
 	t.Run("Successfull Download of Integration flow Artifact", func(t *testing.T) {
-		tempDir, tmpErr := ioutil.TempDir("", "")
-		defer os.RemoveAll(tempDir) // clean up
-		assert.NoError(t, tmpErr, "Error when creating temp dir")
+		tempDir := t.TempDir()
+		apiServiceKey := `{
+			"oauth": {
+				"url": "https://demo",
+				"clientid": "demouser",
+				"clientsecret": "******",
+				"tokenurl": "https://demo/oauth/token"
+			}
+		}`
+
 		config := integrationArtifactDownloadOptions{
-			Host:                   "https://demo",
-			OAuthTokenProviderURL:  "https://demo/oauth/token",
-			Username:               "demouser",
-			Password:               "******",
+			APIServiceKey:          apiServiceKey,
 			IntegrationFlowID:      "flow1",
 			IntegrationFlowVersion: "1.0.1",
 			DownloadPath:           tempDir,
@@ -58,11 +49,17 @@ func TestRunIntegrationArtifactDownload(t *testing.T) {
 	})
 
 	t.Run("Failed case of Integration Flow artifact Download", func(t *testing.T) {
+		apiServiceKey := `{
+			"oauth": {
+				"url": "https://demo",
+				"clientid": "demouser",
+				"clientsecret": "******",
+				"tokenurl": "https://demo/oauth/token"
+			}
+		}`
+
 		config := integrationArtifactDownloadOptions{
-			Host:                   "https://demo",
-			OAuthTokenProviderURL:  "https://demo/oauth/token",
-			Username:               "demouser",
-			Password:               "******",
+			APIServiceKey:          apiServiceKey,
 			IntegrationFlowID:      "flow1",
 			IntegrationFlowVersion: "1.0.1",
 			DownloadPath:           "tmp",

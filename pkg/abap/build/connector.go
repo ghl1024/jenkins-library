@@ -2,24 +2,36 @@ package build
 
 import (
 	"bytes"
-	"io/ioutil"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/SAP/jenkins-library/pkg/abaputils"
 	piperhttp "github.com/SAP/jenkins-library/pkg/http"
 	"github.com/SAP/jenkins-library/pkg/log"
-	"github.com/pkg/errors"
+
+	"golang.org/x/crypto/pkcs12"
 )
 
 // Connector : Connector Utility Wrapping http client
 type Connector struct {
-	Client         piperhttp.Sender
-	DownloadClient piperhttp.Downloader
-	Header         map[string][]string
-	Baseurl        string
+	Client          piperhttp.Sender
+	DownloadClient  piperhttp.Downloader
+	Header          map[string][]string
+	Baseurl         string
+	Parameters      url.Values
+	MaxRuntime      time.Duration // just as handover parameter for polling functions
+	PollingInterval time.Duration // just as handover parameter for polling functions
 }
 
 // ConnectorConfiguration : Handover Structure for Connector Creation
@@ -34,6 +46,8 @@ type ConnectorConfiguration struct {
 	Password            string
 	AddonDescriptor     string
 	MaxRuntimeInMinutes int
+	CertificateNames    []string
+	Parameters          url.Values
 }
 
 // HTTPSendLoader : combine both interfaces [sender, downloader]
@@ -46,45 +60,55 @@ type HTTPSendLoader interface {
 
 // GetToken : Get the X-CRSF Token from ABAP Backend for later post
 func (conn *Connector) GetToken(appendum string) error {
-	url := conn.Baseurl + appendum
+	url := conn.createUrl(appendum)
 	conn.Header["X-CSRF-Token"] = []string{"Fetch"}
 	response, err := conn.Client.SendRequest("HEAD", url, nil, conn.Header, nil)
 	if err != nil {
 		if response == nil {
-			return errors.Wrap(err, "Fetching X-CSRF-Token failed")
+			return fmt.Errorf("Fetching X-CSRF-Token failed: %w", err)
 		}
 		defer response.Body.Close()
-		errorbody, _ := ioutil.ReadAll(response.Body)
-		return errors.Wrapf(err, "Fetching X-CSRF-Token failed: %v", string(errorbody))
+		errorbody, _ := io.ReadAll(response.Body)
+		return fmt.Errorf("Fetching X-CSRF-Token failed: %v: %w", extractErrorStackFromJsonData(errorbody), err)
 
 	}
 	defer response.Body.Close()
 	token := response.Header.Get("X-CSRF-Token")
 	conn.Header["X-CSRF-Token"] = []string{token}
+	log.RegisterSecret(token)
+
+	for _, cookie := range response.Header.Values("Set-Cookie") {
+		if strings.HasPrefix(cookie, "SAP_SESSIONID_") || strings.HasPrefix(cookie, "sap-XSRF_") {
+			nameValuePair, _, _ := strings.Cut(cookie, "; ")
+			_, cookieValue, _ := strings.Cut(nameValuePair, "=")
+			log.RegisterSecret(cookieValue)
+		}
+	}
+
 	return nil
 }
 
 // Get : http get request
 func (conn Connector) Get(appendum string) ([]byte, error) {
-	url := conn.Baseurl + appendum
+	url := conn.createUrl(appendum)
 	response, err := conn.Client.SendRequest("GET", url, nil, conn.Header, nil)
 	if err != nil {
 		if response == nil || response.Body == nil {
-			return nil, errors.Wrap(err, "Get failed")
+			return nil, fmt.Errorf("Get failed: %w", err)
 		}
 		defer response.Body.Close()
-		errorbody, _ := ioutil.ReadAll(response.Body)
-		return errorbody, errors.Wrapf(err, "Get failed: %v", string(errorbody))
+		errorbody, _ := io.ReadAll(response.Body)
+		return errorbody, fmt.Errorf("Get failed: %v: %w", extractErrorStackFromJsonData(errorbody), err)
 
 	}
 	defer response.Body.Close()
-	body, err := ioutil.ReadAll(response.Body)
+	body, err := io.ReadAll(response.Body)
 	return body, err
 }
 
 // Post : http post request
 func (conn Connector) Post(appendum string, importBody string) ([]byte, error) {
-	url := conn.Baseurl + appendum
+	url := conn.createUrl(appendum)
 	var response *http.Response
 	var err error
 	if importBody == "" {
@@ -94,39 +118,117 @@ func (conn Connector) Post(appendum string, importBody string) ([]byte, error) {
 	}
 	if err != nil {
 		if response == nil {
-			return nil, errors.Wrap(err, "Post failed")
+			return nil, fmt.Errorf("Post failed: %w", err)
 		}
 		defer response.Body.Close()
-		errorbody, _ := ioutil.ReadAll(response.Body)
-		return errorbody, errors.Wrapf(err, "Post failed: %v", string(errorbody))
+		errorbody, _ := io.ReadAll(response.Body)
+		return errorbody, fmt.Errorf("Post failed: %v: %w", extractErrorStackFromJsonData(errorbody), err)
 
 	}
 	defer response.Body.Close()
-	body, err := ioutil.ReadAll(response.Body)
+	body, err := io.ReadAll(response.Body)
 	return body, err
 }
 
 // Download : download a file via http
 func (conn Connector) Download(appendum string, downloadPath string) error {
-	url := conn.Baseurl + appendum
+	url := conn.createUrl(appendum)
 	err := conn.DownloadClient.DownloadFile(url, downloadPath, nil, nil)
 	return err
 }
 
+// create url
+func (conn Connector) createUrl(appendum string) string {
+	myUrl := conn.Baseurl + appendum
+	if len(conn.Parameters) == 0 {
+		return myUrl
+	}
+	myUrl = myUrl + "?" + conn.Parameters.Encode()
+	return myUrl
+}
+
 // InitAAKaaS : initialize Connector for communication with AAKaaS backend
-func (conn *Connector) InitAAKaaS(aAKaaSEndpoint string, username string, password string, inputclient piperhttp.Sender) {
+func (conn *Connector) InitAAKaaS(aAKaaSEndpoint string, username string, password string, inputclient piperhttp.Sender, originHash string, certFile string, certPass string) error {
 	conn.Client = inputclient
 	conn.Header = make(map[string][]string)
 	conn.Header["Accept"] = []string{"application/json"}
 	conn.Header["Content-Type"] = []string{"application/json"}
+	conn.Header["User-Agent"] = []string{"Piper-abapAddonAssemblyKit/1.0"}
+	if originHash != "" {
+		conn.Header["build-config-token"] = []string{originHash}
+		log.Entry().Info("Origin info for restricted scenario added")
+	}
 
 	cookieJar, _ := cookiejar.New(nil)
-	conn.Client.SetOptions(piperhttp.ClientOptions{
-		Username:  username,
-		Password:  password,
-		CookieJar: cookieJar,
-	})
 	conn.Baseurl = aAKaaSEndpoint
+
+	tlsCertificates, err := conn.handleLogonCertificate(certFile, certPass)
+	if err != nil {
+		return fmt.Errorf("Handling certificates for client logon failed: %w", err)
+	}
+
+	conn.Client.SetOptions(piperhttp.ClientOptions{
+		Username:         username,
+		Password:         password,
+		CookieJar:        cookieJar,
+		Certificates:     tlsCertificates,
+		TransportTimeout: 15 * time.Minute, //Usually ABAP Backend has timeout of 10min, let them interrupt the connection...
+	})
+
+	if tlsCertificates != nil {
+		log.Entry().Info("Logon procedure: via Certificate")
+		return nil
+	} else if username == "" || password == "" {
+		return errors.New("username/password for AAKaaS must not be initial") //leads to redirect to login page which causes HTTP200 instead of HTTP401 and thus side effects
+	} else {
+		log.Entry().Info("Logon procedure: via Password")
+		return nil
+	}
+}
+
+func (conn *Connector) handleLogonCertificate(certFile, certPass string) ([]tls.Certificate, error) {
+	var tlsCertificate tls.Certificate
+	if certFile != "" && certPass != "" {
+		certFileInBytes, err := base64.StdEncoding.DecodeString(certFile)
+		if err != nil {
+			return nil, fmt.Errorf("Base64 decoding of certificate File string failed: %w", err)
+		}
+
+		pemBlocks, err := pkcs12.ToPEM(certFileInBytes, certPass)
+		if err != nil {
+			return nil, fmt.Errorf("Decoding certificate File from PKCS12 to PEM failed: %w", err)
+		}
+
+		var key []byte
+		var userCertificate []byte
+
+		for _, pemBlock := range pemBlocks {
+			if pemBlock.Type == "PRIVATE KEY" {
+				key = pem.EncodeToMemory(pemBlock)
+			}
+
+			if pemBlock.Type == "CERTIFICATE" {
+				var tempCert, err = x509.ParseCertificate(pemBlock.Bytes)
+				if err != nil {
+					return nil, fmt.Errorf("Parsing x509 Certificate from PEM Block failed: %w", err)
+				}
+
+				if tempCert.IsCA == false { //We ignore the 2 additional CA Certificates
+					userCertificate = pem.EncodeToMemory(pemBlock)
+				}
+			}
+		}
+
+		tlsCertificate, err = tls.X509KeyPair(userCertificate, key)
+		if err != nil {
+			return nil, fmt.Errorf("Creating x509 Key Pair failed: %w", err)
+		}
+
+		return []tls.Certificate{tlsCertificate}, nil
+
+	} else {
+		return nil, nil
+	}
 }
 
 // InitBuildFramework : initialize Connector for communication with ABAP SCP instance
@@ -139,20 +241,20 @@ func (conn *Connector) InitBuildFramework(config ConnectorConfiguration, com aba
 	conn.DownloadClient = inputclient
 	conn.DownloadClient.SetOptions(piperhttp.ClientOptions{TransportTimeout: 20 * time.Second})
 	// Mapping for options
-	subOptions := abaputils.AbapEnvironmentOptions{}
-	subOptions.CfAPIEndpoint = config.CfAPIEndpoint
-	subOptions.CfServiceInstance = config.CfServiceInstance
-	subOptions.CfServiceKeyName = config.CfServiceKeyName
-	subOptions.CfOrg = config.CfOrg
-	subOptions.CfSpace = config.CfSpace
-	subOptions.Host = config.Host
-	subOptions.Password = config.Password
-	subOptions.Username = config.Username
+	subOptions := abaputils.AbapEnvironmentOptions{
+		CfAPIEndpoint:     config.CfAPIEndpoint,
+		CfServiceInstance: config.CfServiceInstance,
+		CfServiceKeyName:  config.CfServiceKeyName,
+		CfOrg:             config.CfOrg,
+		CfSpace:           config.CfSpace,
+		Host:              config.Host,
+		Password:          config.Password,
+		Username:          config.Username}
 
 	// Determine the host, user and password, either via the input parameters or via a cloud foundry service key
 	connectionDetails, err := com.GetAbapCommunicationArrangementInfo(subOptions, "/sap/opu/odata/BUILD/CORE_SRV")
 	if err != nil {
-		return errors.Wrap(err, "Parameters for the ABAP Connection not available")
+		return fmt.Errorf("Parameters for the ABAP Connection not available: %w", err)
 	}
 
 	conn.DownloadClient.SetOptions(piperhttp.ClientOptions{
@@ -161,23 +263,25 @@ func (conn *Connector) InitBuildFramework(config ConnectorConfiguration, com aba
 	})
 	cookieJar, _ := cookiejar.New(nil)
 	conn.Client.SetOptions(piperhttp.ClientOptions{
-		Username:  connectionDetails.User,
-		Password:  connectionDetails.Password,
-		CookieJar: cookieJar,
+		Username:     connectionDetails.User,
+		Password:     connectionDetails.Password,
+		CookieJar:    cookieJar,
+		TrustedCerts: config.CertificateNames,
 	})
 	conn.Baseurl = connectionDetails.URL
+	conn.Parameters = config.Parameters
 
 	return nil
 }
 
 // UploadSarFile : upload *.sar file
 func (conn Connector) UploadSarFile(appendum string, sarFile []byte) error {
-	url := conn.Baseurl + appendum
+	url := conn.createUrl(appendum)
 	response, err := conn.Client.SendRequest("PUT", url, bytes.NewBuffer(sarFile), conn.Header, nil)
 	if err != nil {
 		defer response.Body.Close()
-		errorbody, _ := ioutil.ReadAll(response.Body)
-		return errors.Wrapf(err, "Upload of SAR file failed: %v", string(errorbody))
+		errorbody, _ := io.ReadAll(response.Body)
+		return fmt.Errorf("Upload of SAR file failed: %v: %w", extractErrorStackFromJsonData(errorbody), err)
 	}
 	defer response.Body.Close()
 	return nil
@@ -188,7 +292,7 @@ func (conn Connector) UploadSarFileInChunks(appendum string, fileName string, sa
 	//Maybe Next Refactoring step to read the file in chunks, too?
 	//In case it turns out to be not reliable add a retry mechanism
 
-	url := conn.Baseurl + appendum
+	url := conn.createUrl(appendum)
 
 	header := make(map[string][]string)
 	header["Content-Disposition"] = []string{"form-data; name=\"file\"; filename=\"" + fileName + "\""}
@@ -210,9 +314,13 @@ func (conn Connector) UploadSarFileInChunks(appendum string, fileName string, sa
 
 		response, err := conn.Client.SendRequest("POST", url, nextChunk, header, nil)
 		if err != nil {
-			errorbody, _ := ioutil.ReadAll(response.Body)
-			response.Body.Close()
-			return errors.Wrapf(err, "Upload of SAR file failed: %v", string(errorbody))
+			if response != nil && response.Body != nil {
+				errorbody, _ := io.ReadAll(response.Body)
+				response.Body.Close()
+				return fmt.Errorf("Upload of SAR file failed: %v: %w", extractErrorStackFromJsonData(errorbody), err)
+			} else {
+				return err
+			}
 		}
 
 		response.Body.Close()

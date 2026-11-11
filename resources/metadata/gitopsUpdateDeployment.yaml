@@ -6,10 +6,11 @@ metadata:
 
     It can for example be used for GitOps scenarios where the update of the manifests triggers an update of the corresponding deployment in Kubernetes.
 
-    As of today, it supports the update of deployment yaml files via kubectl patch and update a whole helm template.
-    For kubectl the container inside the yaml must be described within the following hierarchy: `{"spec":{"template":{"spec":{"containers":[{...}]}}}}`
-    For helm the whole template is generated into a file and uploaded into the repository.
+    As of today, it supports the update of deployment yaml files via kubectl patch, update a whole helm template and kustomize.
 
+    For *kubectl* the container inside the yaml must be described within the following hierarchy: `{"spec":{"template":{"spec":{"containers":[{...}]}}}}`
+    For *helm* the whole template is generated into a single file (`filePath`) and uploaded into the repository.
+    For *kustomize* the `images` section will be update with the current image.
 
 spec:
   inputs:
@@ -50,6 +51,24 @@ spec:
         type: string
         default: https://github.com
         mandatory: true
+      - name: forcePush
+        type: bool
+        description: Force push to serverUrl
+        longDescription: |
+          To bypass branch-protections the git push command can be forced.
+
+          Example:
+          ```yaml
+          steps:
+            gitopsUpdateDeployment:
+              forcePush: true
+          ```
+        scope:
+          - PARAMETERS
+          - STAGES
+          - STEPS
+        mandatory: false
+        default: false
       - name: username
         type: string
         description: User name for git authentication
@@ -57,27 +76,41 @@ spec:
           - PARAMETERS
           - STAGES
           - STEPS
-        mandatory: true
+        mandatory: false
         secret: true
         resourceRef:
           - name: gitHttpsCredentialsId
             type: secret
             param: username
+          - type: vaultSecret
+            name: gitHttpsCredentialVaultSecretName
+            default: gitHttpsCredential
       - name: password
         type: string
-        description: Password/token for git authentication.
+        description: Password/token for git authentication. On GitHub Actions the `GITHUB_TOKEN` environment variable is used when no other source provides a token.
         scope:
           - PARAMETERS
           - STAGES
           - STEPS
-        mandatory: true
+        mandatory: false
         secret: true
         resourceRef:
           - name: gitHttpsCredentialsId
             type: secret
             param: password
+          - type: systemTrustSecret
+            name: gitSystemTrustSecretName
+            default: github-app
+          - type: vaultSecret
+            name: gitHttpsCredentialVaultSecretName
+            default: gitHttpsCredential
       - name: filePath
-        description: Relative path in the git repository to the deployment descriptor file that shall be updated
+        description: |
+          Relative path in the git repository to the deployment descriptor file that shall be updated. For different tools this has different semantics:
+
+           * `kubectl` - path to the `deployment.yaml` that should be patched. Supports globbing.
+           * `helm` - path where the helm chart will be generated into. Here no globbing is supported.
+           * `kustomize` - path to the `kustomization.yaml`. Supports globbing.
         scope:
           - PARAMETERS
           - STAGES
@@ -124,7 +157,7 @@ spec:
         aliases:
           - name: helmChartPath
         type: string
-        description: Defines the chart path for deployments using helm.
+        description: Defines the chart path for deployments using helm. Globbing is supported to merge multiple charts into one resource.yaml that will be commited.
         scope:
           - PARAMETERS
           - STAGES
@@ -140,7 +173,7 @@ spec:
         aliases:
           - name: helmDeploymentName
         type: string
-        description: Defines the name of the deployment.
+        description: Defines the name of the deployment. In case of `kustomize` this is the name or alias of the image in the `kustomization.yaml`
         scope:
           - PARAMETERS
           - STAGES
@@ -158,8 +191,32 @@ spec:
         possibleValues:
           - kubectl
           - helm
+          - kustomize
+      - name: customTlsCertificateLinks
+        type: "[]string"
+        description: List containing download links of custom TLS certificates. This is required to ensure trusted connections to registries with custom certificates.
+        scope:
+          - PARAMETERS
+          - STAGES
+          - STEPS
+      - name: customPatchStringWithVersion
+        type: string
+        description: 'Custom patch string with version to be applied to the deployment configuration using `kubectl` only, for example `{"spec":{"semver":"{{.Version}}"}}`. The Go template `{{.Version}}` will be replaced with the unique version Piper generates during the pipeline run.'
+        scope:
+          - PARAMETERS
+          - STAGES
+          - STEPS
+      - name: artifactVersion
+        description: "The version assigned by artifactPrepareVersion to the uploaded artifact"
+        type: string
+        resourceRef:
+          - name: commonPipelineEnvironment
+            param: artifactVersion
+        scope:
+          - PARAMETERS
+          - STEPS
   containers:
-    - image: dtzar/helm-kubectl:3.3.4
+    - image: docker.io/dtzar/helm-kubectl:3.18.1
       workingDir: /config
       options:
         - name: -u
@@ -169,7 +226,7 @@ spec:
           params:
             - name: tool
               value: helm
-    - image: dtzar/helm-kubectl:2.12.1
+    - image: docker.io/dtzar/helm-kubectl:3.18.1
       workingDir: /config
       options:
         - name: -u
@@ -179,3 +236,13 @@ spec:
           params:
             - name: tool
               value: kubectl
+    - image: docker.io/alpine/k8s:1.33.13
+      workingDir: /config
+      options:
+        - name: -u
+          value: "0"
+      conditions:
+        - conditionRef: strings-equal
+          params:
+            - name: tool
+              value: kustomize

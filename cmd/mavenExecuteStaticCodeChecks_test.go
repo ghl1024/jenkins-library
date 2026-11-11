@@ -1,3 +1,6 @@
+//go:build unit
+// +build unit
+
 package cmd
 
 import (
@@ -6,9 +9,9 @@ import (
 	"os"
 	"testing"
 
+	"github.com/SAP/jenkins-library/pkg/maven"
 	"github.com/SAP/jenkins-library/pkg/mock"
 
-	"github.com/SAP/jenkins-library/pkg/maven"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -38,7 +41,7 @@ func TestRunMavenStaticCodeChecks(t *testing.T) {
 				"-Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn",
 				"--batch-mode",
 				"com.github.spotbugs:spotbugs-maven-plugin:4.1.4:check",
-				"org.apache.maven.plugins:maven-pmd-plugin:3.13.0:check",
+				"org.apache.maven.plugins:maven-pmd-plugin:3.14.0:check",
 			},
 		}
 
@@ -46,8 +49,8 @@ func TestRunMavenStaticCodeChecks(t *testing.T) {
 		if err != nil {
 			t.Fatal("Could not get current working directory")
 		}
-		defer os.Chdir(currentDir)
-		os.Chdir("../test/resources/maven/")
+		defer func() { _ = os.Chdir(currentDir) }()
+		_ = os.Chdir("../test/resources/maven/")
 
 		err = runMavenStaticCodeChecks(&config, nil, utils)
 
@@ -74,7 +77,7 @@ func TestGetPmdMavenParameters(t *testing.T) {
 			PmdMaxAllowedViolations: 5,
 		}
 		expected := maven.ExecuteOptions{
-			Goals:   []string{"org.apache.maven.plugins:maven-pmd-plugin:3.13.0:check"},
+			Goals:   []string{"org.apache.maven.plugins:maven-pmd-plugin:3.14.0:check"},
 			Defines: []string{"-Dpmd.maxAllowedViolations=5", "-Dpmd.failurePriority=2"},
 		}
 
@@ -87,7 +90,7 @@ func TestGetPmdMavenParameters(t *testing.T) {
 			PmdMaxAllowedViolations: 5,
 		}
 		expected := maven.ExecuteOptions{
-			Goals:   []string{"org.apache.maven.plugins:maven-pmd-plugin:3.13.0:check"},
+			Goals:   []string{"org.apache.maven.plugins:maven-pmd-plugin:3.14.0:check"},
 			Defines: []string{"-Dpmd.maxAllowedViolations=5"},
 		}
 
@@ -96,7 +99,7 @@ func TestGetPmdMavenParameters(t *testing.T) {
 	t.Run("should return maven goal only", func(t *testing.T) {
 		config := mavenExecuteStaticCodeChecksOptions{}
 		expected := maven.ExecuteOptions{
-			Goals: []string{"org.apache.maven.plugins:maven-pmd-plugin:3.13.0:check"}}
+			Goals: []string{"org.apache.maven.plugins:maven-pmd-plugin:3.14.0:check"}}
 
 		assert.Equal(t, &expected, getPmdMavenParameters(&config))
 	})

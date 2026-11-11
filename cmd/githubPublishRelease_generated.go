@@ -8,8 +8,12 @@ import (
 	"time"
 
 	"github.com/SAP/jenkins-library/pkg/config"
+	"github.com/SAP/jenkins-library/pkg/eventing"
 	"github.com/SAP/jenkins-library/pkg/log"
+	"github.com/SAP/jenkins-library/pkg/splunk"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
+	"github.com/SAP/jenkins-library/pkg/validation"
+
 	"github.com/spf13/cobra"
 )
 
@@ -17,7 +21,9 @@ type githubPublishReleaseOptions struct {
 	AddClosedIssues       bool     `json:"addClosedIssues,omitempty"`
 	AddDeltaToLastRelease bool     `json:"addDeltaToLastRelease,omitempty"`
 	APIURL                string   `json:"apiUrl,omitempty"`
+	GithubAPITimeout      int      `json:"githubApiTimeout,omitempty"`
 	AssetPath             string   `json:"assetPath,omitempty"`
+	AssetPathList         []string `json:"assetPathList,omitempty"`
 	Commitish             string   `json:"commitish,omitempty"`
 	ExcludeLabels         []string `json:"excludeLabels,omitempty"`
 	Labels                []string `json:"labels,omitempty"`
@@ -26,9 +32,11 @@ type githubPublishReleaseOptions struct {
 	ReleaseBodyHeader     string   `json:"releaseBodyHeader,omitempty"`
 	Repository            string   `json:"repository,omitempty"`
 	ServerURL             string   `json:"serverUrl,omitempty"`
+	TagPrefix             string   `json:"tagPrefix,omitempty"`
 	Token                 string   `json:"token,omitempty"`
 	UploadURL             string   `json:"uploadUrl,omitempty"`
 	Version               string   `json:"version,omitempty"`
+	AutoDetectPreRelease  bool     `json:"autoDetectPreRelease,omitempty"`
 }
 
 // GithubPublishReleaseCommand Publish a release in GitHub
@@ -38,6 +46,9 @@ func GithubPublishReleaseCommand() *cobra.Command {
 	metadata := githubPublishReleaseMetadata()
 	var stepConfig githubPublishReleaseOptions
 	var startTime time.Time
+	var logCollector *log.CollectorHook
+	var splunkClient *splunk.Splunk
+	telemetryClient := &telemetry.Telemetry{}
 
 	var createGithubPublishReleaseCmd = &cobra.Command{
 		Use:   STEP_NAME,
@@ -57,15 +68,31 @@ The result looks like
 			log.SetStepName(STEP_NAME)
 			log.SetVerbose(GeneralConfig.Verbose)
 
-			path, _ := os.Getwd()
+			GeneralConfig.GitHubAccessTokens = ResolveAccessTokens(GeneralConfig.GitHubTokens)
+
+			path, err := os.Getwd()
+			if err != nil {
+				return err
+			}
 			fatalHook := &log.FatalHook{CorrelationID: GeneralConfig.CorrelationID, Path: path}
 			log.RegisterHook(fatalHook)
 
-			err := PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
+			err = PrepareConfig(cmd, &metadata, STEP_NAME, &stepConfig, config.OpenPiperFile)
 			if err != nil {
 				log.SetErrorCategory(log.ErrorConfiguration)
 				return err
 			}
+
+			// Set step error patterns for improved error detection
+			stepErrors := make([]log.StepError, len(metadata.Metadata.Errors))
+			for i, err := range metadata.Metadata.Errors {
+				stepErrors[i] = log.StepError{
+					Pattern:  err.Pattern,
+					Message:  err.Message,
+					Category: err.Category,
+				}
+			}
+			log.SetStepErrors(stepErrors)
 			log.RegisterSecret(stepConfig.Token)
 
 			if len(GeneralConfig.HookConfig.SentryConfig.Dsn) > 0 {
@@ -73,22 +100,81 @@ The result looks like
 				log.RegisterHook(&sentryHook)
 			}
 
+			if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 || len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+				splunkClient = &splunk.Splunk{}
+				logCollector = &log.CollectorHook{CorrelationID: GeneralConfig.CorrelationID}
+				log.RegisterHook(logCollector)
+			}
+
+			if err = log.RegisterANSHookIfConfigured(GeneralConfig.CorrelationID); err != nil {
+				log.Entry().WithError(err).Warn("failed to set up SAP Alert Notification Service log hook")
+			}
+
+			validation, err := validation.New(validation.WithJSONNamesForStructFields(), validation.WithPredefinedErrorMessages())
+			if err != nil {
+				return err
+			}
+			if err = validation.ValidateStruct(stepConfig); err != nil {
+				log.SetErrorCategory(log.ErrorConfiguration)
+				return err
+			}
+
 			return nil
 		},
 		Run: func(_ *cobra.Command, _ []string) {
-			telemetryData := telemetry.CustomData{}
-			telemetryData.ErrorCode = "1"
+			vaultClient := config.GlobalVaultClient()
+			var oidcTokenProvider func(string) (string, error)
+			if vaultClient != nil {
+				defer vaultClient.MustRevokeToken()
+				oidcTokenProvider = vaultClient.GetOIDCTokenByValidation
+			}
+
+			stepTelemetryData := telemetry.CustomData{
+				ErrorCode: "1",
+			}
 			handler := func() {
 				config.RemoveVaultSecretFiles()
-				telemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
-				telemetryData.ErrorCategory = log.GetErrorCategory().String()
-				telemetry.Send(&telemetryData)
+				stepTelemetryData.Duration = fmt.Sprintf("%v", time.Since(startTime).Milliseconds())
+				stepTelemetryData.ErrorCategory = log.GetErrorCategory().String()
+				stepTelemetryData.PiperCommitHash = GitCommit
+				telemetryClient.SetData(&stepTelemetryData)
+				telemetryClient.LogStepTelemetryData()
+				if len(GeneralConfig.HookConfig.SplunkConfig.Dsn) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.Dsn,
+						GeneralConfig.HookConfig.SplunkConfig.Token,
+						GeneralConfig.HookConfig.SplunkConfig.Index,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint) > 0 {
+					splunkClient.Initialize(GeneralConfig.CorrelationID,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblEndpoint,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblToken,
+						GeneralConfig.HookConfig.SplunkConfig.ProdCriblIndex,
+						GeneralConfig.HookConfig.SplunkConfig.SendLogs)
+					splunkClient.Send(telemetryClient.GetData(), logCollector)
+				}
+				if len(GeneralConfig.HookConfig.GCPPubSubConfig.ProjectNumber) > 0 {
+					if err := eventing.PublishTaskRunFinishedEvent(
+						oidcTokenProvider,
+						&GeneralConfig,
+						eventing.EventContext{
+							StepName:   STEP_NAME,
+							StageName:  telemetryClient.GetData().StageName,
+							ErrorCode:  stepTelemetryData.ErrorCode,
+							PipelineID: telemetryClient.GetBuildURL(),
+						},
+					); err != nil {
+						log.Entry().WithError(err).Warn("failed to publish GCP Pub/Sub event")
+					}
+				}
 			}
 			log.DeferExitHandler(handler)
 			defer handler()
-			telemetry.Initialize(GeneralConfig.NoTelemetry, STEP_NAME)
-			githubPublishRelease(stepConfig, &telemetryData)
-			telemetryData.ErrorCode = "0"
+			telemetryClient.Initialize(STEP_NAME)
+			githubPublishRelease(stepConfig, &stepTelemetryData)
+			stepTelemetryData.ErrorCode = "0"
 			log.Entry().Info("SUCCESS")
 		},
 	}
@@ -101,7 +187,9 @@ func addGithubPublishReleaseFlags(cmd *cobra.Command, stepConfig *githubPublishR
 	cmd.Flags().BoolVar(&stepConfig.AddClosedIssues, "addClosedIssues", false, "If set to `true`, closed issues and merged pull-requests since the last release will added below the `releaseBodyHeader`")
 	cmd.Flags().BoolVar(&stepConfig.AddDeltaToLastRelease, "addDeltaToLastRelease", false, "If set to `true`, a link will be added to the release information that brings up all commits since the last release.")
 	cmd.Flags().StringVar(&stepConfig.APIURL, "apiUrl", `https://api.github.com`, "Set the GitHub API url.")
+	cmd.Flags().IntVar(&stepConfig.GithubAPITimeout, "githubApiTimeout", 30, "Set HTTP timeout for GitHub API calls (in seconds)")
 	cmd.Flags().StringVar(&stepConfig.AssetPath, "assetPath", os.Getenv("PIPER_assetPath"), "Path to a release asset which should be uploaded to the list of release assets.")
+	cmd.Flags().StringSliceVar(&stepConfig.AssetPathList, "assetPathList", []string{}, "List of paths to a release asset which should be uploaded to the list of release assets.")
 	cmd.Flags().StringVar(&stepConfig.Commitish, "commitish", `master`, "Target git commitish for the release")
 	cmd.Flags().StringSliceVar(&stepConfig.ExcludeLabels, "excludeLabels", []string{}, "Allows to exclude issues with dedicated list of labels.")
 	cmd.Flags().StringSliceVar(&stepConfig.Labels, "labels", []string{}, "Labels to include in issue search.")
@@ -110,15 +198,16 @@ func addGithubPublishReleaseFlags(cmd *cobra.Command, stepConfig *githubPublishR
 	cmd.Flags().StringVar(&stepConfig.ReleaseBodyHeader, "releaseBodyHeader", os.Getenv("PIPER_releaseBodyHeader"), "Content which will appear for the release.")
 	cmd.Flags().StringVar(&stepConfig.Repository, "repository", os.Getenv("PIPER_repository"), "Name of the GitHub repository.")
 	cmd.Flags().StringVar(&stepConfig.ServerURL, "serverUrl", `https://github.com`, "GitHub server url for end-user access.")
-	cmd.Flags().StringVar(&stepConfig.Token, "token", os.Getenv("PIPER_token"), "GitHub personal access token as per https://help.github.com/en/github/authenticating-to-github/creating-a-personal-access-token-for-the-command-line")
+	cmd.Flags().StringVar(&stepConfig.TagPrefix, "tagPrefix", ``, "Defines a prefix to be added to the tag.")
+	cmd.Flags().StringVar(&stepConfig.Token, "token", os.Getenv("PIPER_token"), "GitHub personal access token as per https://help.github.com/en/github/authenticating-to-github/creating-a-personal-access-token-for-the-command-line. On GitHub Actions the `GITHUB_TOKEN` environment variable is used when no other source provides a token.")
 	cmd.Flags().StringVar(&stepConfig.UploadURL, "uploadUrl", `https://uploads.github.com`, "Set the GitHub API url.")
 	cmd.Flags().StringVar(&stepConfig.Version, "version", os.Getenv("PIPER_version"), "Define the version number which will be written as tag as well as release name.")
+	cmd.Flags().BoolVar(&stepConfig.AutoDetectPreRelease, "autoDetectPreRelease", false, "If set to `true`, the pre-release flag will be determined automatically from the version per SemVer (versions with a hyphenated pre-release like `1.2.3-beta` are marked as pre-releases). Build metadata (`+...`) is ignored.")
 
 	cmd.MarkFlagRequired("apiUrl")
 	cmd.MarkFlagRequired("owner")
 	cmd.MarkFlagRequired("repository")
 	cmd.MarkFlagRequired("serverUrl")
-	cmd.MarkFlagRequired("token")
 	cmd.MarkFlagRequired("uploadUrl")
 	cmd.MarkFlagRequired("version")
 }
@@ -133,6 +222,9 @@ func githubPublishReleaseMetadata() config.StepData {
 		},
 		Spec: config.StepSpec{
 			Inputs: config.StepInputs{
+				Secrets: []config.StepSecrets{
+					{Name: "githubTokenCredentialsId", Description: "Jenkins 'Secret text' credentials ID containing token to authenticate to GitHub.", Type: "jenkins"},
+				},
 				Parameters: []config.StepParameters{
 					{
 						Name:        "addClosedIssues",
@@ -141,6 +233,7 @@ func githubPublishReleaseMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     false,
 					},
 					{
 						Name:        "addDeltaToLastRelease",
@@ -149,6 +242,7 @@ func githubPublishReleaseMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     false,
 					},
 					{
 						Name:        "apiUrl",
@@ -157,6 +251,16 @@ func githubPublishReleaseMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   true,
 						Aliases:     []config.Alias{{Name: "githubApiUrl"}},
+						Default:     `https://api.github.com`,
+					},
+					{
+						Name:        "githubApiTimeout",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"GENERAL", "PARAMETERS", "STAGES", "STEPS"},
+						Type:        "int",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     30,
 					},
 					{
 						Name:        "assetPath",
@@ -165,14 +269,30 @@ func githubPublishReleaseMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_assetPath"),
 					},
 					{
-						Name:        "commitish",
+						Name:        "assetPathList",
 						ResourceRef: []config.ResourceReference{},
 						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
-						Type:        "string",
+						Type:        "[]string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     []string{},
+					},
+					{
+						Name: "commitish",
+						ResourceRef: []config.ResourceReference{
+							{
+								Name:  "commonPipelineEnvironment",
+								Param: "git/headCommitId",
+							},
+						},
+						Scope:     []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:      "string",
+						Mandatory: false,
+						Aliases:   []config.Alias{},
+						Default:   `master`,
 					},
 					{
 						Name:        "excludeLabels",
@@ -181,6 +301,7 @@ func githubPublishReleaseMetadata() config.StepData {
 						Type:        "[]string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     []string{},
 					},
 					{
 						Name:        "labels",
@@ -189,6 +310,7 @@ func githubPublishReleaseMetadata() config.StepData {
 						Type:        "[]string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     []string{},
 					},
 					{
 						Name: "owner",
@@ -198,10 +320,11 @@ func githubPublishReleaseMetadata() config.StepData {
 								Param: "github/owner",
 							},
 						},
-						Scope:     []string{"PARAMETERS", "STAGES", "STEPS"},
+						Scope:     []string{"GENERAL", "PARAMETERS", "STAGES", "STEPS"},
 						Type:      "string",
 						Mandatory: true,
 						Aliases:   []config.Alias{{Name: "githubOrg"}},
+						Default:   os.Getenv("PIPER_owner"),
 					},
 					{
 						Name:        "preRelease",
@@ -210,6 +333,7 @@ func githubPublishReleaseMetadata() config.StepData {
 						Type:        "bool",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     false,
 					},
 					{
 						Name:        "releaseBodyHeader",
@@ -218,6 +342,7 @@ func githubPublishReleaseMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   false,
 						Aliases:     []config.Alias{},
+						Default:     os.Getenv("PIPER_releaseBodyHeader"),
 					},
 					{
 						Name: "repository",
@@ -227,10 +352,11 @@ func githubPublishReleaseMetadata() config.StepData {
 								Param: "github/repository",
 							},
 						},
-						Scope:     []string{"PARAMETERS", "STAGES", "STEPS"},
+						Scope:     []string{"GENERAL", "PARAMETERS", "STAGES", "STEPS"},
 						Type:      "string",
 						Mandatory: true,
 						Aliases:   []config.Alias{{Name: "githubRepo"}},
+						Default:   os.Getenv("PIPER_repository"),
 					},
 					{
 						Name:        "serverUrl",
@@ -239,6 +365,16 @@ func githubPublishReleaseMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   true,
 						Aliases:     []config.Alias{{Name: "githubServerUrl"}},
+						Default:     `https://github.com`,
+					},
+					{
+						Name:        "tagPrefix",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:        "string",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     ``,
 					},
 					{
 						Name: "token",
@@ -249,15 +385,22 @@ func githubPublishReleaseMetadata() config.StepData {
 							},
 
 							{
-								Name:  "",
-								Paths: []string{"$(vaultPath)/github", "$(vaultBasePath)/$(vaultPipelineName)/github", "$(vaultBasePath)/GROUP-SECRETS/github"},
-								Type:  "vaultSecret",
+								Name:    "githubVaultSecretName",
+								Type:    "vaultSecret",
+								Default: "github",
+							},
+
+							{
+								Name:    "githubSystemTrustSecretName",
+								Type:    "systemTrustSecret",
+								Default: "github-app",
 							},
 						},
 						Scope:     []string{"GENERAL", "PARAMETERS", "STAGES", "STEPS"},
 						Type:      "string",
-						Mandatory: true,
+						Mandatory: false,
 						Aliases:   []config.Alias{{Name: "githubToken"}, {Name: "access_token"}},
+						Default:   os.Getenv("PIPER_token"),
 					},
 					{
 						Name:        "uploadUrl",
@@ -266,6 +409,7 @@ func githubPublishReleaseMetadata() config.StepData {
 						Type:        "string",
 						Mandatory:   true,
 						Aliases:     []config.Alias{{Name: "githubUploadUrl"}},
+						Default:     `https://uploads.github.com`,
 					},
 					{
 						Name: "version",
@@ -279,6 +423,16 @@ func githubPublishReleaseMetadata() config.StepData {
 						Type:      "string",
 						Mandatory: true,
 						Aliases:   []config.Alias{},
+						Default:   os.Getenv("PIPER_version"),
+					},
+					{
+						Name:        "autoDetectPreRelease",
+						ResourceRef: []config.ResourceReference{},
+						Scope:       []string{"PARAMETERS", "STAGES", "STEPS"},
+						Type:        "bool",
+						Mandatory:   false,
+						Aliases:     []config.Alias{},
+						Default:     false,
 					},
 				},
 			},

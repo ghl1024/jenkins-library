@@ -1,17 +1,24 @@
+//go:build unit
+// +build unit
+
 package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/SAP/jenkins-library/pkg/abaputils"
-	"github.com/pkg/errors"
+
 	"github.com/stretchr/testify/assert"
 )
 
 func TestCreateTargetVectorStep(t *testing.T) {
 	//setup
-	config := abapAddonAssemblyKitCreateTargetVectorOptions{}
+	config := abapAddonAssemblyKitCreateTargetVectorOptions{
+		Username: "dummy",
+		Password: "dummy",
+	}
 	addonDescriptor := abaputils.AddonDescriptor{
 		AddonProduct:    "dummy",
 		AddonVersion:    "dummy",
@@ -39,12 +46,13 @@ func TestCreateTargetVectorStep(t *testing.T) {
 
 	t.Run("step success test", func(t *testing.T) {
 		//act
-		err := runAbapAddonAssemblyKitCreateTargetVector(&config, nil, client, &cpe)
+		err := runAbapAddonAssemblyKitCreateTargetVector(&config, client, &cpe)
 		//assert
 		assert.NoError(t, err, "Did not expect error")
 
 		resultAddonDescriptor := abaputils.AddonDescriptor{}
-		json.Unmarshal([]byte(cpe.abap.addonDescriptor), &resultAddonDescriptor)
+		err = json.Unmarshal([]byte(cpe.abap.addonDescriptor), &resultAddonDescriptor)
+		assert.NoError(t, err)
 		assert.Equal(t, "W7Q00207512600000262", resultAddonDescriptor.TargetVectorID)
 	})
 
@@ -55,7 +63,7 @@ func TestCreateTargetVectorStep(t *testing.T) {
 			Error: errors.New("dummy"),
 		}
 		//act
-		err := runAbapAddonAssemblyKitCreateTargetVector(&config, nil, client, &cpe)
+		err := runAbapAddonAssemblyKitCreateTargetVector(&config, client, &cpe)
 		//assert
 		assert.Error(t, err, "Must end with error")
 	})
@@ -70,7 +78,7 @@ func TestCreateTargetVectorStep(t *testing.T) {
 		adoDesc, _ := json.Marshal(addonDescriptor)
 		config.AddonDescriptor = string(adoDesc)
 		//act
-		err := runAbapAddonAssemblyKitCreateTargetVector(&config, nil, client, &cpe)
+		err := runAbapAddonAssemblyKitCreateTargetVector(&config, client, &cpe)
 		//assert
 		assert.Error(t, err, "Must end with error")
 	})
@@ -97,7 +105,7 @@ func TestCreateTargetVectorStep(t *testing.T) {
 		adoDesc, _ := json.Marshal(addonDescriptor)
 		config.AddonDescriptor = string(adoDesc)
 		//act
-		err := runAbapAddonAssemblyKitCreateTargetVector(&config, nil, client, &cpe)
+		err := runAbapAddonAssemblyKitCreateTargetVector(&config, client, &cpe)
 		//assert
 		assert.Error(t, err, "Must end with error")
 	})

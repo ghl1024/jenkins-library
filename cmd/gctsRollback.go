@@ -1,16 +1,19 @@
 package cmd
 
 import (
-	"io/ioutil"
+	"errors"
+	"fmt"
+	"io"
 	"net/http/cookiejar"
 	"net/url"
 
-	"github.com/Jeffail/gabs/v2"
 	"github.com/SAP/jenkins-library/pkg/command"
+	"github.com/SAP/jenkins-library/pkg/gcts"
 	piperhttp "github.com/SAP/jenkins-library/pkg/http"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/telemetry"
-	"github.com/pkg/errors"
+
+	"github.com/Jeffail/gabs/v2"
 )
 
 func gctsRollback(config gctsRollbackOptions, telemetryData *telemetry.CustomData) {
@@ -34,29 +37,23 @@ func gctsRollback(config gctsRollbackOptions, telemetryData *telemetry.CustomDat
 
 func rollback(config *gctsRollbackOptions, telemetryData *telemetry.CustomData, command command.ExecRunner, httpClient piperhttp.Sender) error {
 
-	cookieJar, cookieErr := cookiejar.New(nil)
-	if cookieErr != nil {
-		return cookieErr
-	}
-	clientOptions := piperhttp.ClientOptions{
-		CookieJar: cookieJar,
-		Username:  config.Username,
-		Password:  config.Password,
+	clientOptions, err := gcts.NewHttpClientOptions(config.Username, config.Password, config.Proxy, config.SkipSSLVerification)
+	if err != nil {
+		return err
 	}
 	httpClient.SetOptions(clientOptions)
 
 	repoInfo, err := getRepoInfo(config, telemetryData, httpClient)
 	if err != nil {
-		return errors.Wrap(err, "could not get local repository data")
+		return fmt.Errorf("could not get local repository data: %w", err)
 	}
 
 	if repoInfo.Result.URL == "" {
-		return errors.Errorf("no remote repository URL configured")
+		return fmt.Errorf("no remote repository URL configured")
 	}
 
-	parsedURL, err := url.Parse(repoInfo.Result.URL)
 	if err != nil {
-		return errors.Wrap(err, "could not parse remote repository URL as valid URL")
+		return fmt.Errorf("could not parse remote repository URL as valid URL: %w", err)
 	}
 
 	var deployOptions gctsDeployOptions
@@ -65,62 +62,42 @@ func rollback(config *gctsRollbackOptions, telemetryData *telemetry.CustomData, 
 		log.Entry().Infof("rolling back to specified commit %v", config.Commit)
 
 		deployOptions = gctsDeployOptions{
-			Username:   config.Username,
-			Password:   config.Password,
-			Host:       config.Host,
-			Repository: config.Repository,
-			Client:     config.Client,
-			Commit:     config.Commit,
-		}
-
-	} else if parsedURL.Host == "github.com" {
-		log.Entry().Info("Remote repository domain is 'github.com'. Trying to rollback to last commit with status 'success'.")
-
-		commitList, err := getCommits(config, telemetryData, httpClient)
-		if err != nil {
-			return errors.Wrap(err, "could not get repository commits")
-		}
-
-		successCommit, err := getLastSuccessfullCommit(config, telemetryData, httpClient, parsedURL, commitList)
-		if err != nil {
-			return errors.Wrap(err, "could not determine successful commit")
-		}
-
-		deployOptions = gctsDeployOptions{
-			Username:   config.Username,
-			Password:   config.Password,
-			Host:       config.Host,
-			Repository: config.Repository,
-			Client:     config.Client,
-			Commit:     successCommit,
+			Username:            config.Username,
+			Password:            config.Password,
+			Host:                config.Host,
+			Repository:          config.Repository,
+			Client:              config.Client,
+			Commit:              config.Commit,
+			SkipSSLVerification: config.SkipSSLVerification,
 		}
 
 	} else {
 		repoHistory, err := getRepoHistory(config, telemetryData, httpClient)
 		if err != nil {
-			return errors.Wrap(err, "could not retrieve repository commit history")
+			return fmt.Errorf("could not retrieve repository commit history: %w", err)
 		}
 		if repoHistory.Result[0].FromCommit != "" {
 
 			log.Entry().WithField("repository", config.Repository).Infof("rolling back to last active commit %v", repoHistory.Result[0].FromCommit)
 			deployOptions = gctsDeployOptions{
-				Username:   config.Username,
-				Password:   config.Password,
-				Host:       config.Host,
-				Repository: config.Repository,
-				Client:     config.Client,
-				Commit:     repoHistory.Result[0].FromCommit,
+				Username:            config.Username,
+				Password:            config.Password,
+				Host:                config.Host,
+				Repository:          config.Repository,
+				Client:              config.Client,
+				Commit:              repoHistory.Result[0].FromCommit,
+				SkipSSLVerification: config.SkipSSLVerification,
 			}
 
 		} else {
-			return errors.Errorf("no commit to rollback to (fromCommit) could be identified from the repository commit history")
+			return fmt.Errorf("no commit to rollback to (fromCommit) could be identified from the repository commit history")
 		}
 	}
 
-	deployErr := deployCommit(&deployOptions, telemetryData, httpClient)
+	deployErr := pullByCommit(&deployOptions, telemetryData, command, httpClient)
 
 	if deployErr != nil {
-		return errors.Wrap(deployErr, "rollback commit failed")
+		return fmt.Errorf("rollback commit failed: %w", deployErr)
 	}
 
 	log.Entry().
@@ -144,12 +121,28 @@ func getLastSuccessfullCommit(config *gctsRollbackOptions, telemetryData *teleme
 	} else {
 		log.Entry().Warning("no GitHub personal access token was provided")
 	}
+	// Add proxy support if configured
+	if config.Proxy != "" {
+		proxyURL, err := url.Parse(config.Proxy)
+		if err != nil {
+			return "", fmt.Errorf("failed to parse proxy URL: %w", err)
+		}
+		clientOptions.TransportProxy = proxyURL
+		log.Entry().Infof("Using proxy: %v", config.Proxy)
+	}
 
 	httpClient.SetOptions(clientOptions)
 
 	for _, commit := range commitList {
 
 		url := githubURL.Scheme + "://api." + githubURL.Host + "/repos" + githubURL.Path + "/commits/" + commit + "/status"
+
+		url, urlErr := addQueryToURL(url, config.QueryParameters)
+
+		if urlErr != nil {
+
+			return "", urlErr
+		}
 
 		resp, httpErr := httpClient.SendRequest("GET", url, nil, nil, nil)
 
@@ -165,16 +158,16 @@ func getLastSuccessfullCommit(config *gctsRollbackOptions, telemetryData *teleme
 			return "", errors.New("did not retrieve a HTTP response")
 		}
 
-		bodyText, readErr := ioutil.ReadAll(resp.Body)
+		bodyText, readErr := io.ReadAll(resp.Body)
 
 		if readErr != nil {
-			return "", errors.Wrapf(readErr, "HTTP response body could not be read")
+			return "", fmt.Errorf("HTTP response body could not be read: %w", readErr)
 		}
 
 		response, parsingErr := gabs.ParseJSON([]byte(bodyText))
 
 		if parsingErr != nil {
-			return "", errors.Wrapf(parsingErr, "HTTP response body could not be parsed as JSON: %v", string(bodyText))
+			return "", fmt.Errorf("HTTP response body could not be parsed as JSON: %v: %w", string(bodyText), parsingErr)
 		}
 
 		if status, ok := response.Path("state").Data().(string); ok && status == "success" {
@@ -185,7 +178,7 @@ func getLastSuccessfullCommit(config *gctsRollbackOptions, telemetryData *teleme
 		}
 	}
 
-	return "", errors.Errorf("no commit with status 'success' could be found")
+	return "", fmt.Errorf("no commit with status 'success' could be found")
 }
 
 func getCommits(config *gctsRollbackOptions, telemetryData *telemetry.CustomData, httpClient piperhttp.Sender) ([]string, error) {
@@ -193,6 +186,13 @@ func getCommits(config *gctsRollbackOptions, telemetryData *telemetry.CustomData
 	url := config.Host +
 		"/sap/bc/cts_abapvcs/repository/" + config.Repository +
 		"/getCommit?sap-client=" + config.Client
+
+	url, urlErr := addQueryToURL(url, config.QueryParameters)
+
+	if urlErr != nil {
+
+		return nil, urlErr
+	}
 
 	type commitsResponseBody struct {
 		Commits []struct {
@@ -241,6 +241,13 @@ func getRepoInfo(config *gctsRollbackOptions, telemetryData *telemetry.CustomDat
 		"/sap/bc/cts_abapvcs/repository/" + config.Repository +
 		"?sap-client=" + config.Client
 
+	url, urlErr := addQueryToURL(url, config.QueryParameters)
+
+	if urlErr != nil {
+
+		return nil, urlErr
+	}
+
 	resp, httpErr := httpClient.SendRequest("GET", url, nil, nil, nil)
 
 	defer func() {
@@ -274,7 +281,7 @@ type getRepoInfoResponseBody struct {
 		Branch        string `json:"branch"`
 		URL           string `json:"url"`
 		Version       string `json:"version"`
-		Objects       int    `json:"objects"`
+		Objects       any    `json:"objects"`
 		CurrentCommit string `json:"currentCommit"`
 		Connection    string `json:"connection"`
 		Config        []struct {
@@ -291,6 +298,13 @@ func getRepoHistory(config *gctsRollbackOptions, telemetryData *telemetry.Custom
 	url := config.Host +
 		"/sap/bc/cts_abapvcs/repository/" + config.Repository +
 		"/getHistory?sap-client=" + config.Client
+
+	url, urlErr := addQueryToURL(url, config.QueryParameters)
+
+	if urlErr != nil {
+
+		return nil, urlErr
+	}
 
 	resp, httpErr := httpClient.SendRequest("GET", url, nil, nil, nil)
 

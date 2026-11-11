@@ -1,19 +1,19 @@
 metadata:
   name: abapEnvironmentPullGitRepo
-  description: Pulls a git repository to a SAP Cloud Platform ABAP Environment system
+  description: Pulls a git repository to a SAP BTP ABAP Environment system
   longDescription: |
-    Pulls a git repository (Software Component) to a SAP Cloud Platform ABAP Environment system.
+    Pulls a git repository (Software Component) to a SAP BTP ABAP Environment system.
     Please provide either of the following options:
 
-    * The host and credentials the Cloud Platform ABAP Environment system itself. The credentials must be configured for the Communication Scenario [SAP_COM_0510](https://help.sap.com/viewer/65de2977205c403bbc107264b8eccf4b/Cloud/en-US/b04a9ae412894725a2fc539bfb1ca055.html).
-    * The Cloud Foundry parameters (API endpoint, organization, space), credentials, the service instance for the ABAP service and the service key for the Communication Scenario SAP_COM_0510.
+    * The host and credentials the BTP ABAP Environment system itself. The credentials must be configured for the Communication Scenario [SAP_COM_0948](https://help.sap.com/docs/sap-btp-abap-environment/abap-environment/api-for-managing-software-components-61f4d47af1394b1c8ad684b71d3ad6a0?locale=en-US).
+    * The Cloud Foundry parameters (API endpoint, organization, space), credentials, the service instance for the ABAP service and the service key for the Communication Scenario SAP_COM_0948.
     * Only provide one of those options with the respective credentials. If all values are provided, the direct communication (via host) has priority.
 
 spec:
   inputs:
     secrets:
       - name: abapCredentialsId
-        description: Jenkins credentials ID containing user and password to authenticate to the Cloud Platform ABAP Environment system or the Cloud Foundry API
+        description: Jenkins credentials ID containing user and password to authenticate to the BTP ABAP Environment system or the Cloud Foundry API
         type: jenkins
         aliases:
           - name: cfCredentialsId
@@ -21,7 +21,7 @@ spec:
     params:
       - name: username
         type: string
-        description: User for either the Cloud Foundry API or the Communication Arrangement for SAP_COM_0510
+        description: User for either the Cloud Foundry API or the Communication Arrangement for SAP_COM_0948
         scope:
           - PARAMETERS
           - STAGES
@@ -34,7 +34,7 @@ spec:
             param: username
       - name: password
         type: string
-        description: Password for either the Cloud Foundry API or the Communication Arrangement for SAP_COM_0510
+        description: Password for either the Cloud Foundry API or the Communication Arrangement for SAP_COM_0948
         scope:
           - PARAMETERS
           - STAGES
@@ -47,7 +47,7 @@ spec:
             param: password
       - name: repositoryNames
         type: "[]string"
-        description: Specifies a list of Repositories (Software Components) on the SAP Cloud Platform ABAP Environment system
+        description: Specifies a list of Repositories (Software Components) on the SAP BTP ABAP Environment system
         scope:
           - PARAMETERS
           - STAGES
@@ -60,14 +60,41 @@ spec:
           - PARAMETERS
           - STAGES
           - STEPS
+      - name: repositoryName
+        type: string
+        description: Specifies a repository (Software Component) on the SAP BTP ABAP Environment system
+        scope:
+          - PARAMETERS
+          - STAGES
+          - STEPS
+      - name: commitID
+        type: string
+        description: Specifies a commitID of the repository, configured via "repositoryName" on the SAP BTP ABAP Environment system
+        scope:
+          - PARAMETERS
+          - STAGES
+          - STEPS
       - name: host
         type: string
-        description: Specifies the host address of the SAP Cloud Platform ABAP Environment system
+        description: Specifies the host address of the SAP BTP ABAP Environment system
         scope:
           - PARAMETERS
           - STAGES
           - STEPS
           - GENERAL
+      - name: logOutput
+        type: string
+        description: Specifies how the clone logs from the Manage Software Components App are displayed or saved
+        scope:
+          - PARAMETERS
+          - STAGES
+          - STEPS
+          - GENERAL
+        possibleValues:
+          - ZIP
+          - STANDARD
+          - ERROR_ONLY
+        default: STANDARD
       - name: cfApiEndpoint
         type: string
         description: Cloud Foundry API Enpoint
@@ -126,6 +153,75 @@ spec:
         scope:
           - PARAMETERS
         default: false
+      - name: certificateNames
+        type: "[]string"
+        description: "file names of trusted (self-signed) server certificates - need to be stored in .pipeline/trustStore"
+        mandatory: false
+        scope:
+          - PARAMETERS
+          - STAGES
+          - STEPS
+          - GENERAL
+      - name: btpApiEndpoint
+        type: string
+        description: BTP CLI API endpoint
+        scope:
+          - PARAMETERS
+          - STAGES
+          - STEPS
+          - GENERAL
+        aliases:
+          - name: btp/url
+      - name: btpSubdomain
+        type: string
+        description: BTP Global Account subdomain
+        scope:
+          - PARAMETERS
+          - STAGES
+          - STEPS
+          - GENERAL
+        aliases:
+          - name: btp/subdomain
+      - name: btpSubaccount
+        type: string
+        description: BTP Subaccount name
+        scope:
+          - PARAMETERS
+          - STAGES
+          - STEPS
+          - GENERAL
+        aliases:
+          - name: btp/subaccount
+      - name: btpIdp
+        type: string
+        description: BTP Identity Provider
+        scope:
+          - PARAMETERS
+          - STAGES
+          - STEPS
+          - GENERAL
+        aliases:
+          - name: btp/idp
+      - name: btpServiceInstanceName
+        type: string
+        description: BTP service instance name
+        scope:
+          - PARAMETERS
+          - STAGES
+          - STEPS
+          - GENERAL
+        aliases:
+          - name: btp/instanceName
+      - name: btpServiceBindingName
+        type: string
+        description: BTP service binding name
+        scope:
+          - PARAMETERS
+          - STAGES
+          - STEPS
+          - GENERAL
+        aliases:
+          - name: btp/bindingName
   containers:
     - name: cf
-      image: ppiper/cf-cli:7
+      image: ppiper/cf-cli:latest

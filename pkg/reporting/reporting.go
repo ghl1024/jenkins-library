@@ -6,14 +6,19 @@ import (
 	"fmt"
 	"text/template"
 	"time"
-
-	"github.com/pkg/errors"
 )
+
+// IssueDetail represents any content that can be transformed into the body of a GitHub issue
+type IssueDetail interface {
+	Title() string
+	ToMarkdown() ([]byte, error)
+	ToTxt() string
+}
 
 // ScanReport defines the elements of a scan report used by various scan steps
 type ScanReport struct {
 	StepName       string          `json:"stepName"`
-	Title          string          `json:"title"`
+	ReportTitle    string          `json:"title"`
 	Subheaders     []Subheader     `json:"subheaders"`
 	Overview       []OverviewRow   `json:"overview"`
 	FurtherInfo    string          `json:"furtherInfo"`
@@ -37,7 +42,7 @@ type ScanRow struct {
 }
 
 // AddColumn adds a column to a dedicated ScanRow
-func (s *ScanRow) AddColumn(content interface{}, style ColumnStyle) {
+func (s *ScanRow) AddColumn(content any, style ColumnStyle) {
 	if s.Columns == nil {
 		s.Columns = []ScanCell{}
 	}
@@ -85,12 +90,18 @@ func (s *ScanReport) AddSubHeader(header, details string) {
 	s.Subheaders = append(s.Subheaders, Subheader{Description: header, Details: details})
 }
 
-//StepReportDirectory specifies the default directory for markdown reports which can later be collected by step pipelineCreateSummary
+// StepReportDirectory specifies the default directory for markdown reports which can later be collected by step pipelineCreateSummary
 const StepReportDirectory = ".pipeline/stepReports"
 
 // ToJSON returns the report in JSON format
 func (s *ScanReport) ToJSON() ([]byte, error) {
 	return json.Marshal(s)
+}
+
+// ToTxt up to now returns the report in JSON format
+func (s ScanReport) ToTxt() string {
+	txt, _ := s.ToJSON()
+	return string(txt)
 }
 
 const reportHTMLTemplate = `<!DOCTYPE html>
@@ -212,17 +223,17 @@ func (s *ScanReport) ToHTML() ([]byte, error) {
 	report := []byte{}
 	tmpl, err := template.New("report").Funcs(funcMap).Parse(reportHTMLTemplate)
 	if err != nil {
-		return report, errors.Wrap(err, "failed to create HTML report template")
+		return report, fmt.Errorf("failed to create HTML report template: %w", err)
 	}
 	buf := new(bytes.Buffer)
 	err = tmpl.Execute(buf, s)
 	if err != nil {
-		return report, errors.Wrap(err, "failed to execute HTML report template")
+		return report, fmt.Errorf("failed to execute HTML report template: %w", err)
 	}
 	return buf.Bytes(), nil
 }
 
-const reportMdTemplate = `## {{.Title}}
+const reportMdTemplate = `## {{if .SuccessfulScan}}:white_check_mark:{{else}}:x:{{end}} {{.Title}}
 
 <table>
 {{range $s := .Subheaders -}}
@@ -266,8 +277,13 @@ Snapshot taken: <i>{{reportTime .ReportTime}}</i>
 
 `
 
+// Title returns the title of the report
+func (s ScanReport) Title() string {
+	return s.ReportTitle
+}
+
 // ToMarkdown creates a markdown version of the report content
-func (s *ScanReport) ToMarkdown() ([]byte, error) {
+func (s ScanReport) ToMarkdown() ([]byte, error) {
 	funcMap := template.FuncMap{
 		"columnCount":     tableColumnCount,
 		"drawCell":        drawCell,
@@ -283,12 +299,12 @@ func (s *ScanReport) ToMarkdown() ([]byte, error) {
 	report := []byte{}
 	tmpl, err := template.New("report").Funcs(funcMap).Parse(reportMdTemplate)
 	if err != nil {
-		return report, errors.Wrap(err, "failed to create Markdown report template")
+		return report, fmt.Errorf("failed to create Markdown report template: %w", err)
 	}
 	buf := new(bytes.Buffer)
 	err = tmpl.Execute(buf, s)
 	if err != nil {
-		return report, errors.Wrap(err, "failed to execute Markdown report template")
+		return report, fmt.Errorf("failed to execute Markdown report template: %w", err)
 	}
 	return buf.Bytes(), nil
 }

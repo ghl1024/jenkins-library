@@ -3,144 +3,163 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/piperenv"
 
-	"github.com/ghodss/yaml"
-	"github.com/pkg/errors"
+	"go.yaml.in/yaml/v3"
 )
+
+const SupportedVolumeName = "volume"
 
 // StepData defines the metadata for a step, like step descriptions, parameters, ...
 type StepData struct {
-	Metadata StepMetadata `json:"metadata"`
-	Spec     StepSpec     `json:"spec"`
+	Metadata StepMetadata `json:"metadata" yaml:"metadata"`
+	Spec     StepSpec     `json:"spec" yaml:"spec"`
 }
 
 // StepMetadata defines the metadata for a step, like step descriptions, parameters, ...
 type StepMetadata struct {
-	Name            string  `json:"name"`
-	Aliases         []Alias `json:"aliases,omitempty"`
-	Description     string  `json:"description"`
-	LongDescription string  `json:"longDescription,omitempty"`
+	Name            string      `json:"name" yaml:"name"`
+	Aliases         []Alias     `json:"aliases,omitempty" yaml:"aliases,omitempty"`
+	CLIAliases      []string    `json:"cliAliases,omitempty" yaml:"cliAliases,omitempty"`
+	Description     string      `json:"description" yaml:"description"`
+	LongDescription string      `json:"longDescription,omitempty" yaml:"longDescription,omitempty"`
+	Orchestrators   []string    `json:"orchestrators,omitempty" yaml:"orchestrators,omitempty"`
+	Errors          []StepError `json:"errors,omitempty" yaml:"errors,omitempty"`
 }
 
 // StepSpec defines the spec details for a step, like step inputs, containers, sidecars, ...
 type StepSpec struct {
-	Inputs     StepInputs  `json:"inputs,omitempty"`
-	Outputs    StepOutputs `json:"outputs,omitempty"`
-	Containers []Container `json:"containers,omitempty"`
-	Sidecars   []Container `json:"sidecars,omitempty"`
+	Inputs     StepInputs  `json:"inputs" yaml:"inputs,omitempty"`
+	Outputs    StepOutputs `json:"outputs" yaml:"outputs,omitempty"`
+	Containers []Container `json:"containers,omitempty" yaml:"containers,omitempty"`
+	Sidecars   []Container `json:"sidecars,omitempty" yaml:"sidecars,omitempty"`
 }
 
 // StepInputs defines the spec details for a step, like step inputs, containers, sidecars, ...
 type StepInputs struct {
-	Parameters []StepParameters `json:"params"`
-	Resources  []StepResources  `json:"resources,omitempty"`
-	Secrets    []StepSecrets    `json:"secrets,omitempty"`
+	Parameters []StepParameters `json:"params" yaml:"params"`
+	Resources  []StepResources  `json:"resources,omitempty" yaml:"resources,omitempty"`
+	Secrets    []StepSecrets    `json:"secrets,omitempty" yaml:"secrets,omitempty"`
 }
 
 // StepParameters defines the parameters for a step
 type StepParameters struct {
-	Name            string              `json:"name"`
-	Description     string              `json:"description"`
-	LongDescription string              `json:"longDescription,omitempty"`
-	ResourceRef     []ResourceReference `json:"resourceRef,omitempty"`
-	Scope           []string            `json:"scope"`
-	Type            string              `json:"type"`
-	Mandatory       bool                `json:"mandatory,omitempty"`
-	Default         interface{}         `json:"default,omitempty"`
-	PossibleValues  []interface{}       `json:"possibleValues,omitempty"`
-	Aliases         []Alias             `json:"aliases,omitempty"`
-	Conditions      []Condition         `json:"conditions,omitempty"`
-	Secret          bool                `json:"secret,omitempty"`
+	Name               string                `json:"name"`
+	Description        string                `json:"description" yaml:"description"`
+	LongDescription    string                `json:"longDescription,omitempty" yaml:"longDescription,omitempty"`
+	ResourceRef        []ResourceReference   `json:"resourceRef,omitempty" yaml:"resourceRef,omitempty"`
+	Scope              []string              `json:"scope" yaml:"scope"`
+	Type               string                `json:"type" yaml:"type"`
+	Mandatory          bool                  `json:"mandatory,omitempty" yaml:"mandatory,omitempty"`
+	Default            any                   `json:"default,omitempty" yaml:"default,omitempty"`
+	PossibleValues     []any                 `json:"possibleValues,omitempty" yaml:"possibleValues,omitempty"`
+	Aliases            []Alias               `json:"aliases,omitempty" yaml:"aliases,omitempty"`
+	Conditions         []Condition           `json:"conditions,omitempty" yaml:"conditions,omitempty"`
+	Secret             bool                  `json:"secret,omitempty" yaml:"secret,omitempty"`
+	MandatoryIf        []ParameterDependence `json:"mandatoryIf,omitempty" yaml:"mandatoryIf,omitempty"`
+	DeprecationMessage string                `json:"deprecationMessage,omitempty" yaml:"deprecationMessage,omitempty"`
+}
+
+type ParameterDependence struct {
+	Name     string `json:"name" yaml:"name"`
+	Value    string `json:"value" yaml:"value"`
+	NotEmpty bool   `json:"notEmpty,omitempty" yaml:"notEmpty,omitempty"`
 }
 
 // ResourceReference defines the parameters of a resource reference
 type ResourceReference struct {
-	Name    string   `json:"name"`
-	Type    string   `json:"type,omitempty"`
-	Param   string   `json:"param,omitempty"`
-	Paths   []string `json:"paths,omitempty"`
-	Aliases []Alias  `json:"aliases,omitempty"`
+	Name    string  `json:"name" yaml:"name"`
+	Type    string  `json:"type,omitempty" yaml:"type,omitempty"`
+	Param   string  `json:"param,omitempty" yaml:"param,omitempty"`
+	Default string  `json:"default,omitempty" yaml:"default,omitempty"`
+	Aliases []Alias `json:"aliases,omitempty" yaml:"aliases,omitempty"`
 }
 
 // Alias defines a step input parameter alias
 type Alias struct {
-	Name       string `json:"name,omitempty"`
-	Deprecated bool   `json:"deprecated,omitempty"`
+	Name       string `json:"name,omitempty" yaml:"name,omitempty"`
+	Deprecated bool   `json:"deprecated,omitempty" yaml:"deprecated,omitempty"`
 }
 
 // StepResources defines the resources to be provided by the step context, e.g. Jenkins pipeline
 type StepResources struct {
-	Name        string                   `json:"name"`
-	Description string                   `json:"description,omitempty"`
-	Type        string                   `json:"type,omitempty"`
-	Parameters  []map[string]interface{} `json:"params,omitempty"`
-	Conditions  []Condition              `json:"conditions,omitempty"`
+	Name        string           `json:"name" yaml:"name"`
+	Description string           `json:"description,omitempty" yaml:"description,omitempty"`
+	Type        string           `json:"type,omitempty" yaml:"type,omitempty"`
+	Parameters  []map[string]any `json:"params,omitempty" yaml:"params,omitempty"`
+	Conditions  []Condition      `json:"conditions,omitempty" yaml:"conditions,omitempty"`
 }
 
 // StepSecrets defines the secrets to be provided by the step context, e.g. Jenkins pipeline
 type StepSecrets struct {
-	Name        string  `json:"name"`
-	Description string  `json:"description,omitempty"`
-	Type        string  `json:"type,omitempty"`
-	Aliases     []Alias `json:"aliases,omitempty"`
+	Name        string  `json:"name" yaml:"name"`
+	Description string  `json:"description,omitempty" yaml:"description,omitempty"`
+	Type        string  `json:"type,omitempty" yaml:"type,omitempty"`
+	Aliases     []Alias `json:"aliases,omitempty" yaml:"aliases,omitempty"`
 }
 
 // StepOutputs defines the outputs of a step step, typically one or multiple resources
 type StepOutputs struct {
-	Resources []StepResources `json:"resources,omitempty"`
+	Resources []StepResources `json:"resources,omitempty" yaml:"resources,omitempty"`
 }
 
 // Container defines an execution container
 type Container struct {
 	//ToDo: check dockerOptions, dockerVolumeBind, containerPortMappings, sidecarOptions, sidecarVolumeBind
-	Command         []string    `json:"command"`
-	EnvVars         []EnvVar    `json:"env"`
-	Image           string      `json:"image"`
-	ImagePullPolicy string      `json:"imagePullPolicy"`
-	Name            string      `json:"name"`
-	ReadyCommand    string      `json:"readyCommand"`
-	Shell           string      `json:"shell"`
-	WorkingDir      string      `json:"workingDir"`
-	Conditions      []Condition `json:"conditions,omitempty"`
-	Options         []Option    `json:"options,omitempty"`
-	//VolumeMounts    []VolumeMount `json:"volumeMounts,omitempty"`
+	Command         []string      `json:"command" yaml:"command"`
+	EnvVars         []EnvVar      `json:"env" yaml:"env"`
+	Image           string        `json:"image" yaml:"image"`
+	ImagePullPolicy string        `json:"imagePullPolicy" yaml:"imagePullPolicy"`
+	Name            string        `json:"name" yaml:"name"`
+	ReadyCommand    string        `json:"readyCommand" yaml:"readyCommand"`
+	Shell           string        `json:"shell" yaml:"shell"`
+	WorkingDir      string        `json:"workingDir" yaml:"workingDir"`
+	Conditions      []Condition   `json:"conditions,omitempty" yaml:"conditions,omitempty"`
+	Options         []Option      `json:"options,omitempty" yaml:"options,omitempty"`
+	VolumeMounts    []VolumeMount `json:"volumeMounts,omitempty" yaml:"volumeMounts,omitempty"`
 }
 
 // ToDo: Add the missing Volumes part to enable the volume mount completely
 // VolumeMount defines a mount path
-// type VolumeMount struct {
-//	MountPath string `json:"mountPath"`
-//	Name      string `json:"name"`
-//}
+type VolumeMount struct {
+	Name      string `json:"name" yaml:"name"`
+	MountPath string `json:"mountPath" yaml:"mountPath"`
+}
 
 // Option defines an docker option
 type Option struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
+	Name  string `json:"name" yaml:"name"`
+	Value string `json:"value" yaml:"value"`
 }
 
 // EnvVar defines an environment variable
 type EnvVar struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
+	Name  string `json:"name" yaml:"name"`
+	Value string `json:"value" yaml:"value"`
 }
 
 // Condition defines an condition which decides when the parameter, resource or container is valid
 type Condition struct {
-	ConditionRef string  `json:"conditionRef"`
-	Params       []Param `json:"params"`
+	ConditionRef string  `json:"conditionRef" yaml:"conditionRef"`
+	Params       []Param `json:"params" yaml:"params"`
 }
 
 // Param defines the parameters serving as inputs to the condition
 type Param struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
+	Name  string `json:"name" yaml:"name"`
+	Value string `json:"value" yaml:"value"`
+}
+
+// StepError defines a known error pattern that can be detected in step output
+type StepError struct {
+	Pattern  string `json:"pattern" yaml:"pattern"`
+	Message  string `json:"message,omitempty" yaml:"message,omitempty"`
+	Category string `json:"category,omitempty" yaml:"category,omitempty"`
 }
 
 // StepFilters defines the filter parameters for the different sections
@@ -156,14 +175,14 @@ type StepFilters struct {
 // ReadPipelineStepData loads step definition in yaml format
 func (m *StepData) ReadPipelineStepData(metadata io.ReadCloser) error {
 	defer metadata.Close()
-	content, err := ioutil.ReadAll(metadata)
+	content, err := io.ReadAll(metadata)
 	if err != nil {
-		return errors.Wrapf(err, "error reading %v", metadata)
+		return fmt.Errorf("error reading %v: %w", metadata, err)
 	}
 
 	err = yaml.Unmarshal(content, &m)
 	if err != nil {
-		return errors.Wrapf(err, "error unmarshalling: %v", err)
+		return fmt.Errorf("error unmarshalling: %v: %w", err, err)
 	}
 	return nil
 }
@@ -214,7 +233,7 @@ func (m *StepData) GetContextParameterFilters() StepFilters {
 		}
 	}
 	if len(m.Spec.Containers) > 0 {
-		parameterKeys := []string{"containerCommand", "containerShell", "dockerEnvVars", "dockerImage", "dockerName", "dockerOptions", "dockerPullImage", "dockerVolumeBind", "dockerWorkspace"}
+		parameterKeys := []string{"containerCommand", "containerShell", "dockerEnvVars", "dockerImage", "dockerName", "dockerOptions", "dockerPullImage", "dockerVolumeBind", "dockerWorkspace", "dockerRegistryUrl", "dockerRegistryCredentialsId"}
 		for _, container := range m.Spec.Containers {
 			for _, condition := range container.Conditions {
 				for _, dependentParam := range condition.Params {
@@ -227,9 +246,17 @@ func (m *StepData) GetContextParameterFilters() StepFilters {
 		contextFilters = append(contextFilters, parameterKeys...)
 	}
 	if len(m.Spec.Sidecars) > 0 {
+		parameterKeysForSideCar := []string{"containerName", "containerPortMappings", "dockerName", "sidecarEnvVars", "sidecarImage", "sidecarName", "sidecarOptions", "sidecarPullImage", "sidecarReadyCommand", "sidecarVolumeBind", "sidecarWorkspace"}
+		for _, sidecar := range m.Spec.Sidecars {
+			for _, condition := range sidecar.Conditions {
+				for _, dependentParam := range condition.Params {
+					parameterKeysForSideCar = append(parameterKeysForSideCar, dependentParam.Value)
+					parameterKeysForSideCar = append(parameterKeysForSideCar, dependentParam.Name)
+				}
+			}
+		}
 		//ToDo: support fallback for "dockerName" configuration property -> via aliasing?
-		contextFilters = append(contextFilters, []string{"containerName", "containerPortMappings", "dockerName", "sidecarEnvVars", "sidecarImage", "sidecarName", "sidecarOptions", "sidecarPullImage", "sidecarReadyCommand", "sidecarVolumeBind", "sidecarWorkspace"}...)
-		//ToDo: add condition param.Value and param.Name to filter as for Containers
+		contextFilters = append(contextFilters, parameterKeysForSideCar...)
 	}
 
 	contextFilters = addVaultContextParametersFilter(m, contextFilters)
@@ -258,7 +285,7 @@ func (m *StepData) GetContextDefaults(stepName string) (io.ReadCloser, error) {
 
 	//ToDo error handling empty Containers/Sidecars
 	//ToDo handle empty Command
-	root := map[string]interface{}{}
+	root := map[string]any{}
 	if len(m.Spec.Containers) > 0 {
 		for _, container := range m.Spec.Containers {
 			key := ""
@@ -267,7 +294,7 @@ func (m *StepData) GetContextDefaults(stepName string) (io.ReadCloser, error) {
 				key = container.Conditions[0].Params[0].Value
 				conditionParam = container.Conditions[0].Params[0].Name
 			}
-			p := map[string]interface{}{}
+			p := map[string]any{}
 			if key != "" {
 				root[key] = p
 				//add default for condition parameter if available
@@ -294,12 +321,43 @@ func (m *StepData) GetContextDefaults(stepName string) (io.ReadCloser, error) {
 	}
 
 	if len(m.Spec.Sidecars) > 0 {
-		if len(m.Spec.Sidecars[0].Command) > 0 {
-			root["sidecarCommand"] = m.Spec.Sidecars[0].Command[0]
-		}
-		m.Spec.Sidecars[0].commonConfiguration("sidecar", &root)
-		putStringIfNotEmpty(root, "sidecarReadyCommand", m.Spec.Sidecars[0].ReadyCommand)
+		// if there one side car do not check conditions and consider the only side care as default . this is default behaviour
+		// if there are more than one side car then check conditions,
+		if len(m.Spec.Sidecars) == 1 {
+			if len(m.Spec.Sidecars[0].Command) > 0 {
+				root["sidecarCommand"] = m.Spec.Sidecars[0].Command[0]
+			}
+			m.Spec.Sidecars[0].commonConfiguration("sidecar", &root)
+			putStringIfNotEmpty(root, "sidecarReadyCommand", m.Spec.Sidecars[0].ReadyCommand)
+		} else {
+			for _, sideCar := range m.Spec.Sidecars {
+				key := ""
+				conditionParam := ""
+				if len(sideCar.Conditions) > 0 {
+					key = sideCar.Conditions[0].Params[0].Value
+					conditionParam = sideCar.Conditions[0].Params[0].Name
+				}
+				p := map[string]any{}
+				if key != "" {
+					root[key] = p
+					//add default for condition parameter if available
+					for _, inputParam := range m.Spec.Inputs.Parameters {
+						if inputParam.Name == conditionParam {
+							root[conditionParam] = inputParam.Default
+						}
+					}
+				} else {
+					p = root
+				}
+				if len(sideCar.Command) > 0 {
+					root["sidecarCommand"] = sideCar.Command[0]
+				}
 
+				putStringIfNotEmpty(root, "sidecarReadyCommand", sideCar.ReadyCommand)
+				sideCar.commonConfiguration("sidecar", &p)
+
+			}
+		}
 		// not filled for now since this is not relevant in Kubernetes case
 		//putStringIfNotEmpty(root, "containerPortMappings", m.Spec.Sidecars[0].)
 	}
@@ -326,11 +384,11 @@ func (m *StepData) GetContextDefaults(stepName string) (io.ReadCloser, error) {
 				root["stashContent"] = resources[""]
 			} else {
 				if root[key] == nil {
-					root[key] = map[string]interface{}{
+					root[key] = map[string]any{
 						"stashContent": resources[key],
 					}
 				} else {
-					p := root[key].(map[string]interface{})
+					p := root[key].(map[string]any)
 					p["stashContent"] = resources[key]
 				}
 			}
@@ -338,29 +396,30 @@ func (m *StepData) GetContextDefaults(stepName string) (io.ReadCloser, error) {
 	}
 
 	c := Config{
-		Steps: map[string]map[string]interface{}{
+		Steps: map[string]map[string]any{
 			stepName: root,
 		},
 	}
 
 	JSON, err := yaml.Marshal(c)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create context defaults")
+		return nil, fmt.Errorf("failed to create context defaults: %w", err)
 	}
 
-	r := ioutil.NopCloser(bytes.NewReader(JSON))
+	r := io.NopCloser(bytes.NewReader(JSON))
 	return r, nil
 }
 
 // GetResourceParameters retrieves parameters from a named pipeline resource with a defined path
-func (m *StepData) GetResourceParameters(path, name string) map[string]interface{} {
-	resourceParams := map[string]interface{}{}
+func (m *StepData) GetResourceParameters(path, name string) map[string]any {
+	resourceParams := map[string]any{}
 
 	for _, param := range m.Spec.Inputs.Parameters {
 		for _, res := range param.ResourceRef {
 			if res.Name == name {
 				if val := getParameterValue(path, res, param); val != nil {
 					resourceParams[param.Name] = val
+					break
 				}
 			}
 		}
@@ -369,7 +428,7 @@ func (m *StepData) GetResourceParameters(path, name string) map[string]interface
 	return resourceParams
 }
 
-func (container *Container) commonConfiguration(keyPrefix string, config *map[string]interface{}) {
+func (container *Container) commonConfiguration(keyPrefix string, config *map[string]any) {
 	putMapIfNotEmpty(*config, keyPrefix+"EnvVars", EnvVarsAsMap(container.EnvVars))
 	putStringIfNotEmpty(*config, keyPrefix+"Image", container.Image)
 	putStringIfNotEmpty(*config, keyPrefix+"Name", container.Name)
@@ -378,18 +437,18 @@ func (container *Container) commonConfiguration(keyPrefix string, config *map[st
 	}
 	putStringIfNotEmpty(*config, keyPrefix+"Workspace", container.WorkingDir)
 	putSliceIfNotEmpty(*config, keyPrefix+"Options", OptionsAsStringSlice(container.Options))
-	//putSliceIfNotEmpty(*config, keyPrefix+"VolumeBind", volumeMountsAsStringSlice(container.VolumeMounts))
+	putSliceIfNotEmpty(*config, keyPrefix+"VolumeBind", volumeMountsAsStringSlice(container.VolumeMounts))
 
 }
 
-func getParameterValue(path string, res ResourceReference, param StepParameters) interface{} {
+func getParameterValue(path string, res ResourceReference, param StepParameters) any {
 	paramName := res.Param
 	if param.Type != "string" {
 		paramName += ".json"
 	}
 	if val := piperenv.GetResourceParameter(path, res.Name, paramName); len(val) > 0 {
 		if param.Type != "string" {
-			var unmarshalledValue interface{}
+			var unmarshalledValue any
 			err := json.Unmarshal([]byte(val), &unmarshalledValue)
 			if err != nil {
 				log.Entry().Debugf("Failed to unmarshal: %v", val)
@@ -409,6 +468,23 @@ func (m *StepParameters) GetReference(refType string) *ResourceReference {
 		}
 	}
 	return nil
+}
+
+func getFilterForResourceReferences(params []StepParameters) []string {
+	var filter []string
+	for _, param := range params {
+		reference := param.GetReference("vaultSecret")
+		if reference == nil {
+			reference = param.GetReference("vaultSecretFile")
+		}
+		if reference == nil {
+			return filter
+		}
+		if reference.Name != "" {
+			filter = append(filter, reference.Name)
+		}
+	}
+	return filter
 }
 
 // HasReference checks whether StepData contains a parameter that has Reference with the given type
@@ -434,34 +510,74 @@ func EnvVarsAsMap(envVars []EnvVar) map[string]string {
 func OptionsAsStringSlice(options []Option) []string {
 	e := []string{}
 	for _, v := range options {
-		e = append(e, fmt.Sprintf("%v %v", v.Name, v.Value))
+		if len(v.Value) != 0 {
+			e = append(e, fmt.Sprintf("%v %v", v.Name, v.Value))
+		} else {
+			e = append(e, fmt.Sprintf("%v=", v.Name))
+		}
+
 	}
 	return e
 }
 
-func putStringIfNotEmpty(config map[string]interface{}, key, value string) {
+func putStringIfNotEmpty(config map[string]any, key, value string) {
 	if value != "" {
 		config[key] = value
 	}
 }
 
-func putMapIfNotEmpty(config map[string]interface{}, key string, value map[string]string) {
+func putMapIfNotEmpty(config map[string]any, key string, value map[string]string) {
 	if len(value) > 0 {
 		config[key] = value
 	}
 }
 
-func putSliceIfNotEmpty(config map[string]interface{}, key string, value []string) {
+func putSliceIfNotEmpty(config map[string]any, key string, value []string) {
 	if len(value) > 0 {
 		config[key] = value
 	}
 }
 
-//ToDo: Enable this when the Volumes part is also implemented
-//func volumeMountsAsStringSlice(volumeMounts []VolumeMount) []string {
-//	e := []string{}
-//	for _, v := range volumeMounts {
-//		e = append(e, fmt.Sprintf("%v:%v", v.Name, v.MountPath))
-//	}
-//	return e
-//}
+func ResolveMetadata(gitHubTokens map[string]string, metaDataResolver func() map[string]StepData, stepMetadata string, stepName string) (StepData, error) {
+
+	var metadata StepData
+
+	if stepMetadata != "" {
+		metadataFile, err := OpenPiperFile(stepMetadata, gitHubTokens)
+		if err != nil {
+			return metadata, fmt.Errorf("open failed: %w", err)
+		}
+
+		err = metadata.ReadPipelineStepData(metadataFile)
+		if err != nil {
+			return metadata, fmt.Errorf("read failed: %w", err)
+		}
+	} else {
+		if stepName != "" {
+			if metaDataResolver == nil {
+				return metadata, errors.New("metaDataResolver is nil")
+			}
+			metadataMap := metaDataResolver()
+			var ok bool
+			metadata, ok = metadataMap[stepName]
+			if !ok {
+				return metadata, fmt.Errorf("could not retrieve by stepName %v", stepName)
+			}
+		} else {
+			return metadata, fmt.Errorf("either one of stepMetadata or stepName parameter has to be passed")
+		}
+	}
+	return metadata, nil
+}
+
+func volumeMountsAsStringSlice(volumeMounts []VolumeMount) []string {
+	e := []string{}
+	for _, v := range volumeMounts {
+		if v.Name != SupportedVolumeName {
+			log.Entry().Warningf("Unsupported volume name: %q, only %q is supported", v.Name, SupportedVolumeName)
+			continue
+		}
+		e = append(e, fmt.Sprintf("%v:%v", v.Name, v.MountPath))
+	}
+	return e
+}

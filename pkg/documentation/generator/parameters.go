@@ -2,11 +2,22 @@ package generator
 
 import (
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 
 	"github.com/SAP/jenkins-library/pkg/config"
 )
+
+const (
+	vaultBadge       = "![Vault](https://img.shields.io/badge/-Vault-lightgrey)"
+	jenkinsOnlyBadge = "![Jenkins only](https://img.shields.io/badge/-Jenkins%20only-yellowgreen)"
+	secretBadge      = "![Secret](https://img.shields.io/badge/-Secret-yellowgreen)"
+	systemTrustBadge = "![System Trust](https://img.shields.io/badge/-System%20Trust-lightblue)"
+	deprecatedBadge  = "![deprecated](https://img.shields.io/badge/-deprecated-red)"
+)
+
+var jenkinsParams = []string{"containerCommand", "containerName", "containerShell", "dockerVolumeBind", "dockerWorkspace", "sidecarReadyCommand", "sidecarWorkspace", "stashContent"}
 
 // Replaces the Parameters placeholder with the content from the yaml
 func createParametersSection(stepData *config.StepData) string {
@@ -15,8 +26,12 @@ func createParametersSection(stepData *config.StepData) string {
 
 	// sort parameters alphabetically with mandatory parameters first
 	sortStepParameters(stepData, true)
-	parameters += "### Overview\n\n"
-	parameters += createParameterOverview(stepData)
+	parameters += "### Overview - Step\n\n"
+	parameters += createParameterOverview(stepData, false)
+
+	parameters += "### Overview - Execution Environment\n\n"
+	parameters += "!!! note \"Orchestrator-specific only\"\n\n    These parameters are relevant for orchestrator usage and not considered when using the command line option.\n\n"
+	parameters += createParameterOverview(stepData, true)
 
 	// sort parameters alphabetically
 	sortStepParameters(stepData, false)
@@ -26,122 +41,185 @@ func createParametersSection(stepData *config.StepData) string {
 	return parameters
 }
 
-func createParameterOverview(stepData *config.StepData) string {
-	var table = "| Name | Mandatory | Additional information |\n"
-	table += "| ---- | --------- | ---------------------- |\n"
+func parameterMandatoryInformation(param config.StepParameters, furtherInfo string) (mandatory bool, mandatoryString string, mandatoryInfo string) {
+	mandatory = param.Mandatory
+	mandatoryInfo = furtherInfo
 
-	for _, param := range stepData.Spec.Inputs.Parameters {
-		table += fmt.Sprintf("| [%v](#%v) | %v | %v |\n", param.Name, strings.ToLower(param.Name), ifThenElse(param.Mandatory, "**yes**", "no"), parameterFurtherInfo(param.Name, stepData))
+	mandatoryIf := param.MandatoryIf
+	if len(mandatoryIf) > 0 {
+		mandatory = true
+		if len(mandatoryInfo) > 0 {
+			mandatoryInfo += "<br />"
+		}
+		furtherInfoConditions := []string{"mandatory in case of:"}
+		for _, mandatoryCondition := range mandatoryIf {
+			furtherInfoConditions = append(furtherInfoConditions, fmt.Sprintf("- [`%v`](#%v)=`%v`", mandatoryCondition.Name, strings.ToLower(mandatoryCondition.Name), mandatoryCondition.Value))
+		}
+
+		mandatoryInfo += strings.Join(furtherInfoConditions, "<br />")
 	}
 
-	table += "\n"
-
-	return table
+	mandatoryString = "**yes**"
+	if len(mandatoryInfo) > 0 {
+		mandatoryString = "**(yes)**"
+	}
+	return
 }
 
-func parameterFurtherInfo(paramName string, stepData *config.StepData) string {
+func createParameterOverview(stepData *config.StepData, executionEnvironment bool) string {
+	var table strings.Builder
+	table.WriteString("| Name | Mandatory | Additional information |\n")
+	table.WriteString("| ---- | --------- | ---------------------- |\n")
+
+	for _, param := range stepData.Spec.Inputs.Parameters {
+		furtherInfo, err := parameterFurtherInfo(param.Name, stepData, executionEnvironment)
+		if err == nil {
+
+			var mandatory bool
+			var mandatoryString string
+			mandatory, mandatoryString, furtherInfo = parameterMandatoryInformation(param, furtherInfo)
+			table.WriteString(fmt.Sprintf("| [%v](#%v) | %v | %v |\n", param.Name, strings.ToLower(param.Name), ifThenElse(mandatory, mandatoryString, "no"), furtherInfo))
+		}
+	}
+
+	table.WriteString("\n")
+
+	return table.String()
+}
+
+func parameterFurtherInfo(paramName string, stepData *config.StepData, executionEnvironment bool) (string, error) {
 
 	// handle general parameters
 	// ToDo: add special handling once we have more than one general parameter to consider
 	if paramName == "verbose" {
-		return "activates debug output"
+		return checkParameterInfo("activates debug output", true, executionEnvironment)
 	}
 
 	if paramName == "script" {
-		return "[![Jenkins only](https://img.shields.io/badge/-Jenkins%20only-yellowgreen)](#) reference to Jenkins main pipeline script"
+		return checkParameterInfo(fmt.Sprintf("%s reference to Jenkins main pipeline script", jenkinsOnlyBadge), true, executionEnvironment)
 	}
 
-	// handle Jenkins-specific parameters
+	// handle non-step parameters (e.g. Jenkins-specific parameters as well as execution environment parameters)
 	if !contains(stepParameterNames, paramName) {
 		for _, secret := range stepData.Spec.Inputs.Secrets {
 			if paramName == secret.Name && secret.Type == "jenkins" {
-				return "[![Jenkins only](https://img.shields.io/badge/-Jenkins%20only-yellowgreen)](#) id of credentials ([using credentials](https://www.jenkins.io/doc/book/using/using-credentials/))"
+				return checkParameterInfo(fmt.Sprintf("%s id of credentials ([using credentials](https://www.jenkins.io/doc/book/using/using-credentials/))", jenkinsOnlyBadge), true, executionEnvironment)
 			}
 		}
-		return "[![Jenkins only](https://img.shields.io/badge/-Jenkins%20only-yellowgreen)](#)"
+		if contains(jenkinsParams, paramName) {
+			return checkParameterInfo(fmt.Sprintf("%s", jenkinsOnlyBadge), false, executionEnvironment)
+		}
+		return checkParameterInfo("", false, executionEnvironment)
 	}
 
-	// handle Secrets
+	// handle step-parameters (incl. secrets)
 	for _, param := range stepData.Spec.Inputs.Parameters {
 		if paramName == param.Name {
+			furtherInfo := ""
+			if param.DeprecationMessage != "" {
+				furtherInfo += fmt.Sprintf("%s", deprecatedBadge)
+			}
 			if param.Secret {
-				secretInfo := "[![Secret](https://img.shields.io/badge/-Secret-yellowgreen)](#) pass via ENV or Jenkins credentials"
-				if param.GetReference("vaultSecret") != nil {
-					secretInfo = " [![Vault](https://img.shields.io/badge/-Vault-lightgrey)](#) [![Secret](https://img.shields.io/badge/-Secret-yellowgreen)](/) pass via ENV, Vault or Jenkins credentials"
+				secretInfo := fmt.Sprintf("%s pass via ENV or Jenkins credentials", secretBadge)
 
+				isVaultSecret := param.GetReference("vaultSecret") != nil || param.GetReference("vaultSecretFile") != nil
+				isSystemTrustSecret := param.GetReference(config.RefTypeSystemTrustSecret) != nil
+				if isVaultSecret && isSystemTrustSecret {
+					secretInfo = fmt.Sprintf(" %s %s %s pass via ENV, Vault, System Trust or Jenkins credentials", vaultBadge, systemTrustBadge, secretBadge)
+				} else if isVaultSecret {
+					secretInfo = fmt.Sprintf(" %s %s pass via ENV, Vault or Jenkins credentials", vaultBadge, secretBadge)
 				}
+
 				for _, res := range param.ResourceRef {
 					if res.Type == "secret" {
 						secretInfo += fmt.Sprintf(" ([`%v`](#%v))", res.Name, strings.ToLower(res.Name))
 					}
 				}
-				return secretInfo
+				return checkParameterInfo(furtherInfo+secretInfo, true, executionEnvironment)
 			}
-			return ""
+			return checkParameterInfo(furtherInfo, true, executionEnvironment)
 		}
 	}
-	return ""
+	return checkParameterInfo("", true, executionEnvironment)
+}
+
+func checkParameterInfo(furtherInfo string, stepParam bool, executionEnvironment bool) (string, error) {
+	if stepParam && !executionEnvironment || !stepParam && executionEnvironment {
+		return furtherInfo, nil
+	}
+
+	if executionEnvironment {
+		return "", fmt.Errorf("step parameter not relevant as execution environment parameter")
+	}
+	return "", fmt.Errorf("execution environment parameter not relevant as step parameter")
 }
 
 func createParameterDetails(stepData *config.StepData) string {
 
-	details := ""
+	var details strings.Builder
 
 	//jenkinsParameters := append(jenkinsParameters(stepData), "script")
 
 	for _, param := range stepData.Spec.Inputs.Parameters {
-		details += fmt.Sprintf("#### %v\n\n", param.Name)
+		details.WriteString(fmt.Sprintf("#### %v\n\n", param.Name))
 
-		if !contains(stepParameterNames, param.Name) {
-			details += "**Jenkins-specific:** Used for proper environment setup.\n\n"
+		if !contains(stepParameterNames, param.Name) && contains(jenkinsParams, param.Name) {
+			details.WriteString("**Jenkins-specific:** Used for proper environment setup.\n\n")
 		}
 
 		if len(param.LongDescription) > 0 {
-			details += param.LongDescription + "\n\n"
+			details.WriteString(param.LongDescription + "\n\n")
 		} else {
-			details += param.Description + "\n\n"
+			details.WriteString(param.Description + "\n\n")
 		}
 
-		details += "[back to overview](#parameters)\n\n"
+		details.WriteString("[back to overview](#parameters)\n\n")
 
-		details += "| Scope | Details |\n"
-		details += "| ---- | --------- |\n"
+		details.WriteString("| Scope | Details |\n")
+		details.WriteString("| ---- | --------- |\n")
 
-		details += fmt.Sprintf("| Aliases | %v |\n", aliasList(param.Aliases))
-		details += fmt.Sprintf("| Type | `%v` |\n", param.Type)
-		details += fmt.Sprintf("| Mandatory | %v |\n", ifThenElse(param.Mandatory, "**yes**", "no"))
-		details += fmt.Sprintf("| Default | %v |\n", formatDefault(param, stepParameterNames))
+		if param.DeprecationMessage != "" {
+			details.WriteString(fmt.Sprintf("| Deprecated | %v |\n", param.DeprecationMessage))
+		}
+		details.WriteString(fmt.Sprintf("| Aliases | %v |\n", aliasList(param.Aliases)))
+		details.WriteString(fmt.Sprintf("| Type | `%v` |\n", param.Type))
+		mandatory, mandatoryString, furtherInfo := parameterMandatoryInformation(param, "")
+		if mandatory && len(furtherInfo) > 0 {
+			mandatoryString = furtherInfo
+		}
+		details.WriteString(fmt.Sprintf("| Mandatory | %v |\n", ifThenElse(mandatory, mandatoryString, "no")))
+		details.WriteString(fmt.Sprintf("| Default | %v |\n", formatDefault(param, stepParameterNames)))
 		if param.PossibleValues != nil {
-			details += fmt.Sprintf("| Possible values | %v |\n", possibleValueList(param.PossibleValues))
+			details.WriteString(fmt.Sprintf("| Possible values | %v |\n", possibleValueList(param.PossibleValues)))
 		}
-		details += fmt.Sprintf("| Secret | %v |\n", ifThenElse(param.Secret, "**yes**", "no"))
-		details += fmt.Sprintf("| Configuration scope | %v |\n", scopeDetails(param.Scope))
-		details += fmt.Sprintf("| Resource references | %v |\n", resourceReferenceDetails(param.ResourceRef))
+		details.WriteString(fmt.Sprintf("| Secret | %v |\n", ifThenElse(param.Secret, "**yes**", "no")))
+		details.WriteString(fmt.Sprintf("| Configuration scope | %v |\n", scopeDetails(param.Scope)))
+		details.WriteString(fmt.Sprintf("| Resource references | %v |\n", resourceReferenceDetails(param.ResourceRef)))
 
-		details += "\n\n"
+		details.WriteString("\n\n")
 	}
 
 	for _, secret := range stepData.Spec.Inputs.Secrets {
-		details += fmt.Sprintf("#### %v\n\n", secret.Name)
+		details.WriteString(fmt.Sprintf("#### %v\n\n", secret.Name))
 
-		if !contains(stepParameterNames, secret.Name) {
-			details += "**Jenkins-specific:** Used for proper environment setup. See *[using credentials](https://www.jenkins.io/doc/book/using/using-credentials/)* for details.\n\n"
+		if !contains(stepParameterNames, secret.Name) && contains(jenkinsParams, secret.Name) {
+			details.WriteString("**Jenkins-specific:** Used for proper environment setup. See *[using credentials](https://www.jenkins.io/doc/book/using/using-credentials/)* for details.\n\n")
 		}
 
-		details += secret.Description + "\n\n"
+		details.WriteString(secret.Description + "\n\n")
 
-		details += "[back to overview](#parameters)\n\n"
+		details.WriteString("[back to overview](#parameters)\n\n")
 
-		details += "| Scope | Details |\n"
-		details += "| ---- | --------- |\n"
-		details += fmt.Sprintf("| Aliases | %v |\n", aliasList(secret.Aliases))
-		details += fmt.Sprintf("| Type | `%v` |\n", "string")
-		details += fmt.Sprintf("| Configuration scope | %v |\n", scopeDetails([]string{"PARAMETERS", "GENERAL", "STEPS", "STAGES"}))
+		details.WriteString("| Scope | Details |\n")
+		details.WriteString("| ---- | --------- |\n")
+		details.WriteString(fmt.Sprintf("| Aliases | %v |\n", aliasList(secret.Aliases)))
+		details.WriteString(fmt.Sprintf("| Type | `%v` |\n", "string"))
+		details.WriteString(fmt.Sprintf("| Configuration scope | %v |\n", scopeDetails([]string{"PARAMETERS", "GENERAL", "STEPS", "STAGES"})))
 
-		details += "\n\n"
+		details.WriteString("\n\n")
 	}
 
-	return details
+	return details.String()
 }
 
 func formatDefault(param config.StepParameters, stepParameterNames []string) string {
@@ -158,10 +236,15 @@ func formatDefault(param config.StepParameters, stepParameterNames []string) str
 		defaults := []string{}
 		for _, condDef := range v {
 			//ToDo: add type-specific handling of default
-			defaults = append(defaults, fmt.Sprintf("%v=`%v`: `%v`", condDef.key, condDef.value, condDef.def))
+			if len(condDef.key) > 0 && len(condDef.value) > 0 {
+				defaults = append(defaults, fmt.Sprintf("%v=`%v`: `%v`", condDef.key, condDef.value, condDef.def))
+			} else {
+				// containers with no condition will only hold def
+				defaults = append(defaults, fmt.Sprintf("`%v`", condDef.def))
+			}
 		}
 		return strings.Join(defaults, "<br />")
-	case []interface{}:
+	case []any:
 		// handle for example stashes which possibly contain a mixture of fix and conditional values
 		defaults := []string{}
 		for _, def := range v {
@@ -210,7 +293,7 @@ func aliasList(aliases []config.Alias) string {
 	}
 }
 
-func possibleValueList(possibleValues []interface{}) string {
+func possibleValueList(possibleValues []any) string {
 	if len(possibleValues) == 0 {
 		return ""
 	}
@@ -261,21 +344,37 @@ func resourceReferenceDetails(resourceRef []config.ResourceReference) string {
 			continue
 		}
 
-		resourceDetails = addVaultResourceDetails(resource, resourceDetails)
+		if resource.Type == "vaultSecret" || resource.Type == "vaultSecretFile" {
+			resourceDetails = addVaultResourceDetails(resource, resourceDetails)
+			continue
+		}
+		if resource.Type == config.RefTypeSystemTrustSecret {
+			resourceDetails = addSystemTrustResourceDetails(resource, resourceDetails)
+		}
 	}
 
 	return resourceDetails
 }
 
 func addVaultResourceDetails(resource config.ResourceReference, resourceDetails string) string {
-	if resource.Type == "vaultSecret" {
-		resourceDetails += "<br/>Vault paths: <br />"
-		resourceDetails += "<ul>"
-		for _, path := range resource.Paths[0:1] {
-			resourceDetails += fmt.Sprintf("<li>`%s`</li>", path)
-		}
-		resourceDetails += "</ul>"
+	resourceDetails += "<br/>Vault resource:<br />"
+	resourceDetails += fmt.Sprintf("&nbsp;&nbsp;name: `%v`<br />", resource.Name)
+	resourceDetails += fmt.Sprintf("&nbsp;&nbsp;default value: `%v`<br />", resource.Default)
+	resourceDetails += "<br/>Vault paths: <br />"
+	resourceDetails += "<ul>"
+	for _, rootPath := range config.VaultRootPaths {
+		resourceDetails += fmt.Sprintf("<li>`%s`</li>", path.Join(rootPath, resource.Default))
 	}
+	resourceDetails += "</ul>"
+
+	return resourceDetails
+}
+
+func addSystemTrustResourceDetails(resource config.ResourceReference, resourceDetails string) string {
+	resourceDetails += "<br/>System Trust resource:<br />"
+	resourceDetails += fmt.Sprintf("&nbsp;&nbsp;name: `%v`<br />", resource.Name)
+	resourceDetails += fmt.Sprintf("&nbsp;&nbsp;value: `%v`<br />", resource.Default)
+
 	return resourceDetails
 }
 
@@ -285,9 +384,9 @@ func sortStepParameters(stepData *config.StepData, considerMandatory bool) {
 
 		if considerMandatory {
 			sort.SliceStable(parameters[:], func(i, j int) bool {
-				if parameters[i].Mandatory == parameters[j].Mandatory {
+				if (parameters[i].Mandatory || len(parameters[i].MandatoryIf) > 0) == (parameters[j].Mandatory || len(parameters[j].MandatoryIf) > 0) {
 					return strings.Compare(parameters[i].Name, parameters[j].Name) < 0
-				} else if parameters[i].Mandatory {
+				} else if parameters[i].Mandatory || len(parameters[i].MandatoryIf) > 0 {
 					return true
 				}
 				return false

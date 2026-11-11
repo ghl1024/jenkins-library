@@ -1,8 +1,13 @@
+//go:build unit
+// +build unit
+
 package git
 
 import (
 	"errors"
 	"fmt"
+	"testing"
+
 	"github.com/go-git/go-billy/v5"
 	"github.com/go-git/go-billy/v5/memfs"
 	"github.com/go-git/go-git/v5"
@@ -10,7 +15,6 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/storage/memory"
 	"github.com/stretchr/testify/assert"
-	"testing"
 )
 
 func TestCommit(t *testing.T) {
@@ -46,15 +50,15 @@ func TestPushChangesToRepository(t *testing.T) {
 	t.Parallel()
 	t.Run("successful push", func(t *testing.T) {
 		t.Parallel()
-		err := pushChangesToRepository("user", "password", RepositoryMock{
+		err := pushChangesToRepository("user", "password", nil, RepositoryMock{
 			test: t,
-		})
+		}, []byte{})
 		assert.NoError(t, err)
 	})
 
 	t.Run("error pushing", func(t *testing.T) {
 		t.Parallel()
-		err := pushChangesToRepository("user", "password", RepositoryMockError{})
+		err := pushChangesToRepository("user", "password", nil, RepositoryMockError{}, []byte{})
 		assert.EqualError(t, err, "failed to push commit: error on push commits")
 	})
 }
@@ -64,7 +68,7 @@ func TestPlainClone(t *testing.T) {
 	t.Run("successful clone", func(t *testing.T) {
 		t.Parallel()
 		abstractedGit := &UtilsGitMock{}
-		_, err := plainClone("user", "password", "URL", "directory", abstractedGit)
+		_, err := plainClone("user", "password", "URL", "", "directory", abstractedGit, []byte{})
 		assert.NoError(t, err)
 		assert.Equal(t, "directory", abstractedGit.path)
 		assert.False(t, abstractedGit.isBare)
@@ -75,7 +79,7 @@ func TestPlainClone(t *testing.T) {
 	t.Run("error on cloning", func(t *testing.T) {
 		t.Parallel()
 		abstractedGit := UtilsGitMockError{}
-		_, err := plainClone("user", "password", "URL", "directory", abstractedGit)
+		_, err := plainClone("user", "password", "URL", "", "directory", abstractedGit, []byte{})
 		assert.EqualError(t, err, "failed to clone git: error during clone")
 	})
 }

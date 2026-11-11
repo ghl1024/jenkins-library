@@ -1,3 +1,6 @@
+//go:build unit
+// +build unit
+
 package cmd
 
 import (
@@ -5,21 +8,9 @@ import (
 	"testing"
 
 	"github.com/SAP/jenkins-library/pkg/mock"
+
 	"github.com/stretchr/testify/assert"
 )
-
-type integrationArtifactUploadMockUtils struct {
-	*mock.ExecMockRunner
-	*mock.FilesMock
-}
-
-func newIntegrationArtifactUploadTestsUtils() integrationArtifactUploadMockUtils {
-	utils := integrationArtifactUploadMockUtils{
-		ExecMockRunner: &mock.ExecMockRunner{},
-		FilesMock:      &mock.FilesMock{},
-	}
-	return utils
-}
 
 func TestRunIntegrationArtifactUpload(t *testing.T) {
 	t.Parallel()
@@ -32,16 +23,21 @@ func TestRunIntegrationArtifactUpload(t *testing.T) {
 		assert.NoError(t, err)
 		assert.True(t, exists)
 
+		apiServiceKey := `{
+			"oauth": {
+				"url": "https://demo",
+				"clientid": "demouser",
+				"clientsecret": "******",
+				"tokenurl": "https://demo/oauth/token"
+			}
+		}`
+
 		config := integrationArtifactUploadOptions{
-			Host:                   "https://demo",
-			OAuthTokenProviderURL:  "https://demo/oauth/token",
-			Username:               "demouser",
-			Password:               "******",
-			IntegrationFlowName:    "flow4",
-			IntegrationFlowID:      "flow4",
-			IntegrationFlowVersion: "1.0.4",
-			PackageID:              "CICD",
-			FilePath:               path,
+			APIServiceKey:       apiServiceKey,
+			IntegrationFlowName: "flow4",
+			IntegrationFlowID:   "flow4",
+			PackageID:           "CICD",
+			FilePath:            path,
 		}
 
 		httpClient := httpMockCpis{CPIFunction: "", ResponseBody: ``, TestType: "PositiveAndCreateIntegrationDesigntimeArtifactResBody"}
@@ -51,11 +47,11 @@ func TestRunIntegrationArtifactUpload(t *testing.T) {
 		if assert.NoError(t, err) {
 
 			t.Run("check url", func(t *testing.T) {
-				assert.Equal(t, "https://demo/api/v1/IntegrationDesigntimeArtifactSaveAsVersion?Id='flow4'&SaveAsVersion='1.0.4'", httpClient.URL)
+				assert.Equal(t, "https://demo/api/v1/IntegrationDesigntimeArtifacts(Id='flow4',Version='Active')", httpClient.URL)
 			})
 
 			t.Run("check method", func(t *testing.T) {
-				assert.Equal(t, "POST", httpClient.Method)
+				assert.Equal(t, "PUT", httpClient.Method)
 			})
 		}
 	})
@@ -68,16 +64,20 @@ func TestRunIntegrationArtifactUpload(t *testing.T) {
 		exists, err := files.FileExists(path)
 		assert.NoError(t, err)
 		assert.True(t, exists)
+		apiServiceKey := `{
+			"oauth": {
+				"url": "https://demo",
+				"clientid": "demouser",
+				"clientsecret": "******",
+				"tokenurl": "https://demo/oauth/token"
+			}
+		}`
 		config := integrationArtifactUploadOptions{
-			Host:                   "https://demo",
-			OAuthTokenProviderURL:  "https://demo/oauth/token",
-			Username:               "demouser",
-			Password:               "******",
-			IntegrationFlowName:    "flow4",
-			IntegrationFlowID:      "flow4",
-			IntegrationFlowVersion: "1.0.4",
-			PackageID:              "CICD",
-			FilePath:               path,
+			APIServiceKey:       apiServiceKey,
+			IntegrationFlowName: "flow4",
+			IntegrationFlowID:   "flow4",
+			PackageID:           "CICD",
+			FilePath:            path,
 		}
 
 		httpClient := httpMockCpis{CPIFunction: "", ResponseBody: ``, TestType: "PositiveAndUpdateIntegrationDesigntimeArtifactResBody"}
@@ -98,16 +98,20 @@ func TestRunIntegrationArtifactUpload(t *testing.T) {
 
 	t.Run("Failed case of Integration Flow Get Test", func(t *testing.T) {
 
+		apiServiceKey := `{
+			"oauth": {
+				"url": "https://demo",
+				"clientid": "demouser",
+				"clientsecret": "******",
+				"tokenurl": "https://demo/oauth/token"
+			}
+		}`
 		config := integrationArtifactUploadOptions{
-			Host:                   "https://demo",
-			OAuthTokenProviderURL:  "https://demo/oauth/token",
-			Username:               "demouser",
-			Password:               "******",
-			IntegrationFlowName:    "flow4",
-			IntegrationFlowID:      "flow4",
-			IntegrationFlowVersion: "1.0.4",
-			PackageID:              "CICD",
-			FilePath:               "path",
+			APIServiceKey:       apiServiceKey,
+			IntegrationFlowName: "flow4",
+			IntegrationFlowID:   "flow4",
+			PackageID:           "CICD",
+			FilePath:            "path",
 		}
 
 		httpClient := httpMockCpis{CPIFunction: "", ResponseBody: ``, TestType: "NegativeAndGetIntegrationDesigntimeArtifactResBody"}
@@ -124,22 +128,26 @@ func TestRunIntegrationArtifactUpload(t *testing.T) {
 		assert.NoError(t, err)
 		assert.True(t, exists)
 
+		apiServiceKey := `{
+			"oauth": {
+				"url": "https://demo",
+				"clientid": "demouser",
+				"clientsecret": "******",
+				"tokenurl": "https://demo/oauth/token"
+			}
+		}`
 		config := integrationArtifactUploadOptions{
-			Host:                   "https://demo",
-			OAuthTokenProviderURL:  "https://demo/oauth/token",
-			Username:               "demouser",
-			Password:               "******",
-			IntegrationFlowName:    "flow4",
-			IntegrationFlowID:      "flow4",
-			IntegrationFlowVersion: "1.0.4",
-			PackageID:              "CICD",
-			FilePath:               path,
+			APIServiceKey:       apiServiceKey,
+			IntegrationFlowName: "flow4",
+			IntegrationFlowID:   "flow4",
+			PackageID:           "CICD",
+			FilePath:            path,
 		}
 
 		httpClient := httpMockCpis{CPIFunction: "", ResponseBody: ``, TestType: "NegativeAndCreateIntegrationDesigntimeArtifactResBody"}
 
 		err = runIntegrationArtifactUpload(&config, nil, &files, &httpClient)
-		assert.EqualError(t, err, "HTTP POST request to https://demo/api/v1/IntegrationDesigntimeArtifactSaveAsVersion?Id='flow4'&SaveAsVersion='1.0.4' failed with error: []: Internal error")
+		assert.EqualError(t, err, "HTTP PUT request to https://demo/api/v1/IntegrationDesigntimeArtifacts(Id='flow4',Version='Active') failed with error: : 401 Unauthorized")
 	})
 
 	t.Run("Failed case of Integration Flow Create Test", func(t *testing.T) {
@@ -150,21 +158,25 @@ func TestRunIntegrationArtifactUpload(t *testing.T) {
 		assert.NoError(t, err)
 		assert.True(t, exists)
 
+		apiServiceKey := `{
+			"oauth": {
+				"url": "https://demo",
+				"clientid": "demouser",
+				"clientsecret": "******",
+				"tokenurl": "https://demo/oauth/token"
+			}
+		}`
 		config := integrationArtifactUploadOptions{
-			Host:                   "https://demo",
-			OAuthTokenProviderURL:  "https://demo/oauth/token",
-			Username:               "demouser",
-			Password:               "******",
-			IntegrationFlowName:    "flow4",
-			IntegrationFlowID:      "flow4",
-			IntegrationFlowVersion: "1.0.4",
-			PackageID:              "CICD",
-			FilePath:               path,
+			APIServiceKey:       apiServiceKey,
+			IntegrationFlowName: "flow4",
+			IntegrationFlowID:   "flow4",
+			PackageID:           "CICD",
+			FilePath:            path,
 		}
 
 		httpClient := httpMockCpis{CPIFunction: "", ResponseBody: ``, TestType: "NegativeAndUpdateIntegrationDesigntimeArtifactResBody"}
 
 		err = runIntegrationArtifactUpload(&config, nil, &filesMock, &httpClient)
-		assert.EqualError(t, err, "HTTP POST request to https://demo/api/v1/IntegrationDesigntimeArtifacts failed with error: []: Internal error")
+		assert.EqualError(t, err, "HTTP POST request to https://demo/api/v1/IntegrationDesigntimeArtifacts failed with error: : 401 Unauthorized")
 	})
 }

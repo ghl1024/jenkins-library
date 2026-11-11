@@ -1,5 +1,7 @@
 package log
 
+import "sync"
+
 // ErrorCategory defines the category of a pipeline error
 type ErrorCategory int
 
@@ -15,7 +17,12 @@ const (
 	ErrorTest
 )
 
+// errorCategoryMu guards errorCategory. Steps may report an error category from
+// several goroutines, and the unit tests exercise steps in parallel, so the
+// package global needs to be synchronized.
+var errorCategoryMu sync.RWMutex
 var errorCategory ErrorCategory = ErrorUndefined
+var fatalError []byte
 
 func (e ErrorCategory) String() string {
 	return [...]string{
@@ -56,10 +63,24 @@ func ErrorCategoryByString(category string) ErrorCategory {
 // In addition it will be used when exiting the program with
 // log.FatalError(err, message)
 func SetErrorCategory(category ErrorCategory) {
+	errorCategoryMu.Lock()
+	defer errorCategoryMu.Unlock()
 	errorCategory = category
 }
 
 // GetErrorCategory retrieves the error category which is currently known to the execution of a step
 func GetErrorCategory() ErrorCategory {
+	errorCategoryMu.RLock()
+	defer errorCategoryMu.RUnlock()
 	return errorCategory
+}
+
+// SetFatalErrorDetail sets the fatal error to be stored
+func SetFatalErrorDetail(error []byte) {
+	fatalError = error
+}
+
+// GetFatalErrorDetail retrieves the error which is currently known to the execution of a step
+func GetFatalErrorDetail() []byte {
+	return fatalError
 }

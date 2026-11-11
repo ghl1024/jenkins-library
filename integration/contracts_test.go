@@ -1,13 +1,16 @@
+//go:build integration
+// +build integration
+
 package main
 
 import (
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/SAP/jenkins-library/pkg/generator/helper"
+
 	"github.com/stretchr/testify/assert"
 )
 
@@ -18,9 +21,7 @@ func TestCommandContract(t *testing.T) {
 // Test provided by consumer: SAP InnerSource project
 // Changes to the test require peer review by core-team members involved in the project.
 func TestGenerator(t *testing.T) {
-	dir, err := ioutil.TempDir("", "")
-	defer os.RemoveAll(dir) // clean up
-	assert.NoError(t, err, "Error when creating temp dir")
+	dir := t.TempDir()
 
 	metadata := `metadata:
   name: test
@@ -60,7 +61,7 @@ func TestGenerator(t *testing.T) {
               - name: test_cpe
 `
 
-	ioutil.WriteFile(filepath.Join(dir, "test.yaml"), []byte(metadata), 0755)
+	os.WriteFile(filepath.Join(dir, "test.yaml"), []byte(metadata), 0755)
 
 	openMetaFile := func(name string) (io.ReadCloser, error) { return os.Open(name) }
 	fileWriter := func(filename string, data []byte, perm os.FileMode) error { return nil }

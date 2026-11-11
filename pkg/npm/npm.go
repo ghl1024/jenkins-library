@@ -9,14 +9,27 @@ import (
 	"strings"
 
 	"github.com/SAP/jenkins-library/pkg/command"
+	piperhttp "github.com/SAP/jenkins-library/pkg/http"
 	"github.com/SAP/jenkins-library/pkg/log"
 	"github.com/SAP/jenkins-library/pkg/piperutils"
+	"github.com/SAP/jenkins-library/pkg/versioning"
 )
+
+const tmpInstallFolder = "./tmp" // This folder is also added to npmignore in publish.go
 
 // Execute struct holds utils to enable mocking and common parameters
 type Execute struct {
-	Utils   Utils
-	Options ExecutorOptions
+	Utils     Utils
+	Options   ExecutorOptions
+	pnpmSetup pnpmSetupState
+}
+
+// pnpmSetupState holds the cached pnpm installation state
+type pnpmSetupState struct {
+	checked   bool
+	installed bool
+	command   string
+	rootDir   string
 }
 
 // Executor interface to enable mocking for testing
@@ -26,6 +39,7 @@ type Executor interface {
 	FindPackageJSONFilesWithScript(packageJSONFiles []string, script string) ([]string, error)
 	RunScriptsInAllPackages(runScripts []string, runOptions []string, scriptOptions []string, virtualFrameBuffer bool, excludeList []string, packagesList []string) error
 	InstallAllDependencies(packageJSONFiles []string) error
+	PublishAllPackages(packageJSONFiles []string, registry, username, password, publishTag string, packBeforePublish bool, buildCoordinates *[]versioning.Coordinates) error
 	SetNpmRegistries() error
 	CreateBOM(packageJSONFiles []string) error
 }
@@ -34,14 +48,26 @@ type Executor interface {
 type ExecutorOptions struct {
 	DefaultNpmRegistry string
 	ExecRunner         ExecRunner
+	PnpmVersion        string
 }
 
 // NewExecutor instantiates Execute struct and sets executeOptions
 func NewExecutor(executorOptions ExecutorOptions) Executor {
-	utils := utilsBundle{Files: &piperutils.Files{}, execRunner: executorOptions.ExecRunner}
+	utils := utilsBundle{
+		Files:          &piperutils.Files{},
+		execRunner:     executorOptions.ExecRunner,
+		downloadClient: &piperhttp.Client{},
+	}
+
+	// Capture the root directory at initialization time
+	rootDir, _ := utils.Getwd()
+
 	return &Execute{
 		Utils:   &utils,
 		Options: executorOptions,
+		pnpmSetup: pnpmSetupState{
+			rootDir: rootDir,
+		},
 	}
 }
 
@@ -56,24 +82,36 @@ type ExecRunner interface {
 
 // Utils interface for mocking
 type Utils interface {
-	Chdir(path string) error
-	FileExists(filename string) (bool, error)
-	FileRead(path string) ([]byte, error)
-	Getwd() (string, error)
-	Glob(pattern string) (matches []string, err error)
+	piperutils.FileUtils
 
 	GetExecRunner() ExecRunner
+	GetFileUtils() piperutils.FileUtils
+	GetDownloadUtils() piperhttp.Downloader
 }
 
 type utilsBundle struct {
 	*piperutils.Files
-	execRunner ExecRunner
+	execRunner     ExecRunner
+	downloadClient piperhttp.Downloader
+}
+
+func (u *utilsBundle) GetFileUtils() piperutils.FileUtils {
+	return u.Files
+}
+
+func (u *utilsBundle) GetDownloadUtils() piperhttp.Downloader {
+	if u.downloadClient == nil {
+		u.downloadClient = &piperhttp.Client{}
+	}
+	return u.downloadClient
 }
 
 // GetExecRunner returns an execRunner if it's not yet initialized
 func (u *utilsBundle) GetExecRunner() ExecRunner {
 	if u.execRunner == nil {
-		u.execRunner = &command.Command{}
+		u.execRunner = &command.Command{
+			StepName: "npmExecuteScripts",
+		}
 		u.execRunner.Stdout(log.Writer())
 		u.execRunner.Stderr(log.Writer())
 	}
@@ -88,7 +126,7 @@ func (exec *Execute) SetNpmRegistries() error {
 
 	var buffer bytes.Buffer
 	execRunner.Stdout(&buffer)
-	err := execRunner.RunExecutable("npm", "config", "get", npmRegistry)
+	err := execRunner.RunExecutable("npm", "config", "get", npmRegistry, "-ws=false", "-iwr")
 	execRunner.Stdout(log.Writer())
 	if err != nil {
 		return err
@@ -101,7 +139,7 @@ func (exec *Execute) SetNpmRegistries() error {
 
 	if exec.Options.DefaultNpmRegistry != "" && registryRequiresConfiguration(preConfiguredRegistry, "https://registry.npmjs.org") {
 		log.Entry().Info("npm registry " + npmRegistry + " was not configured, setting it to " + exec.Options.DefaultNpmRegistry)
-		err = execRunner.RunExecutable("npm", "config", "set", npmRegistry, exec.Options.DefaultNpmRegistry)
+		err = execRunner.RunExecutable("npm", "config", "set", npmRegistry, exec.Options.DefaultNpmRegistry, "-ws=false", "-iwr")
 		if err != nil {
 			return err
 		}
@@ -125,6 +163,7 @@ func (exec *Execute) RunScriptsInAllPackages(runScripts []string, runOptions []s
 
 	if len(packagesList) > 0 {
 		packageJSONFiles = packagesList
+		log.Entry().Infof("Using provided package-list: %s", strings.Join(packageJSONFiles, ", "))
 	} else {
 		packageJSONFiles, err = exec.FindPackageJSONFilesWithExcludes(excludeList)
 		if err != nil {
@@ -150,8 +189,8 @@ func (exec *Execute) RunScriptsInAllPackages(runScripts []string, runOptions []s
 		}
 
 		if len(packagesWithScript) == 0 {
-			log.Entry().Warnf("could not find any package.json file with script " + script)
-			continue
+			return fmt.Errorf("could not find any package.json file with script : %s ", script)
+
 		}
 
 		for _, packageJSON := range packagesWithScript {
@@ -219,7 +258,8 @@ func (exec *Execute) FindPackageJSONFilesWithExcludes(excludeList []string) ([]s
 
 	nodeModulesExclude := "**/node_modules/**"
 	genExclude := "**/gen/**"
-	excludeList = append(excludeList, nodeModulesExclude, genExclude)
+	tmpExclude := "**/tmp/**"
+	excludeList = append(excludeList, nodeModulesExclude, genExclude, tmpExclude)
 
 	packageJSONFiles, err := piperutils.ExcludeFiles(unfilteredListOfPackageJSONFiles, excludeList)
 	if err != nil {
@@ -237,7 +277,7 @@ func (exec *Execute) FindPackageJSONFilesWithScript(packageJSONFiles []string, s
 	var packagesWithScript []string
 
 	for _, file := range packageJSONFiles {
-		var packageJSON map[string]interface{}
+		var packageJSON map[string]any
 
 		packageRaw, err := exec.Utils.FileRead(file)
 		if err != nil {
@@ -249,7 +289,7 @@ func (exec *Execute) FindPackageJSONFilesWithScript(packageJSONFiles []string, s
 			return nil, fmt.Errorf("failed to unmarshal %s to check for existence of %s script: %w", file, script, err)
 		}
 
-		scripts, ok := packageJSON["scripts"].(map[string]interface{})
+		scripts, ok := packageJSON["scripts"].(map[string]any)
 		if ok {
 			_, ok := scripts[script].(string)
 			if ok {
@@ -280,7 +320,7 @@ func (exec *Execute) InstallAllDependencies(packageJSONFiles []string) error {
 	return nil
 }
 
-// install executes npm or yarn Install for package.json
+// install executes the appropriate package manager install command for package.json
 func (exec *Execute) install(packageJSON string) error {
 	execRunner := exec.Utils.GetExecRunner()
 
@@ -300,97 +340,25 @@ func (exec *Execute) install(packageJSON string) error {
 		return err
 	}
 
-	packageLockExists, yarnLockExists, err := exec.checkIfLockFilesExist()
+	pm, err := exec.detectPackageManager()
 	if err != nil {
 		return err
 	}
 
 	log.Entry().WithField("WorkingDirectory", dir).Info("Running Install")
-	if packageLockExists {
-		err = execRunner.RunExecutable("npm", "ci")
-		if err != nil {
-			return err
-		}
-	} else if yarnLockExists {
-		err = execRunner.RunExecutable("yarn", "install", "--frozen-lockfile")
-		if err != nil {
-			return err
-		}
-	} else {
-		log.Entry().Warn("No package lock file found. " +
-			"It is recommended to create a `package-lock.json` file by running `npm Install` locally." +
-			" Add this file to your version control. " +
-			"By doing so, the builds of your application become more reliable.")
-		err = execRunner.RunExecutable("npm", "install")
-		if err != nil {
-			return err
-		}
+
+	if !strings.HasPrefix(pm.LockFile, "package-lock.json") {
+		log.Entry().Info("Using " + pm.Name + " package manager")
+	}
+
+	err = execRunner.RunExecutable(pm.InstallCommand, pm.InstallArgs...)
+	if err != nil {
+		return err
 	}
 
 	err = exec.Utils.Chdir(oldWorkingDirectory)
 	if err != nil {
 		return fmt.Errorf("failed to change back into original directory: %w", err)
-	}
-	return nil
-}
-
-// checkIfLockFilesExist checks if yarn/package lock fileUtils exist
-func (exec *Execute) checkIfLockFilesExist() (bool, bool, error) {
-	packageLockExists, err := exec.Utils.FileExists("package-lock.json")
-	if err != nil {
-		return false, false, err
-	}
-
-	yarnLockExists, err := exec.Utils.FileExists("yarn.lock")
-	if err != nil {
-		return false, false, err
-	}
-	return packageLockExists, yarnLockExists, nil
-}
-
-// CreateBOM generates BOM file using CycloneDX from all package.json files
-func (exec *Execute) CreateBOM(packageJSONFiles []string) error {
-	execRunner := exec.Utils.GetExecRunner()
-	// Install CycloneDX Node.js module locally without saving in package.json
-	err := execRunner.RunExecutable("npm", "install", "@cyclonedx/bom", "--no-save")
-	if err != nil {
-		return err
-	}
-	if len(packageJSONFiles) > 0 {
-		path := filepath.Dir(packageJSONFiles[0])
-		createBOMConfig := []string{
-			"--schema", "1.2", // Target schema version
-			"--include-license-text", "false",
-			"--include-dev", "false", // Include devDependencies
-			"--output", "bom.xml",
-		}
-
-		params := []string{
-			"cyclonedx-bom",
-			path,
-		}
-		params = append(params, createBOMConfig...)
-		// Generate BOM from first package.json
-		err := execRunner.RunExecutable("npx", params...)
-		if err != nil {
-			return err
-		}
-
-		// Merge BOM(s) into the current BOM
-		for _, packageJSONFile := range packageJSONFiles[1:] {
-			path := filepath.Dir(packageJSONFile)
-			params = []string{
-				"cyclonedx-bom",
-				path,
-				"--append",
-				"bom.xml",
-			}
-			params = append(params, createBOMConfig...)
-			err := execRunner.RunExecutable("npx", params...)
-			if err != nil {
-				return err
-			}
-		}
 	}
 	return nil
 }
